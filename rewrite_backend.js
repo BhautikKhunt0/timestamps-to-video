@@ -131,27 +131,32 @@ app.post("/api/generate", async (req, res) => {
     jobs.get(jobId).status = "normalizing";
     const normalizedFiles = [];
     
-    // Normalize sequentially for simplicity and safety, or use Promise.all for parallelism
-    // We'll use a simple loop here
-    for (let i = 0; i < rawImages.length; i++) {
-      const img = rawImages[i];
-      const inPath = path.join(jobDir, img);
-      const outPath = path.join(jobDir, \`norm_\${i}.png\`);
+    // Normalize in batches to avoid overwhelming the CPU
+    const CONCURRENCY_LIMIT = 5;
+    for (let i = 0; i < rawImages.length; i += CONCURRENCY_LIMIT) {
+      const batch = rawImages.slice(i, i + CONCURRENCY_LIMIT);
       
-      const filter = "scale=w=1920:h=1080:force_original_aspect_ratio=decrease,pad=1920:1080:(1920-iw)/2:(1080-ih)/2:black,setsar=1,format=yuv420p";
-      const cmd = \`ffmpeg -y -i "\${inPath}" -vf "\${filter}" -vframes 1 "\${outPath}"\`;
-      
-      await new Promise((resolve, reject) => {
-        exec(cmd, (err) => {
-          if (err) reject(err);
-          else resolve(null);
+      await Promise.all(batch.map(async (img, batchIndex) => {
+        const globalIndex = i + batchIndex;
+        const inPath = path.join(jobDir, img);
+        const outPath = path.join(jobDir, \`norm_\${globalIndex}.png\`);
+        
+        const filter = "scale=w=1920:h=1080:force_original_aspect_ratio=decrease,pad=1920:1080:(1920-iw)/2:(1080-ih)/2:black,setsar=1,format=yuv420p";
+        const cmd = \`ffmpeg -y -i "\${inPath}" -vf "\${filter}" -vframes 1 "\${outPath}"\`;
+        
+        await new Promise((resolve, reject) => {
+          exec(cmd, (err) => {
+            if (err) reject(err);
+            else resolve(null);
+          });
         });
-      });
-      normalizedFiles.push(outPath);
+        
+        normalizedFiles[globalIndex] = outPath;
+      }));
       
       const p = jobs.get(jobId);
       if (p) {
-        p.progress = Math.round(((i + 1) / rawImages.length) * 15); // Normalization is first 15%
+        p.progress = Math.round((Math.min(i + CONCURRENCY_LIMIT, rawImages.length) / rawImages.length) * 15); // Normalization is first 15%
         p.lastUpdateTime = Date.now();
       }
     }
@@ -194,7 +199,7 @@ app.post("/api/generate", async (req, res) => {
     ffmpegArgs = ffmpegArgs.concat([
       "-r", "30",
       "-c:v", "libx264",
-      "-preset", "medium",
+      "-preset", "ultrafast",
       "-crf", "18",
       "-tune", "stillimage",
       "-pix_fmt", "yuv420p"
