@@ -279,7 +279,7 @@ app.post("/api/generate", async (req, res) => {
       "-shortest",
       "-t", totalDuration.toString(),
       "-f", "segment",
-      "-segment_time", "240",
+      "-segment_time", "180",
       "-segment_list", playlistPath,
       "-segment_list_type", "csv",
       "-reset_timestamps", "1",
