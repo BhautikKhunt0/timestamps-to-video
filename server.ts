@@ -9,6 +9,23 @@ import ffmpegPath from "ffmpeg-static";
 import { WebSocketServer, WebSocket } from "ws";
 import http from "http";
 
+
+const getMediaDuration = (filePath: string): Promise<number> => {
+  return new Promise((resolve) => {
+    exec(`"${ffmpegPath}" -i "${filePath}"`, (err, stdout, stderr) => {
+      const match = stderr.match(/Duration: (\d{2}):(\d{2}):(\d{2}(\.\d+)?)/);
+      if (match) {
+        const hours = parseInt(match[1], 10);
+        const mins = parseInt(match[2], 10);
+        const secs = parseFloat(match[3]);
+        resolve(hours * 3600 + mins * 60 + secs);
+      } else {
+        resolve(0); 
+      }
+    });
+  });
+};
+
 const app = express();
 const PORT = 3000;
 const server = http.createServer(app);
@@ -228,47 +245,128 @@ app.post("/api/generate", async (req, res) => {
       });
       
     const hasAudio = audioFiles.length > 0;
-
-    const playlistPath = path.join(jobDir, "playlist.csv");
-    const chunkPattern = path.join(jobDir, "chunk_%03d.mp4");
-
-    let ffmpegArgs: string[] = ["-y", "-nostdin"];
+    const audioDurations: number[] = [];
+    if (hasAudio) {
+      for (const f of audioFiles) {
+        const dur = await getMediaDuration(path.join(jobDir, f));
+        audioDurations.push(dur);
+      }
+    }
 
     if (!hasActiveTransitions) {
       // MODE A: Ultra-fast concat demuxer (when all transitions are 'none' or single image)
-      const concatTxtPath = path.join(jobDir, "concat.txt");
-      let concatContent = "";
       
+      const rawBlocks = [];
       for (let i = 0; i < normalizedFiles.length; i++) {
-        concatContent += `file '${normalizedFiles[i].replace(/\\/g, "/").replace(/'/g, "'\\''")}'\n`;
-        concatContent += `duration ${finalDurations[i]}\n`;
+        rawBlocks.push({ type: 'image', imgIndex: i, dur: finalDurations[i] });
       }
-      concatContent += `file '${normalizedFiles[normalizedFiles.length - 1].replace(/\\/g, "/").replace(/'/g, "'\\''")}'\n`;
-      fs.writeFileSync(concatTxtPath, concatContent);
 
-      ffmpegArgs.push(
-        "-f", "concat",
-        "-safe", "0",
-        "-i", concatTxtPath
-      );
+      const chunks: any[] = [];
+      let currentChunkIdx = 0;
+      let currentAudioTarget = audioDurations[currentChunkIdx] || 120;
+      let currentChunkTime = 0;
+      let currentChunkBlocks: any[] = [];
 
-      if (hasAudio) {
-        audioFiles.forEach(f => {
-          ffmpegArgs.push("-i", path.join(jobDir, f));
+      for (const block of rawBlocks) {
+        let remainingDur = block.dur;
+        
+        while (remainingDur > 0.001) {
+          let spaceLeft = currentAudioTarget - currentChunkTime;
+          
+          if (spaceLeft <= 0.001) {
+            chunks.push({ index: currentChunkIdx, audio: audioFiles[currentChunkIdx], blocks: currentChunkBlocks, targetDur: currentAudioTarget });
+            currentChunkIdx++;
+            currentAudioTarget = audioDurations[currentChunkIdx] || 120;
+            currentChunkTime = 0;
+            currentChunkBlocks = [];
+            spaceLeft = currentAudioTarget;
+          }
+          
+          let take = Math.min(remainingDur, spaceLeft);
+          
+          currentChunkBlocks.push({
+            type: block.type,
+            imgIndex: block.imgIndex,
+            dur: take,
+            isSplit: take < block.dur,
+            originalDur: block.dur
+          });
+          
+          remainingDur -= take;
+          currentChunkTime += take;
+        }
+      }
+      if (currentChunkBlocks.length > 0) {
+        chunks.push({ index: currentChunkIdx, audio: audioFiles[currentChunkIdx], blocks: currentChunkBlocks, targetDur: currentChunkTime });
+      }
+
+      const job = jobs.get(jobId);
+      if (job) job.chunks = [];
+
+      for (let c = 0; c < chunks.length; c++) {
+        const chunk = chunks[c];
+        const concatTxtPath = path.join(jobDir, `concat_chunk_${c}.txt`);
+        let concatContent = "";
+        
+        chunk.blocks.forEach((block: any) => {
+          concatContent += `file '${normalizedFiles[block.imgIndex].replace(/\\/g, "/").replace(/'/g, "'\\''")}'\n`;
+          concatContent += `duration ${block.dur}\n`;
         });
+        // concat demuxer requires the last file to be repeated without duration
+        if (chunk.blocks.length > 0) {
+           const lastBlock = chunk.blocks[chunk.blocks.length - 1];
+           concatContent += `file '${normalizedFiles[lastBlock.imgIndex].replace(/\\/g, "/").replace(/'/g, "'\\''")}'\n`;
+        }
+        fs.writeFileSync(concatTxtPath, concatContent);
+
+        const chunkFileName = `chunk_${c.toString().padStart(3, '0')}.mp4`;
+        const chunkOutPath = path.join(jobDir, chunkFileName);
+
+        let ffmpegArgs = [
+          "-y", "-nostdin",
+          "-f", "concat", "-safe", "0", "-i", concatTxtPath
+        ];
+
+        if (chunk.audio) {
+          ffmpegArgs.push("-i", path.join(jobDir, chunk.audio));
+        }
+
+        ffmpegArgs = ffmpegArgs.concat([
+          "-r", "30",
+          "-c:v", "libx264",
+          "-preset", "ultrafast",
+          "-crf", "18",
+          "-tune", "stillimage",
+          "-pix_fmt", "yuv420p"
+        ]);
+
+        if (chunk.audio) {
+          ffmpegArgs.push("-c:a", "aac", "-b:a", "320k", "-shortest");
+        }
+
+        ffmpegArgs.push(chunkOutPath);
+
+        await new Promise<void>((resolve, reject) => {
+          const proc = spawn(ffmpegPath as string, ffmpegArgs);
+          proc.stderr.on("data", () => {});
+          proc.on("close", (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`Failed rendering final chunk ${c}`));
+          });
+        });
+
+        const chunkUrl = `/api/video/job/${jobId}/${chunkFileName}`;
+        if (job) job.chunks.push(chunkUrl);
+        broadcast(jobId, "chunk_ready", { chunkUrl });
+        
+        if (job) {
+           job.progress = 15 + Math.round(((c + 1) / chunks.length) * 85);
+           broadcast(jobId, "progress", { progress: job.progress, eta: null });
+        }
       }
 
-      ffmpegArgs = ffmpegArgs.concat([
-        "-r", "30",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "18",
-        "-tune", "stillimage",
-        "-pix_fmt", "yuv420p"
-      ]);
     } else {
       // MODE B: Pure video concat pipeline with pre-rendered holds and xfade transition clips
-      // 1. Calculate per-transition durations ensuring each transition does not exceed 80% of adjacent clip durations
       const safeTransDurations: number[] = [];
       for (let i = 0; i < parsedTransitions.length; i++) {
         if (parsedTransitions[i] !== "none") {
@@ -283,53 +381,109 @@ app.post("/api/generate", async (req, res) => {
       }
       const halfDurations = safeTransDurations.map(d => Number((d / 2).toFixed(3)));
 
-      // 2. Prepare micro-encode tasks for both static holds and active transition clips
-      const tasks: { type: 'hold' | 'trans'; index: number; args: string[]; outPath: string }[] = [];
-
+      const rawBlocks = [];
       for (let i = 0; i < normalizedFiles.length; i++) {
         const incomingHalf = i > 0 ? halfDurations[i - 1] : 0;
         const outgoingHalf = i < parsedTransitions.length ? halfDurations[i] : 0;
         const staticHold = Number(Math.max(0.04, finalDurations[i] - incomingHalf - outgoingHalf).toFixed(3));
-        const holdPath = path.join(jobDir, `hold_${i}.mp4`);
-
-        tasks.push({
-          type: 'hold',
-          index: i,
-          outPath: holdPath,
-          args: [
-            "-y", "-nostdin",
-            "-loop", "1", "-t", staticHold.toString(), "-i", normalizedFiles[i],
-            "-r", "30", "-c:v", "libx264", "-preset", "ultrafast",
-            "-tune", "stillimage", "-crf", "18", "-pix_fmt", "yuv420p",
-            holdPath
-          ]
-        });
+        rawBlocks.push({ type: 'hold', imgIndex: i, dur: staticHold });
 
         if (i < parsedTransitions.length && parsedTransitions[i] !== "none") {
-          const transPath = path.join(jobDir, `trans_${i}.mp4`);
           const dur = safeTransDurations[i];
-          const transType = parsedTransitions[i];
-          tasks.push({
-            type: 'trans',
-            index: i,
-            outPath: transPath,
-            args: [
-              "-y", "-nostdin",
-              "-loop", "1", "-t", dur.toString(), "-i", normalizedFiles[i],
-              "-loop", "1", "-t", dur.toString(), "-i", normalizedFiles[i + 1],
-              "-filter_complex", `[0:v][1:v]xfade=transition=${transType}:duration=${dur}:offset=0[v]`,
-              "-map", "[v]",
-              "-r", "30", "-c:v", "libx264", "-preset", "ultrafast",
-              "-crf", "18", "-pix_fmt", "yuv420p",
-              transPath
-            ]
-          });
+          rawBlocks.push({ type: 'trans', imgIndex: i, dur: dur });
         }
       }
 
-      // 3. Render micro-encode tasks in parallel worker pool (concurrency 10)
+      const chunks: { index: number, audio: string, blocks: any[], targetDur: number }[] = [];
+      let currentChunkIdx = 0;
+      let currentAudioTarget = audioDurations[currentChunkIdx] || 120;
+      let currentChunkTime = 0;
+      let currentChunkBlocks: any[] = [];
+
+      for (const block of rawBlocks) {
+        let remainingDur = block.dur;
+        
+        while (remainingDur > 0.001) {
+          let spaceLeft = currentAudioTarget - currentChunkTime;
+          
+          if (spaceLeft <= 0.001) {
+            chunks.push({ index: currentChunkIdx, audio: audioFiles[currentChunkIdx], blocks: currentChunkBlocks, targetDur: currentAudioTarget });
+            currentChunkIdx++;
+            currentAudioTarget = audioDurations[currentChunkIdx] || 120;
+            currentChunkTime = 0;
+            currentChunkBlocks = [];
+            spaceLeft = currentAudioTarget;
+          }
+          
+          let take = Math.min(remainingDur, spaceLeft);
+          
+          if (block.type === 'trans' && take < remainingDur) {
+            take = remainingDur; 
+          }
+          
+          currentChunkBlocks.push({
+            type: block.type,
+            imgIndex: block.imgIndex,
+            dur: take,
+            isSplit: take < block.dur,
+            originalDur: block.dur
+          });
+          
+          remainingDur -= take;
+          currentChunkTime += take;
+        }
+      }
+      
+      if (currentChunkBlocks.length > 0) {
+        chunks.push({ index: currentChunkIdx, audio: audioFiles[currentChunkIdx], blocks: currentChunkBlocks, targetDur: currentChunkTime });
+      }
+
+      const tasks: { type: 'hold' | 'trans'; index: number; args: string[]; outPath: string }[] = [];
+      let holdSubId = 0;
+
+      chunks.forEach(chunk => {
+        chunk.blocks.forEach(block => {
+          if (block.type === 'hold') {
+            const outPath = path.join(jobDir, `hold_${block.imgIndex}_${holdSubId++}.mp4`);
+            block.outPath = outPath;
+            tasks.push({
+              type: 'hold',
+              index: block.imgIndex,
+              outPath: outPath,
+              args: [
+                "-y", "-nostdin",
+                "-loop", "1", "-t", block.dur.toString(), "-i", normalizedFiles[block.imgIndex],
+                "-r", "30", "-c:v", "libx264", "-preset", "ultrafast",
+                "-tune", "stillimage", "-crf", "18", "-pix_fmt", "yuv420p",
+                outPath
+              ]
+            });
+          } else if (block.type === 'trans') {
+            const outPath = path.join(jobDir, `trans_${block.imgIndex}.mp4`);
+            block.outPath = outPath;
+            if (!tasks.find(t => t.outPath === outPath)) {
+              tasks.push({
+                type: 'trans',
+                index: block.imgIndex,
+                outPath: outPath,
+                args: [
+                  "-y", "-nostdin",
+                  "-loop", "1", "-t", block.dur.toString(), "-i", normalizedFiles[block.imgIndex],
+                  "-loop", "1", "-t", block.dur.toString(), "-i", normalizedFiles[block.imgIndex + 1],
+                  "-filter_complex", `[0:v][1:v]xfade=transition=${parsedTransitions[block.imgIndex]}:duration=${block.dur}:offset=0[v]`,
+                  "-map", "[v]",
+                  "-r", "30", "-c:v", "libx264", "-preset", "ultrafast",
+                  "-crf", "18", "-pix_fmt", "yuv420p",
+                  outPath
+                ]
+              });
+            }
+          }
+        });
+      });
+
       const BATCH_CONCURRENCY = 10;
-      let completedTasks = 0;
+      let completedMicroTasks = 0;
       for (let i = 0; i < tasks.length; i += BATCH_CONCURRENCY) {
         const batch = tasks.slice(i, i + BATCH_CONCURRENCY);
         await Promise.all(batch.map(async (task) => {
@@ -343,163 +497,72 @@ app.post("/api/generate", async (req, res) => {
             });
           });
 
-          completedTasks++;
+          completedMicroTasks++;
           const p = jobs.get(jobId);
           if (p) {
-            p.progress = 15 + Math.round((completedTasks / tasks.length) * 35); // 15% to 50%
+            p.progress = 15 + Math.round((completedMicroTasks / tasks.length) * 35);
             p.lastUpdateTime = Date.now();
             broadcast(jobId, "progress", { progress: p.progress, eta: null });
           }
         }));
       }
 
-      // 4. Assemble pure video concat.txt (all MP4s, 100% demuxer compatible)
-      const concatTxtPath = path.join(jobDir, "concat.txt");
-      let concatContent = "";
-      for (let i = 0; i < normalizedFiles.length; i++) {
-        const holdPath = path.join(jobDir, `hold_${i}.mp4`);
-        concatContent += `file '${holdPath.replace(/\\/g, "/").replace(/'/g, "'\\''")}'\n`;
-
-        if (i < parsedTransitions.length && parsedTransitions[i] !== "none") {
-          const transPath = path.join(jobDir, `trans_${i}.mp4`);
-          concatContent += `file '${transPath.replace(/\\/g, "/").replace(/'/g, "'\\''")}'\n`;
-        }
-      }
-      fs.writeFileSync(concatTxtPath, concatContent);
-
-      ffmpegArgs.push(
-        "-f", "concat",
-        "-safe", "0",
-        "-i", concatTxtPath
-      );
-
-      if (hasAudio) {
-        audioFiles.forEach(f => {
-          ffmpegArgs.push("-i", path.join(jobDir, f));
-        });
-      }
-
-      ffmpegArgs = ffmpegArgs.concat([
-        "-c:v", "copy"
-      ]);
-    }
-
-    if (hasAudio) {
-      if (audioFiles.length === 1) {
-        ffmpegArgs = ffmpegArgs.concat([
-          "-c:a", "aac",
-          "-b:a", "320k",
-          "-af", "aresample=async=1000,apad"
-        ]);
-      } else {
-        let filterComplexStr = "";
-        let concatStreams = "";
-        for (let i = 0; i < audioFiles.length; i++) {
-          filterComplexStr += `[${i + 1}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[a${i}];`;
-          concatStreams += `[a${i}]`;
-        }
-        filterComplexStr += `${concatStreams}concat=n=${audioFiles.length}:v=0:a=1,aresample=async=1000,apad[aout]`;
-        
-        ffmpegArgs = ffmpegArgs.concat([
-          "-filter_complex", filterComplexStr,
-          "-map", "0:v",
-          "-map", "[aout]",
-          "-c:a", "aac",
-          "-b:a", "320k"
-        ]);
-      }
-    }
-
-    ffmpegArgs = ffmpegArgs.concat([
-      "-shortest",
-      "-t", totalDuration.toString(),
-      "-f", "segment",
-      "-segment_time", "120",
-      "-segment_list", playlistPath,
-      "-segment_list_type", "csv",
-      "-reset_timestamps", "1",
-      "-progress", "pipe:1",
-      chunkPattern
-    ]);
-
-    const ffmpegProcess = spawn(ffmpegPath as string, ffmpegArgs);
-    
-    // Drain stderr to prevent the 64KB pipe buffer from filling up and hanging the process
-    ffmpegProcess.stderr.on("data", () => {});
-    
-    let totalFrames = totalDuration * 30; // approx
-    let knownChunks = new Set<string>();
-
-    const chunkPoller = setInterval(() => {
-      if (fs.existsSync(playlistPath)) {
-        const content = fs.readFileSync(playlistPath, 'utf8');
-        const lines = content.trim().split('\n');
-        lines.forEach(line => {
-          const file = line.split(',')[0];
-          if (file && !knownChunks.has(file)) {
-            knownChunks.add(file);
-            const chunkUrl = `/api/video/job/${jobId}/${file}`;
-            
-            // Add chunk to job record
-            const job = jobs.get(jobId);
-            if (job) {
-              if (!job.chunks) job.chunks = [];
-              if (!job.chunks.includes(chunkUrl)) job.chunks.push(chunkUrl);
-            }
-            
-            broadcast(jobId, "chunk_ready", { chunkUrl });
-          }
-        });
-      }
-    }, 1000);
-
-    ffmpegProcess.stdout.on("data", (data) => {
-      const output = data.toString();
-      const frameMatch = output.match(/frame=\s*(\d+)/);
-      if (frameMatch) {
-        const frame = parseInt(frameMatch[1], 10);
-        const basePct = hasActiveTransitions ? 50 : 15;
-        const remainingPct = 99 - basePct;
-        let currentProgress = basePct + Math.min(remainingPct, (frame / totalFrames) * remainingPct);
-        
-        const job = jobs.get(jobId);
-        if (job && currentProgress > job.progress) {
-          const now = Date.now();
-          const elapsed = (now - job.startTime) / 1000;
-          const pct = currentProgress / 100;
-          let newEta = pct > 0 ? (elapsed / pct) - elapsed : 0;
-          
-          job.progress = Math.round(currentProgress);
-          job.eta = newEta;
-          job.lastUpdateTime = now;
-          broadcast(jobId, "progress", { progress: job.progress, eta: newEta });
-        }
-      }
-    });
-
-    ffmpegProcess.on("close", (code) => {
-      clearInterval(chunkPoller);
-      // Final poll to catch last chunk
-      if (fs.existsSync(playlistPath)) {
-        const content = fs.readFileSync(playlistPath, 'utf8');
-        const lines = content.trim().split('\n');
-        lines.forEach(line => {
-          const file = line.split(',')[0];
-          if (file && !knownChunks.has(file)) {
-            knownChunks.add(file);
-            const chunkUrl = `/api/video/job/${jobId}/${file}`;
-            const job = jobs.get(jobId);
-            if (job) {
-              if (!job.chunks) job.chunks = [];
-              if (!job.chunks.includes(chunkUrl)) job.chunks.push(chunkUrl);
-            }
-            broadcast(jobId, "chunk_ready", { chunkUrl });
-          }
-        });
-      }
-
       const job = jobs.get(jobId);
-      if (code === 0) {
+      if (job) job.chunks = [];
+
+      for (let c = 0; c < chunks.length; c++) {
+        const chunk = chunks[c];
+        const concatTxtPath = path.join(jobDir, `concat_chunk_${c}.txt`);
+        let concatContent = "";
+        
+        chunk.blocks.forEach(block => {
+          concatContent += `file '${block.outPath.replace(/\\/g, "/").replace(/'/g, "'\\''")}'\n`;
+        });
+        fs.writeFileSync(concatTxtPath, concatContent);
+
+        const chunkFileName = `chunk_${c.toString().padStart(3, '0')}.mp4`;
+        const chunkOutPath = path.join(jobDir, chunkFileName);
+
+        let ffmpegArgs = [
+          "-y", "-nostdin",
+          "-f", "concat", "-safe", "0", "-i", concatTxtPath
+        ];
+
+        if (chunk.audio) {
+          ffmpegArgs.push("-i", path.join(jobDir, chunk.audio));
+        }
+
+        ffmpegArgs.push("-c:v", "copy");
+
+        if (chunk.audio) {
+          ffmpegArgs.push("-c:a", "aac", "-b:a", "320k", "-shortest");
+        }
+
+        ffmpegArgs.push(chunkOutPath);
+
+        await new Promise<void>((resolve, reject) => {
+          const proc = spawn(ffmpegPath as string, ffmpegArgs);
+          proc.stderr.on("data", () => {});
+          proc.on("close", (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`Failed rendering final chunk ${c}`));
+          });
+        });
+
+        const chunkUrl = `/api/video/job/${jobId}/${chunkFileName}`;
+        if (job) job.chunks.push(chunkUrl);
+        broadcast(jobId, "chunk_ready", { chunkUrl });
+        
+        if (job) {
+           job.progress = 50 + Math.round(((c + 1) / chunks.length) * 50);
+           broadcast(jobId, "progress", { progress: job.progress, eta: null });
+        }
+      }
+    }
+
+    let code = 0;
+    const job = jobs.get(jobId);
+    if (code === 0) {
         if (job) {
           job.status = "completed";
           job.progress = 100;
@@ -515,8 +578,6 @@ app.post("/api/generate", async (req, res) => {
           broadcast(jobId, "error", { error: job.error });
         }
       }
-    });
-
   } catch (error: any) {
     const job = jobs.get(jobId);
     if (job) {
