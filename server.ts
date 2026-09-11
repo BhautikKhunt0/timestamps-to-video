@@ -117,7 +117,7 @@ app.post("/api/upload-audio", upload.array("audio", 50), (req, res) => {
 });
 
 app.post("/api/generate", async (req, res) => {
-  const { jobId, durations } = req.body;
+  const { jobId, durations, transitions, transitionDurations, transitionDuration } = req.body;
   if (!jobId || !durations || !Array.isArray(durations)) {
     return res.status(400).json({ error: "Invalid payload" });
   }
@@ -160,6 +160,9 @@ app.post("/api/generate", async (req, res) => {
     }
     finalDurations = finalDurations.slice(0, rawImages.length);
 
+    // Calculate total duration
+    const totalDuration = Number(finalDurations.reduce((acc, d) => acc + d, 0).toFixed(3));
+
     // Pixel-perfect Normalization
     jobs.get(jobId).status = "normalizing";
     const normalizedFiles = [];
@@ -195,20 +198,23 @@ app.post("/api/generate", async (req, res) => {
       }
     }
 
-    // Build concat.txt EXACTLY
-    const concatTxtPath = path.join(jobDir, "concat.txt");
-    let concatContent = "";
-    let totalDuration = 0;
-    
-    for (let i = 0; i < normalizedFiles.length; i++) {
-      concatContent += `file '${normalizedFiles[i].replace(/'/g, "'\\''")}'\n`;
-      concatContent += `duration ${finalDurations[i]}\n`;
-      totalDuration += finalDurations[i];
+    // Process Transitions
+    const allowedTransitions = new Set(["none", "fade", "smoothleft", "smoothright", "slideleft", "slideright"]);
+    let parsedTransitions: string[] = [];
+    if (Array.isArray(transitions)) {
+      parsedTransitions = transitions.map(t => allowedTransitions.has(t) ? t : "none");
     }
-    // FFmpeg concat requires the last file to be repeated without duration
-    concatContent += `file '${normalizedFiles[normalizedFiles.length - 1].replace(/'/g, "'\\''")}'\n`;
-    
-    fs.writeFileSync(concatTxtPath, concatContent);
+    while (parsedTransitions.length < normalizedFiles.length - 1) {
+      parsedTransitions.push("none");
+    }
+    parsedTransitions = parsedTransitions.slice(0, normalizedFiles.length - 1);
+
+    const rawTransDurs = Array.isArray(transitionDurations) ? transitionDurations : [];
+    const baseTransDuration = typeof transitionDuration === "number" && transitionDuration > 0
+      ? transitionDuration
+      : 0.5;
+
+    const hasActiveTransitions = normalizedFiles.length > 1 && parsedTransitions.some(t => t !== "none");
 
     // Check for audio
     const audioFiles = files
@@ -223,35 +229,160 @@ app.post("/api/generate", async (req, res) => {
       
     const hasAudio = audioFiles.length > 0;
 
-    // We will segment the output into approx 120 second chunks
     const playlistPath = path.join(jobDir, "playlist.csv");
     const chunkPattern = path.join(jobDir, "chunk_%03d.mp4");
 
-    let ffmpegArgs = [
-      "-y", "-nostdin",
-      "-f", "concat",
-      "-safe", "0",
-      "-i", concatTxtPath
-    ];
+    let ffmpegArgs: string[] = ["-y", "-nostdin"];
 
-    if (hasAudio) {
-      if (audioFiles.length === 1) {
-        ffmpegArgs.push("-i", path.join(jobDir, audioFiles[0]));
-      } else {
+    if (!hasActiveTransitions) {
+      // MODE A: Ultra-fast concat demuxer (when all transitions are 'none' or single image)
+      const concatTxtPath = path.join(jobDir, "concat.txt");
+      let concatContent = "";
+      
+      for (let i = 0; i < normalizedFiles.length; i++) {
+        concatContent += `file '${normalizedFiles[i].replace(/\\/g, "/").replace(/'/g, "'\\''")}'\n`;
+        concatContent += `duration ${finalDurations[i]}\n`;
+      }
+      concatContent += `file '${normalizedFiles[normalizedFiles.length - 1].replace(/\\/g, "/").replace(/'/g, "'\\''")}'\n`;
+      fs.writeFileSync(concatTxtPath, concatContent);
+
+      ffmpegArgs.push(
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concatTxtPath
+      );
+
+      if (hasAudio) {
         audioFiles.forEach(f => {
           ffmpegArgs.push("-i", path.join(jobDir, f));
         });
       }
-    }
 
-    ffmpegArgs = ffmpegArgs.concat([
-      "-r", "30",
-      "-c:v", "libx264",
-      "-preset", "ultrafast",
-      "-crf", "18",
-      "-tune", "stillimage",
-      "-pix_fmt", "yuv420p"
-    ]);
+      ffmpegArgs = ffmpegArgs.concat([
+        "-r", "30",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "18",
+        "-tune", "stillimage",
+        "-pix_fmt", "yuv420p"
+      ]);
+    } else {
+      // MODE B: Pure video concat pipeline with pre-rendered holds and xfade transition clips
+      // 1. Calculate per-transition durations ensuring each transition does not exceed 80% of adjacent clip durations
+      const safeTransDurations: number[] = [];
+      for (let i = 0; i < parsedTransitions.length; i++) {
+        if (parsedTransitions[i] !== "none") {
+          const requested = typeof rawTransDurs[i] === "number" && rawTransDurs[i] > 0
+            ? rawTransDurs[i]
+            : baseTransDuration;
+          const maxAllowed = Math.min(finalDurations[i], finalDurations[i + 1]) * 0.8;
+          safeTransDurations[i] = Number(Math.min(requested, Math.max(0.15, maxAllowed)).toFixed(3));
+        } else {
+          safeTransDurations[i] = 0;
+        }
+      }
+      const halfDurations = safeTransDurations.map(d => Number((d / 2).toFixed(3)));
+
+      // 2. Prepare micro-encode tasks for both static holds and active transition clips
+      const tasks: { type: 'hold' | 'trans'; index: number; args: string[]; outPath: string }[] = [];
+
+      for (let i = 0; i < normalizedFiles.length; i++) {
+        const incomingHalf = i > 0 ? halfDurations[i - 1] : 0;
+        const outgoingHalf = i < parsedTransitions.length ? halfDurations[i] : 0;
+        const staticHold = Number(Math.max(0.04, finalDurations[i] - incomingHalf - outgoingHalf).toFixed(3));
+        const holdPath = path.join(jobDir, `hold_${i}.mp4`);
+
+        tasks.push({
+          type: 'hold',
+          index: i,
+          outPath: holdPath,
+          args: [
+            "-y", "-nostdin",
+            "-loop", "1", "-t", staticHold.toString(), "-i", normalizedFiles[i],
+            "-r", "30", "-c:v", "libx264", "-preset", "ultrafast",
+            "-tune", "stillimage", "-crf", "18", "-pix_fmt", "yuv420p",
+            holdPath
+          ]
+        });
+
+        if (i < parsedTransitions.length && parsedTransitions[i] !== "none") {
+          const transPath = path.join(jobDir, `trans_${i}.mp4`);
+          const dur = safeTransDurations[i];
+          const transType = parsedTransitions[i];
+          tasks.push({
+            type: 'trans',
+            index: i,
+            outPath: transPath,
+            args: [
+              "-y", "-nostdin",
+              "-loop", "1", "-t", dur.toString(), "-i", normalizedFiles[i],
+              "-loop", "1", "-t", dur.toString(), "-i", normalizedFiles[i + 1],
+              "-filter_complex", `[0:v][1:v]xfade=transition=${transType}:duration=${dur}:offset=0[v]`,
+              "-map", "[v]",
+              "-r", "30", "-c:v", "libx264", "-preset", "ultrafast",
+              "-crf", "18", "-pix_fmt", "yuv420p",
+              transPath
+            ]
+          });
+        }
+      }
+
+      // 3. Render micro-encode tasks in parallel worker pool (concurrency 10)
+      const BATCH_CONCURRENCY = 10;
+      let completedTasks = 0;
+      for (let i = 0; i < tasks.length; i += BATCH_CONCURRENCY) {
+        const batch = tasks.slice(i, i + BATCH_CONCURRENCY);
+        await Promise.all(batch.map(async (task) => {
+          await new Promise<void>((resolve, reject) => {
+            const proc = spawn(ffmpegPath as string, task.args);
+            proc.stderr.on("data", () => {});
+            proc.on("error", reject);
+            proc.on("close", (code) => {
+              if (code === 0) resolve();
+              else reject(new Error(`Failed rendering ${task.type}_${task.index} (code ${code})`));
+            });
+          });
+
+          completedTasks++;
+          const p = jobs.get(jobId);
+          if (p) {
+            p.progress = 15 + Math.round((completedTasks / tasks.length) * 35); // 15% to 50%
+            p.lastUpdateTime = Date.now();
+            broadcast(jobId, "progress", { progress: p.progress, eta: null });
+          }
+        }));
+      }
+
+      // 4. Assemble pure video concat.txt (all MP4s, 100% demuxer compatible)
+      const concatTxtPath = path.join(jobDir, "concat.txt");
+      let concatContent = "";
+      for (let i = 0; i < normalizedFiles.length; i++) {
+        const holdPath = path.join(jobDir, `hold_${i}.mp4`);
+        concatContent += `file '${holdPath.replace(/\\/g, "/").replace(/'/g, "'\\''")}'\n`;
+
+        if (i < parsedTransitions.length && parsedTransitions[i] !== "none") {
+          const transPath = path.join(jobDir, `trans_${i}.mp4`);
+          concatContent += `file '${transPath.replace(/\\/g, "/").replace(/'/g, "'\\''")}'\n`;
+        }
+      }
+      fs.writeFileSync(concatTxtPath, concatContent);
+
+      ffmpegArgs.push(
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concatTxtPath
+      );
+
+      if (hasAudio) {
+        audioFiles.forEach(f => {
+          ffmpegArgs.push("-i", path.join(jobDir, f));
+        });
+      }
+
+      ffmpegArgs = ffmpegArgs.concat([
+        "-c:v", "copy"
+      ]);
+    }
 
     if (hasAudio) {
       if (audioFiles.length === 1) {
@@ -264,11 +395,9 @@ app.post("/api/generate", async (req, res) => {
         let filterComplexStr = "";
         let concatStreams = "";
         for (let i = 0; i < audioFiles.length; i++) {
-          // Normalize sample rate and channels BEFORE concat to prevent dropping streams
           filterComplexStr += `[${i + 1}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[a${i}];`;
           concatStreams += `[a${i}]`;
         }
-        // Concat the normalized streams and add apad to fill any remaining video duration with silence
         filterComplexStr += `${concatStreams}concat=n=${audioFiles.length}:v=0:a=1,aresample=async=1000,apad[aout]`;
         
         ffmpegArgs = ffmpegArgs.concat([
@@ -329,7 +458,9 @@ app.post("/api/generate", async (req, res) => {
       const frameMatch = output.match(/frame=\s*(\d+)/);
       if (frameMatch) {
         const frame = parseInt(frameMatch[1], 10);
-        let currentProgress = 15 + Math.min(84, (frame / totalFrames) * 84); // 15% to 99%
+        const basePct = hasActiveTransitions ? 50 : 15;
+        const remainingPct = 99 - basePct;
+        let currentProgress = basePct + Math.min(remainingPct, (frame / totalFrames) * remainingPct);
         
         const job = jobs.get(jobId);
         if (job && currentProgress > job.progress) {
@@ -338,10 +469,10 @@ app.post("/api/generate", async (req, res) => {
           const pct = currentProgress / 100;
           let newEta = pct > 0 ? (elapsed / pct) - elapsed : 0;
           
-          job.progress = currentProgress;
+          job.progress = Math.round(currentProgress);
           job.eta = newEta;
           job.lastUpdateTime = now;
-          broadcast(jobId, "progress", { progress: currentProgress, eta: newEta });
+          broadcast(jobId, "progress", { progress: job.progress, eta: newEta });
         }
       }
     });

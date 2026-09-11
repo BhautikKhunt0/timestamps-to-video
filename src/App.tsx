@@ -1,6 +1,17 @@
 import React, { useState, useRef, useEffect } from "react";
-import { Upload, FileVideo, AlertCircle, Loader2, Video, X, CheckCircle2, Download, Play, Music, RefreshCw, ExternalLink, Clock, Layers } from "lucide-react";
+import { 
+  Upload, FileVideo, AlertCircle, Loader2, Video, X, CheckCircle2, 
+  Download, Play, Music, RefreshCw, ExternalLink, Clock, Layers,
+  Sparkles, Scissors, ArrowLeft, ArrowRight, Wand2, ChevronDown, ChevronUp, Shuffle
+} from "lucide-react";
 import { parseTimestamps } from "./utils/parser";
+
+const TRANSITIONS_CONFIG = [
+  { id: "none", name: "None (Cut)", icon: Scissors, color: "text-neutral-400", border: "border-neutral-700/60", bg: "bg-neutral-800" },
+  { id: "fade", name: "Fade", icon: Sparkles, color: "text-blue-400", border: "border-blue-500/60", bg: "bg-blue-950/40" },
+  { id: "smoothleft", name: "Smooth Slide Left", icon: ArrowLeft, color: "text-cyan-400", border: "border-cyan-500/60", bg: "bg-cyan-950/40" },
+  { id: "smoothright", name: "Smooth Slide Right", icon: ArrowRight, color: "text-teal-400", border: "border-teal-500/60", bg: "bg-teal-950/40" }
+];
 
 const safeParseResponse = async (res: Response): Promise<{ ok: boolean; data: any; error?: string }> => {
   try {
@@ -28,6 +39,58 @@ const safeParseResponse = async (res: Response): Promise<{ ok: boolean; data: an
   }
 };
 
+const CustomSelect = ({ value, onChange, options, className = "", dropdownUp = false }: any) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  const selectedOption = options.find((opt: any) => opt.value === value) || options[0];
+
+  return (
+    <div className={`relative ${className}`} ref={containerRef}>
+      <button
+        type="button"
+        onClick={() => setIsOpen(!isOpen)}
+        className="w-full flex items-center justify-between gap-3 px-3 py-1.5 bg-black/60 border border-white/10 rounded-lg text-sm text-neutral-200 hover:bg-black/80 hover:border-white/20 transition-all focus:outline-none focus:ring-1 focus:ring-blue-500"
+      >
+        <span className="truncate">{selectedOption?.label}</span>
+        <ChevronDown className={`w-3.5 h-3.5 text-neutral-400 transition-transform ${isOpen ? "rotate-180" : ""}`} />
+      </button>
+      
+      {isOpen && (
+        <div className={`absolute z-50 w-full bg-[#111111] border border-white/10 rounded-lg shadow-2xl py-1 max-h-48 overflow-y-auto custom-scrollbar ${dropdownUp ? "bottom-full mb-1" : "top-full mt-1"}`}>
+          {options.map((opt: any) => (
+            <button
+              key={opt.value}
+              type="button"
+              className={`w-full text-left px-3 py-2 text-sm transition-colors ${
+                opt.value === value 
+                  ? "bg-blue-500/20 text-blue-400 font-medium" 
+                  : "text-neutral-300 hover:bg-white/5"
+              }`}
+              onClick={() => {
+                onChange(opt.value);
+                setIsOpen(false);
+              }}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
 export default function App() {
   const [images, setImages] = useState<File[]>([]);
   const [imageUrls, setImageUrls] = useState<string[]>([]);
@@ -35,6 +98,16 @@ export default function App() {
   const [defaultDurationPerImage, setDefaultDurationPerImage] = useState(5);
   
   const [audioFiles, setAudioFiles] = useState<File[]>([]);
+
+  // Transition States
+  const [globalTransition, setGlobalTransition] = useState<string>("none");
+  const [categoryDurations, setCategoryDurations] = useState<Record<string, number>>({
+    fade: 0.5,
+    smoothleft: 0.5,
+    smoothright: 0.5
+  });
+  const [transitions, setTransitions] = useState<string[]>([]);
+  const [showAllCuts, setShowAllCuts] = useState<boolean>(false);
 
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -98,6 +171,7 @@ export default function App() {
 
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
+    e.currentTarget.classList.remove('drag-over');
     if (e.dataTransfer.files) {
       const filesArray = Array.from(e.dataTransfer.files).filter((file: File) => file.type.startsWith('image/'));
       setImages(prev => {
@@ -111,10 +185,71 @@ export default function App() {
 
   const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
+    e.currentTarget.classList.add('drag-over');
+  };
+
+  const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.currentTarget.classList.remove('drag-over');
+  };
+
+  useEffect(() => {
+    const needed = Math.max(0, images.length - 1);
+    setTransitions(prev => {
+      if (prev.length === needed) return prev;
+      if (prev.length < needed) {
+        const added = new Array(needed - prev.length).fill("none");
+        return [...prev, ...added];
+      }
+      return prev.slice(0, needed);
+    });
+  }, [images.length]);
+
+  const handleCategoryDurationChange = (category: string, newDuration: number) => {
+    if (category === "none") return;
+    setCategoryDurations(prev => ({
+      ...prev,
+      [category]: newDuration
+    }));
+
+    const categoryName = TRANSITIONS_CONFIG.find(c => c.id === category)?.name || category;
+    setSuccessMessage(`Updated all ${categoryName} transitions duration to ${newDuration}s.`);
+    setTimeout(() => setSuccessMessage(""), 3500);
+  };
+
+  const handleApplyToAll = (transType: string) => {
+    const needed = Math.max(0, images.length - 1);
+    const chosenDur = categoryDurations[transType] || 0.5;
+    setTransitions(new Array(needed).fill(transType));
+    setGlobalTransition(transType);
+    const catName = TRANSITIONS_CONFIG.find(t => t.id === transType)?.name || transType;
+    setSuccessMessage(`Applied "${catName}" (${transType === "none" ? "Cut" : chosenDur + "s"}) to all ${needed} cuts.`);
+    setTimeout(() => setSuccessMessage(""), 4000);
+  };
+
+  const handleSpecificTransition = (index: number, transType: string) => {
+    setTransitions(prev => {
+      const updated = [...prev];
+      updated[index] = transType;
+      return updated;
+    });
+  };
+
+  const handleResetTransitions = () => {
+    const needed = Math.max(0, images.length - 1);
+    setTransitions(new Array(needed).fill("none"));
+    setGlobalTransition("none");
+    setSuccessMessage("Reset all cuts to standard Cuts (None).");
+    setTimeout(() => setSuccessMessage(""), 3500);
   };
 
   const removeImage = (index: number) => {
     setImages(prev => prev.filter((_, i) => i !== index));
+    setTransitions(prev => {
+      if (prev.length === 0) return [];
+      const transIndexToRemove = index === 0 ? 0 : index - 1;
+      return prev.filter((_, i) => i !== transIndexToRemove);
+    });
   };
 
   const stopActiveTracking = () => {
@@ -279,7 +414,10 @@ export default function App() {
         },
         body: JSON.stringify({
           jobId,
-          durations: finalDurations
+          durations: finalDurations,
+          transitions,
+          transitionDurations: transitions.map(t => t === "none" ? 0 : (categoryDurations[t] || 0.5)),
+          transitionDuration: categoryDurations["fade"] || 0.5
         })
       });
 
@@ -307,7 +445,6 @@ export default function App() {
     try {
       setDownloadingIndex(index);
       const link = document.createElement("a");
-      // Add download query param so the server sets Content-Disposition attachment
       link.href = url + "?download=1";
       link.download = `rendered_video_${index + 1}.mp4`;
       document.body.appendChild(link);
@@ -317,7 +454,6 @@ export default function App() {
       console.error('Download error:', err);
       alert('Failed to download video. You can still right-click the video and save it.');
     } finally {
-      // Small timeout to allow the click to register before clearing the loading state
       setTimeout(() => {
         setDownloadingIndex(null);
         setDownloadProgress(0);
@@ -326,23 +462,46 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-[#0a0a0a] text-neutral-200 font-sans selection:bg-indigo-500/30">
-      <div className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 lg:gap-10">
-          <div className="lg:col-span-7 space-y-8">
-            <div className="bg-neutral-800/40 p-5 sm:p-6 rounded-2xl border border-neutral-700/40 shadow-sm space-y-5">
+    <div className="min-h-screen relative overflow-hidden bg-[#050505] text-neutral-200 font-sans selection:bg-blue-500/30">
+      {/* Dynamic Background Glows */}
+      <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] rounded-full bg-blue-900/20 blur-[120px] pointer-events-none" />
+      <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] rounded-full bg-cyan-900/10 blur-[120px] pointer-events-none" />
+
+      {/* Header */}
+      <header className="relative z-10 w-full border-b border-white/5 bg-black/40 backdrop-blur-md">
+        <div className="max-w-[1400px] mx-auto px-6 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="p-2 rounded-xl bg-gradient-to-br from-blue-500 to-cyan-400 shadow-[0_0_20px_rgba(59,130,246,0.3)]">
+              <Video className="w-5 h-5 text-white" />
+            </div>
+            <h1 className="text-xl font-bold tracking-wide text-transparent bg-clip-text bg-gradient-to-r from-white to-neutral-400">
+              Studio
+            </h1>
+          </div>
+        </div>
+      </header>
+
+      <main className="relative z-10 max-w-[1400px] mx-auto px-4 sm:px-6 py-8">
+        <div className="grid grid-cols-1 xl:grid-cols-12 gap-8">
+          
+          {/* LEFT COLUMN: Input & Configuration (7 columns on extra large screens) */}
+          <div className="xl:col-span-7 space-y-6">
+            
+            {/* 1. Media Assets */}
+            <section className="glass-panel rounded-2xl p-6 space-y-6">
               <div className="flex items-center justify-between">
                 <h2 className="text-lg font-semibold text-white flex items-center gap-2">
-                  <Layers className="w-5 h-5 text-indigo-400" />
-                  1. Media Assets
+                  <Layers className="w-5 h-5 text-blue-400" />
+                  Media Assets
                 </h2>
                 {images.length > 0 && (
                   <button 
                     onClick={() => {
                       setImages([]);
+                      setTransitions([]);
                       if (fileInputRef.current) fileInputRef.current.value = "";
                     }}
-                    className="text-xs font-semibold text-red-400 hover:text-red-300 bg-red-400/10 hover:bg-red-400/20 px-2.5 py-1 rounded transition-colors"
+                    className="text-xs font-semibold text-rose-400 hover:text-rose-300 bg-rose-500/10 hover:bg-rose-500/20 px-3 py-1.5 rounded-lg transition-all"
                   >
                     Clear All
                   </button>
@@ -351,206 +510,348 @@ export default function App() {
               
               <div 
                 id="drop-zone"
-                className="border-2 border-dashed border-neutral-700 hover:border-indigo-500/60 bg-neutral-900/40 hover:bg-indigo-950/10 rounded-xl p-6 sm:p-8 text-center cursor-pointer transition-all duration-200"
+                className="border-2 border-dashed border-white/10 hover:border-blue-500/50 hover:bg-blue-500/5 rounded-2xl p-10 cursor-pointer group transition-all duration-300 ease-out"
                 onClick={() => fileInputRef.current?.click()}
                 onDrop={handleDrop}
                 onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
               >
-                <input 
-                  type="file" 
-                  ref={fileInputRef} 
-                  multiple 
-                  accept="image/*"
-                  onChange={handleImageChange}
-                  className="hidden" 
-                />
-                <div className="flex flex-col items-center gap-2.5">
-                  <div className="p-3 bg-neutral-800 rounded-full text-neutral-400 group-hover:text-indigo-400">
-                    <Upload className="w-6 h-6" />
+                <div className="flex flex-col items-center justify-center gap-4 h-full">
+                  <input 
+                    type="file" 
+                    ref={fileInputRef} 
+                    multiple 
+                    accept="image/*"
+                    onChange={handleImageChange}
+                    className="hidden" 
+                  />
+                  <div className="p-4 bg-white/5 rounded-full text-blue-400 group-hover:scale-110 group-hover:bg-blue-500/20 group-hover:shadow-[0_0_20px_rgba(59,130,246,0.3)] transition-all duration-300">
+                    <Upload className="w-8 h-8" />
                   </div>
-                  <span className="font-medium text-sm text-neutral-200">
-                    Click to browse or drag & drop images
-                  </span>
-                  <span className="text-xs text-neutral-500">
-                    JPG, PNG, WebP • Auto-sorted alphabetically (1.jpg, 2.jpg...)
-                  </span>
+                  <div className="text-center">
+                    <h3 className="font-semibold text-neutral-200 text-lg">Click to Browse or Drag & Drop</h3>
+                    <p className="text-sm text-neutral-500 mt-1">JPG, PNG, WebP • Auto-sorted alphabetically</p>
+                  </div>
                 </div>
               </div>
 
-              {/* Audio Upload */}
-              <div className="pt-2 border-t border-neutral-700/40">
-                <div 
-                  className="mt-3 flex items-center gap-4 bg-neutral-900/60 border border-neutral-700/60 rounded-xl p-4 cursor-pointer hover:border-indigo-500/50 transition-colors"
-                  onClick={() => audioInputRef.current?.click()}
-                >
-                  <input
-                    type="file"
-                    ref={audioInputRef}
-                    multiple
-                    accept="audio/*"
-                    onChange={handleAudioChange}
-                    className="hidden"
-                  />
-                  <div className="p-2.5 bg-neutral-800 rounded-full text-indigo-400 shrink-0">
-                    <Music className="w-5 h-5" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <h3 className="text-sm font-semibold text-neutral-200 truncate">
-                      Add Background Audio (Optional)
-                    </h3>
-                    <p className="text-xs text-neutral-500 truncate">
-                      Click to select MP3, WAV, AAC (Multiple files supported)
-                    </p>
-                  </div>
+              {/* Audio Upload Pill */}
+              <div 
+                className="flex items-center gap-4 bg-white/[0.03] border border-white/5 rounded-xl p-3 cursor-pointer hover:bg-white/[0.06] transition-colors group"
+                onClick={() => audioInputRef.current?.click()}
+              >
+                <input
+                  type="file"
+                  ref={audioInputRef}
+                  multiple
+                  accept="audio/*"
+                  onChange={handleAudioChange}
+                  className="hidden"
+                />
+                <div className="p-2.5 bg-blue-500/10 rounded-lg text-blue-400 group-hover:bg-blue-500/20 transition-colors shrink-0">
+                  <Music className="w-5 h-5" />
                 </div>
+                <div className="flex-1 min-w-0">
+                  <h3 className="text-sm font-semibold text-neutral-200 truncate">Background Audio Track</h3>
+                  <p className="text-xs text-neutral-500 truncate">Optional • Select MP3, WAV</p>
+                </div>
+              </div>
 
-                {audioFiles.length > 0 && (
-                  <div className="mt-3 space-y-2 max-h-40 overflow-y-auto custom-scrollbar pr-2">
-                    {audioFiles.map((file, idx) => (
-                      <div key={`${file.name}-${idx}`} className="flex items-center justify-between p-2.5 bg-neutral-900 border border-neutral-800 rounded-lg">
-                        <div className="flex items-center gap-3 min-w-0">
-                          <span className="text-[10px] bg-neutral-800 text-neutral-400 px-1.5 py-0.5 rounded font-mono shrink-0">
-                            {idx + 1}
-                          </span>
-                          <span className="text-xs font-medium text-neutral-300 truncate">
-                            {file.name}
-                          </span>
-                          <span className="text-[10px] text-neutral-500 shrink-0">
-                            {(file.size / 1024 / 1024).toFixed(2)} MB
-                          </span>
-                        </div>
+              {/* Audio Files List */}
+              {audioFiles.length > 0 && (
+                <div className="space-y-2 max-h-32 overflow-y-auto custom-scrollbar pr-2">
+                  {audioFiles.map((file, idx) => (
+                    <div key={`${file.name}-${idx}`} className="flex items-center justify-between p-3 bg-black/40 border border-white/5 rounded-xl">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <span className="text-[10px] bg-blue-500/20 text-blue-300 px-1.5 py-0.5 rounded font-mono shrink-0">Track {idx + 1}</span>
+                        <span className="text-xs font-medium text-neutral-300 truncate">{file.name}</span>
+                        <span className="text-[10px] text-neutral-500 shrink-0">{(file.size / 1024 / 1024).toFixed(2)} MB</span>
+                      </div>
+                      <button 
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setAudioFiles(prev => prev.filter((_, i) => i !== idx));
+                        }}
+                        className="p-1.5 hover:bg-white/10 rounded-lg text-neutral-400 hover:text-rose-400 shrink-0 transition-colors"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Image Grid */}
+              {images.length > 0 && (
+                <div className="grid grid-cols-4 sm:grid-cols-5 md:grid-cols-6 gap-3 max-h-64 overflow-y-auto pr-2 custom-scrollbar pt-2">
+                  {images.map((file, index) => (
+                    <div key={`${file.name}-${index}`} className="relative group aspect-square rounded-xl overflow-hidden bg-black border border-white/10 shadow-lg">
+                      <img 
+                        src={imageUrls[index]} 
+                        alt={file.name} 
+                        className="w-full h-full object-cover group-hover:scale-110 group-hover:rotate-1 transition-all duration-500" 
+                      />
+                      <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/30 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 backdrop-blur-[2px]">
                         <button 
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setAudioFiles(prev => prev.filter((_, i) => i !== idx));
-                          }}
-                          className="p-1 hover:bg-neutral-800 rounded text-neutral-400 hover:text-red-400 shrink-0 transition-colors"
+                          onClick={(e) => { e.stopPropagation(); removeImage(index); }}
+                          className="absolute top-2 right-2 p-1.5 bg-rose-500/80 hover:bg-rose-500 text-white rounded-lg transition-colors backdrop-blur-md shadow-lg"
                         >
                           <X className="w-3.5 h-3.5" />
                         </button>
+                        <span className="absolute bottom-2 left-2 right-2 text-[10px] font-medium text-white truncate drop-shadow-md">
+                          {file.name}
+                        </span>
                       </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              {images.length > 0 && (
-                <div className="pt-2">
-                  <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-3 max-h-64 overflow-y-auto pr-2 custom-scrollbar">
-                    {images.map((file, index) => (
-                      <div key={`${file.name}-${index}`} className="relative group aspect-square rounded-lg overflow-hidden bg-neutral-900 border border-neutral-800">
-                        <img 
-                          src={imageUrls[index]} 
-                          alt={file.name} 
-                          className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" 
-                        />
-                        <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/20 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-200">
-                          <button 
-                            onClick={(e) => { e.stopPropagation(); removeImage(index); }}
-                            className="absolute top-1.5 right-1.5 p-1 bg-black/60 hover:bg-red-500 text-white rounded-full transition-colors backdrop-blur-sm"
-                          >
-                            <X className="w-3.5 h-3.5" />
-                          </button>
-                          <span className="absolute bottom-1.5 left-2 right-2 text-[10px] font-mono text-white truncate drop-shadow-md">
-                            {file.name}
-                          </span>
-                        </div>
-                        <div className="absolute top-1.5 left-1.5 px-1.5 py-0.5 bg-black/70 backdrop-blur-md rounded text-[10px] font-mono text-neutral-300">
-                          {index + 1}
-                        </div>
+                      <div className="absolute top-2 left-2 px-2 py-0.5 bg-black/60 backdrop-blur-md rounded-md text-[10px] font-mono font-bold text-white shadow-sm border border-white/10">
+                        {index + 1}
                       </div>
-                    ))}
-                  </div>
+                    </div>
+                  ))}
                 </div>
               )}
-            </div>
+            </section>
 
-            <div className="bg-neutral-800/40 p-5 sm:p-6 rounded-2xl border border-neutral-700/40 shadow-sm space-y-4">
+            {/* 3. Timestamps / Durations */}
+            <section className="glass-panel rounded-2xl p-6 space-y-5">
               <div className="flex items-center justify-between">
                 <h2 className="text-lg font-semibold text-white flex items-center gap-2">
-                  <Clock className="w-5 h-5 text-indigo-400" />
-                  2. Exact Timestamps
+                  <Clock className="w-5 h-5 text-cyan-400" />
+                  Script / Durations
                 </h2>
               </div>
               
-              <textarea 
-                className="w-full h-36 p-3.5 bg-neutral-900/90 border border-neutral-700 rounded-xl focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all text-xs sm:text-sm font-mono text-neutral-200 resize-none placeholder:text-neutral-600 leading-relaxed"
-                placeholder="Paste timestamps (e.g. 1:55.438) or leave empty for uniform slide durations"
-                value={script}
-                onChange={(e) => setScript(e.target.value)}
-              />
+              <div className="relative focus-ring-glow rounded-xl transition-all duration-300">
+                <textarea 
+                  className="w-full h-32 p-4 bg-black/50 border border-white/10 rounded-xl focus:outline-none text-sm font-mono text-neutral-200 resize-none placeholder:text-neutral-600 leading-relaxed custom-scrollbar"
+                  placeholder="Paste timestamps (e.g. 1:55.438) or leave empty for uniform slide durations"
+                  value={script}
+                  onChange={(e) => setScript(e.target.value)}
+                />
+              </div>
 
-              <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-4 bg-white/[0.02] p-3 rounded-xl border border-white/5">
                 <div className="flex items-center gap-2">
-                  <span className="text-neutral-400">Parsed Timestamps:</span>
-                  <span className="px-2 py-0.5 bg-indigo-950/80 text-indigo-300 border border-indigo-800/60 rounded font-mono font-semibold">
+                  <span className="text-xs text-neutral-400">Parsed Timestamps:</span>
+                  <span className="px-2.5 py-1 bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 rounded-md text-xs font-mono font-bold shadow-inner">
                     {durations.length}
                   </span>
                   {durations.length > 0 && (
-                    <span className="text-neutral-500 font-mono">
-                      (Total: ~{durations.reduce((a, b) => a + b, 0).toFixed(1)}s)
+                    <span className="text-xs text-neutral-500 font-mono">
+                      (~{durations.reduce((a, b) => a + b, 0).toFixed(1)}s total)
                     </span>
                   )}
                 </div>
 
                 {durations.length === 0 && (
-                  <div className="flex items-center gap-2 text-neutral-400">
-                    <Clock className="w-3.5 h-3.5 text-indigo-400" />
+                  <div className="flex items-center gap-2 text-xs text-neutral-400">
+                    <Clock className="w-3.5 h-3.5 text-cyan-500" />
                     <span>Default duration:</span>
-                    <select
+                    <CustomSelect
                       value={defaultDurationPerImage}
-                      onChange={(e) => setDefaultDurationPerImage(Number(e.target.value))}
-                      className="bg-neutral-900 border border-neutral-700 rounded px-2 py-0.5 text-neutral-200 text-xs font-mono"
-                    >
-                      <option value={2}>2s / image</option>
-                      <option value={3}>3s / image</option>
-                      <option value={4}>4s / image</option>
-                      <option value={5}>5s / image</option>
-                      <option value={8}>8s / image</option>
-                      <option value={10}>10s / image</option>
-                    </select>
+                      onChange={(val: any) => setDefaultDurationPerImage(Number(val))}
+                      options={[
+                        { value: 2, label: '2s / slide' },
+                        { value: 3, label: '3s / slide' },
+                        { value: 4, label: '4s / slide' },
+                        { value: 5, label: '5s / slide' },
+                        { value: 8, label: '8s / slide' },
+                        { value: 10, label: '10s / slide' },
+                      ]}
+                      className="w-32"
+                    />
                   </div>
                 )}
 
                 {durations.length > 0 && images.length > 0 && durations.length !== images.length && (
-                  <span className="text-amber-400 flex items-center gap-1 font-medium">
+                  <span className="text-amber-400 flex items-center gap-1.5 text-xs font-medium px-3 py-1 bg-amber-500/10 rounded-lg border border-amber-500/20">
                     <AlertCircle className="w-3.5 h-3.5" />
-                    {images.length} images vs {durations.length} timestamps (auto-aligned)
+                    {images.length} images vs {durations.length} timestamps
                   </span>
                 )}
               </div>
-            </div>
+            </section>
 
           </div>
 
-          <div className="lg:col-span-5 space-y-6">
-            <div className="bg-neutral-800/60 backdrop-blur-sm p-5 sm:p-6 rounded-2xl border border-neutral-700/60 shadow-xl space-y-6 sticky top-8">
+          {/* RIGHT COLUMN: Transitions & Output (5 columns on extra large screens) */}
+          <div className="xl:col-span-5 space-y-6">
+            
+            {/* 2. Video Transitions */}
+            <section className="glass-panel rounded-2xl p-6 space-y-6 relative overflow-hidden">
+              <div className="absolute top-0 right-0 w-32 h-32 bg-blue-500/10 blur-[50px] pointer-events-none" />
               
-              <div className="flex justify-between items-center">
-                <h2 className="text-lg font-semibold text-white flex items-center gap-2">
-                  <Video className="w-5 h-5 text-indigo-400" />
-                  3. Preview & Export
-                </h2>
-                {videoUrls.length > 0 && !loading && (
-                  <span className="flex items-center gap-1.5 text-xs text-emerald-400 bg-emerald-950/60 border border-emerald-800/60 px-2.5 py-1 rounded-full font-medium">
-                    <CheckCircle2 className="w-3.5 h-3.5" />
-                    Ready
-                  </span>
+              <div className="flex flex-wrap items-center justify-between gap-2 relative z-10">
+                <div className="flex items-center gap-2.5">
+                  <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+                    <Wand2 className="w-5 h-5 text-blue-400" />
+                    Transitions
+                  </h2>
+                  {images.length > 1 && (
+                    <span className="px-2 py-0.5 text-[10px] bg-blue-500/20 text-blue-300 border border-blue-500/30 rounded-md font-mono font-bold shadow-sm">
+                      {transitions.filter(t => t !== "none").length} active
+                    </span>
+                  )}
+                </div>
+
+                {images.length > 1 && transitions.some(t => t !== "none") && (
+                  <button
+                    type="button"
+                    onClick={handleResetTransitions}
+                    className="px-3 py-1.5 text-xs font-medium bg-white/5 hover:bg-white/10 text-neutral-300 rounded-lg transition-colors border border-white/10"
+                  >
+                    Reset All
+                  </button>
                 )}
               </div>
 
-              {error && (
-                <div className="p-4 bg-red-950/50 border border-red-900/50 rounded-xl flex items-start gap-3">
-                  <AlertCircle className="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
+              {/* Category Presets */}
+              <div className="space-y-4 relative z-30">
+                <div className="grid grid-cols-2 gap-3">
+                  {TRANSITIONS_CONFIG.map((item) => {
+                    const Icon = item.icon;
+                    const dur = categoryDurations[item.id] || 0.5;
+                    const count = transitions.filter(t => t === item.id).length;
+
+                    return (
+                      <div
+                        key={item.id}
+                        className={`glass-card p-3.5 rounded-xl border flex flex-col gap-3 ${item.border} relative z-10 focus-within:z-50 hover:z-40`}
+                      >
+                        <div className="flex items-center gap-2.5">
+                          <div className={`p-2 rounded-lg ${item.bg} ${item.color} shadow-inner`}>
+                            <Icon className="w-4 h-4" />
+                          </div>
+                          <div>
+                            <div className="text-sm font-semibold text-white">{item.name}</div>
+                            <div className="text-[10px] text-neutral-400 font-mono mt-0.5">
+                              {count} active
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="space-y-2.5 mt-auto pt-2 border-t border-white/5">
+                          {item.id !== "none" ? (
+                            <div className="flex items-center justify-between text-xs">
+                              <span className="text-neutral-400">Duration:</span>
+                              <CustomSelect
+                                value={dur}
+                                onChange={(val: any) => handleCategoryDurationChange(item.id, Number(val))}
+                                options={[
+                                  { value: 0.3, label: '0.3s' },
+                                  { value: 0.5, label: '0.5s' },
+                                  { value: 0.8, label: '0.8s' },
+                                  { value: 1.0, label: '1.0s' },
+                                  { value: 1.5, label: '1.5s' },
+                                  { value: 2.0, label: '2.0s' },
+                                ]}
+                                className="w-24 font-mono"
+                              />
+                            </div>
+                          ) : (
+                            <div className="text-[11px] text-neutral-500 py-1 font-mono">
+                              Hard Cut (0s)
+                            </div>
+                          )}
+
+                          {images.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={() => handleApplyToAll(item.id)}
+                              className="w-full py-1.5 text-xs font-semibold bg-white/5 hover:bg-white/10 text-neutral-200 border border-white/5 rounded-lg transition-colors"
+                            >
+                              {item.id === "none" ? "Apply Cut to All" : "Apply to All"}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Granular Cuts Accordion */}
+              {images.length > 1 ? (
+                <div className="bg-black/30 rounded-xl border border-white/5 relative z-20">
+                  <button
+                    onClick={() => setShowAllCuts(!showAllCuts)}
+                    className="w-full p-3 flex items-center justify-between text-xs font-semibold text-neutral-300 hover:bg-white/5 transition-colors"
+                  >
+                    <span className="flex items-center gap-2">
+                      <Scissors className="w-3.5 h-3.5 text-blue-400" />
+                      Individual Cut Settings
+                    </span>
+                    {showAllCuts ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                  </button>
+                  
+                  {showAllCuts && (
+                    <div className="p-3 border-t border-white/5 max-h-60 overflow-y-auto custom-scrollbar space-y-2 bg-black/20">
+                      {transitions.map((trans, idx) => {
+                        const imgFrom = images[idx]?.name || `Img ${idx + 1}`;
+                        const imgTo = images[idx + 1]?.name || `Img ${idx + 2}`;
+                        const isActive = trans !== "none";
+                        const thisDur = categoryDurations[trans] || 0.5;
+
+                        return (
+                          <div key={idx} className="flex items-center justify-between p-2.5 bg-white/5 rounded-lg border border-white/5 hover:bg-white/10 transition-colors">
+                            <div className="flex flex-col min-w-0 flex-1">
+                              <span className="text-[10px] text-blue-400 font-mono font-bold">Cut #{idx + 1}</span>
+                              <div className="flex items-center gap-1.5 text-xs text-neutral-300 mt-1">
+                                <span className="truncate max-w-[80px]">{imgFrom}</span>
+                                <span className="text-neutral-500">➔</span>
+                                <span className="truncate max-w-[80px]">{imgTo}</span>
+                              </div>
+                            </div>
+                            
+                            <div className="flex items-center gap-2 shrink-0">
+                              <CustomSelect
+                                value={trans}
+                                onChange={(val: any) => handleSpecificTransition(idx, String(val))}
+                                options={[
+                                  { value: "none", label: "None" },
+                                  { value: "fade", label: "Fade" },
+                                  { value: "smoothleft", label: "Slide Left" },
+                                  { value: "smoothright", label: "Slide Right" },
+                                ]}
+                                className="w-32"
+                                dropdownUp={idx > transitions.length - 3}
+                              />
+                              {isActive ? (
+                                <span className="px-2 py-1 bg-white/5 border border-white/10 text-neutral-300 rounded-md text-[10px] font-mono shadow-inner min-w-[3rem] text-center">
+                                  {thisDur}s
+                                </span>
+                              ) : (
+                                <span className="w-12"></span>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="p-4 bg-white/5 rounded-xl border border-white/5 text-xs text-neutral-400 text-center relative z-20">
+                  Upload at least 2 images to customize transitions.
+                </div>
+              )}
+            </section>
+
+            {/* 4. Generation & Output */}
+            <section className="glass-panel rounded-2xl p-6 space-y-6 relative overflow-hidden">
+               <div className="absolute bottom-0 right-0 w-40 h-40 bg-cyan-500/10 blur-[60px] pointer-events-none" />
+               
+               {error && (
+                <div className="p-4 bg-rose-500/10 border border-rose-500/20 rounded-xl flex items-start gap-3 backdrop-blur-md relative z-10">
+                  <AlertCircle className="w-5 h-5 text-rose-500 shrink-0 mt-0.5" />
                   <div className="flex-1 min-w-0">
-                    <h3 className="text-sm font-semibold text-red-400">Error</h3>
-                    <p className="text-xs text-red-300 mt-1 break-words">{error}</p>
+                    <h3 className="text-sm font-semibold text-rose-400">Error</h3>
+                    <p className="text-xs text-rose-300/80 mt-1">{error}</p>
                   </div>
                 </div>
               )}
               
               {successMessage && (
-                <div className="p-4 bg-emerald-950/40 border border-emerald-900/50 rounded-xl flex items-start gap-3">
+                <div className="p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-xl flex items-start gap-3 backdrop-blur-md relative z-10">
                   <CheckCircle2 className="w-5 h-5 text-emerald-500 shrink-0 mt-0.5" />
                   <div className="flex-1 min-w-0">
                     <h3 className="text-sm font-semibold text-emerald-400">Success</h3>
@@ -560,49 +861,38 @@ export default function App() {
               )}
 
               {videoUrls.length > 0 ? (
-                <div className="space-y-4">
+                <div className="space-y-4 relative z-10">
                   {videoUrls.map((url, index) => (
-                    <div key={index} className="rounded-xl overflow-hidden bg-black border border-neutral-700/50 shadow-2xl flex flex-col group">
-                      <div className="aspect-video bg-black relative flex items-center justify-center group">
+                    <div key={index} className="rounded-xl overflow-hidden bg-black/80 border border-white/10 shadow-2xl flex flex-col group backdrop-blur-md">
+                      <div className="aspect-video relative flex items-center justify-center">
                         <video 
                           controls 
                           className="w-full h-full object-contain"
                           src={url}
                           controlsList="nodownload"
-                        >
-                          Your browser does not support the video tag.
-                        </video>
+                        />
                       </div>
                       
-                      <div className="bg-neutral-900 border-t border-neutral-800 p-3 flex items-center justify-between">
-                        <div className="flex items-center gap-2 px-2.5 py-1 bg-neutral-800 rounded-md">
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-                          <span className="text-[11px] font-mono font-medium text-neutral-300 uppercase tracking-wider">HD 1080p</span>
+                      <div className="bg-white/5 border-t border-white/10 p-4 flex items-center justify-between">
+                        <div className="flex items-center gap-2 px-3 py-1.5 bg-black/40 rounded-lg shadow-inner">
+                          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                          <span className="text-[10px] font-mono font-bold text-neutral-300 tracking-wider">1080p READY</span>
                         </div>
                         
                         <div className="flex gap-2">
-                          <a 
-                            href={url} 
-                            target="_blank" 
-                            rel="noreferrer"
-                            className="p-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 hover:text-white rounded-lg transition-colors flex items-center justify-center shadow-sm"
-                            title="Open in new tab"
-                          >
-                            <ExternalLink className="w-3.5 h-3.5" />
-                          </a>
                           <button 
                             onClick={() => handleDownload(url, index)}
                             disabled={downloadingIndex === index}
-                            className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 active:scale-95 text-white text-xs font-semibold rounded-lg transition-all shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                            className="inline-flex items-center gap-2 px-5 py-2 bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 active:scale-95 text-white text-xs font-bold rounded-lg transition-all shadow-[0_0_15px_rgba(59,130,246,0.3)] disabled:opacity-50 disabled:cursor-not-allowed"
                           >
                             {downloadingIndex === index ? (
                               <>
-                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                                <span>Downloading... {downloadProgress > 0 ? `${Math.round(downloadProgress)}%` : ''}</span>
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                                <span>{downloadProgress > 0 ? `${Math.round(downloadProgress)}%` : 'Saving...'}</span>
                               </>
                             ) : (
                               <>
-                                <Download className="w-3.5 h-3.5" />
+                                <Download className="w-4 h-4" />
                                 <span>Download</span>
                               </>
                             )}
@@ -613,41 +903,44 @@ export default function App() {
                   ))}
                 </div>
               ) : (
-                <div className="aspect-video bg-neutral-900/60 rounded-xl border-2 border-dashed border-neutral-800 flex flex-col items-center justify-center text-neutral-500 gap-3 p-6 text-center">
-                  <div className="p-4 bg-neutral-800/60 rounded-full">
+                <div className="aspect-video bg-black/20 rounded-xl border border-dashed border-white/10 flex flex-col items-center justify-center text-neutral-500 gap-4 p-6 text-center relative z-10 shadow-inner">
+                  <div className="p-4 bg-white/5 rounded-2xl shadow-inner">
                     <Video className="w-8 h-8 text-neutral-600" />
                   </div>
                   <div>
-                    <p className="text-sm font-medium text-neutral-300">Video output will appear here</p>
-                    <p className="text-xs text-neutral-500 mt-1">
-                      Rendered in precise 1080p {audioFiles.length > 0 ? "with Audio Sync" : "H.264 MP4"}
-                    </p>
+                    <p className="text-sm font-semibold text-neutral-400">Video preview will appear here</p>
+                    <p className="text-[11px] text-neutral-600 mt-1">Rendered in 1080p resolution</p>
                   </div>
                 </div>
               )}
 
-              <div className="space-y-2.5 pt-4">
+              <div className="pt-2 relative z-10">
                 <button
-                  id="generate-video-btn"
                   onClick={handleGenerate}
                   disabled={loading || images.length === 0}
-                  className={`relative w-full py-4 px-6 rounded-xl font-bold text-sm sm:text-base overflow-hidden transition-all duration-200 flex items-center justify-center gap-2.5 shadow-lg select-none
+                  className={`relative w-full py-4 px-6 rounded-xl font-bold text-base overflow-hidden transition-all duration-300 flex items-center justify-center gap-3 shadow-2xl select-none group
                     ${loading 
-                      ? 'bg-neutral-800 border border-indigo-500/40 text-white cursor-wait' 
+                      ? 'bg-neutral-800 border border-blue-500/30 text-white cursor-wait' 
                       : images.length === 0
-                        ? 'bg-neutral-800/80 border border-neutral-700/60 text-neutral-500 cursor-not-allowed'
-                        : 'bg-indigo-600 hover:bg-indigo-500 active:scale-[0.99] text-white hover:shadow-indigo-500/20'
+                        ? 'bg-white/5 border border-white/5 text-neutral-600 cursor-not-allowed'
+                        : 'bg-gradient-to-r from-blue-600 to-cyan-500 hover:from-blue-500 hover:to-cyan-400 active:scale-[0.98] text-white hover:shadow-[0_0_30px_rgba(34,211,238,0.4)] border border-white/10'
                     }
                   `}
                 >
+                  {/* Progress Fill Background */}
                   {loading && (
                     <div 
-                      className="absolute left-0 top-0 bottom-0 bg-indigo-600 transition-all duration-150 ease-out opacity-90" 
+                      className="absolute left-0 top-0 bottom-0 bg-gradient-to-r from-blue-600 to-cyan-600 transition-all duration-300 ease-out opacity-40" 
                       style={{ width: `${uploading ? uploadProgress : progress}%` }}
                     />
                   )}
                   
-                  <span className="relative z-10 flex items-center gap-2 tracking-wide">
+                  {/* Subtle shimmer effect when ready to generate */}
+                  {!loading && images.length > 0 && (
+                    <div className="absolute inset-0 -translate-x-full bg-gradient-to-r from-transparent via-white/20 to-transparent group-hover:animate-[shimmer_2s_infinite] skew-x-12" />
+                  )}
+                  
+                  <span className="relative z-10 flex items-center gap-2.5 tracking-wide text-shadow-sm">
                     {loading ? (
                       <>
                         <Loader2 className="w-5 h-5 animate-spin text-white" />
@@ -662,29 +955,32 @@ export default function App() {
                     ) : (
                       <>
                         <Play className="w-5 h-5 fill-current" />
-                        <span>Generate Video</span>
+                        <span>Generate Masterpiece</span>
                       </>
                     )}
                   </span>
                 </button>
+                
                 {loading && (
-                  <div className="flex items-center justify-between px-1 text-xs text-neutral-400">
-                    <span className="flex items-center gap-1.5 text-neutral-400">
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-400" />
-                      {uploading ? (uploadStatusText || 'Transferring media...') : 'Encoding with FFmpeg...'}
+                  <div className="mt-4 flex items-center justify-between px-2 text-xs font-mono">
+                    <span className="flex items-center gap-2 text-blue-400">
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      {uploading ? (uploadStatusText || 'Transferring media...') : 'Encoding with FFmpeg Engine...'}
                     </span>
                     {!uploading && progress > 0 && (
-                      <span className="font-mono text-indigo-300 font-medium">
-                        {formatEta(eta)}
+                      <span className="text-cyan-400 font-bold bg-cyan-500/10 px-2 py-0.5 rounded border border-cyan-500/20 shadow-inner">
+                        ETA: {formatEta(eta)}
                       </span>
                     )}
                   </div>
                 )}
               </div>
-            </div>
+
+            </section>
           </div>
+
         </div>
-      </div>
+      </main>
     </div>
   );
 }
