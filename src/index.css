@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,400;1,9..144,600&family=JetBrains+Mono:wght@400;500;700&display=swap');
 @import "tailwindcss";
 
 @theme {
@@ -9,50 +9,184 @@
   }
 }
 
+:root {
+  --flux-bg: #0b0b0d;
+  --flux-card: #131316;
+  --flux-card2: #17171b;
+  --flux-ink: #f2efe9;
+  --flux-ink2: #a8a29a;
+  --flux-ink3: #5f5a52;
+  --flux-line: #232327;
+  --flux-line2: #2c2c33;
+  --flux-acc: #ff5a1f;
+  --flux-acc-soft: rgba(255, 90, 31, 0.12);
+  --flux-ok: #34d399;
+  --flux-ok: #34d399;
+}
+
 @layer base {
   body {
     font-family: 'Inter', sans-serif;
-    background-color: #050505;
-    color: #e5e5e5;
+    background-color: var(--flux-bg);
+    color: var(--flux-ink);
+    background-image: radial-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+    background-size: 22px 22px;
   }
   h1, h2, h3, h4, h5, h6 {
-    font-family: 'Outfit', sans-serif;
+    font-family: 'Inter', sans-serif;
+  }
+  ::selection {
+    background: rgba(255, 90, 31, 0.3);
+  }
+  a:focus-visible, button:focus-visible, textarea:focus-visible, video:focus-visible {
+    outline: 2px solid var(--flux-acc);
+    outline-offset: 2px;
   }
 }
 
 @layer utilities {
+  .font-serif-d {
+    font-family: 'Fraunces', serif;
+  }
+  .font-mono-d {
+    font-family: 'JetBrains Mono', monospace;
+  }
+
   .custom-scrollbar::-webkit-scrollbar {
     width: 6px;
     height: 6px;
   }
-  .custom-scrollbar::-webkit-scrollbar-track {
-    background: rgba(255, 255, 255, 0.02);
-    border-radius: 4px;
-  }
   .custom-scrollbar::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.1);
+    background: #33333b;
     border-radius: 4px;
   }
-  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-    background: rgba(255, 255, 255, 0.2);
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
   }
 
-  .glass-panel {
-    @apply bg-white/[0.02] backdrop-blur-xl border border-white/10 shadow-2xl;
+  /* Signature card: solid noir surface, hairline border, single inner highlight.
+     No blurred blobs anywhere — depth comes from borders, not glow. */
+  .flux-card {
+    background: linear-gradient(180deg, var(--flux-card2), var(--flux-card));
+    border: 1px solid var(--flux-line);
+    border-radius: 22px;
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 24px 48px -24px rgba(0, 0, 0, 0.7);
   }
 
-  .glass-card {
-    @apply bg-white/[0.03] backdrop-blur-md border border-white/5 hover:bg-white/[0.05] transition-all duration-300;
+  .flux-eyebrow {
+    font-size: 11px;
+    letter-spacing: 0.22em;
+    font-weight: 700;
+    color: var(--flux-acc);
+  }
+
+  .flux-stepnum {
+    font-family: 'Fraunces', serif;
+    font-style: italic;
+    font-size: 16px;
+    color: var(--flux-ink3);
+  }
+
+  .flux-hairline {
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--flux-line2), transparent);
+  }
+
+  /* Professional-grade glow: ONE restrained ember — a 1px accent keyline plus a
+     short, tight shadow. Used only on: the active transition card, the armed
+     Render button, and focus states. Never large, never blurred everywhere. */
+  .glow-acc {
+    border-color: rgba(255, 90, 31, 0.55) !important;
+    box-shadow: 0 0 0 1px rgba(255, 90, 31, 0.35), 0 10px 26px -14px rgba(255, 90, 31, 0.55);
+  }
+
+  .btn-fire {
+    background: var(--flux-acc);
+    color: #fff;
+    transition: transform 0.18s cubic-bezier(0.22, 0.8, 0.3, 1), filter 0.15s ease, box-shadow 0.25s ease;
+    box-shadow: 0 12px 32px -10px rgba(255, 90, 31, 0.55), 0 1px 0 rgba(255, 255, 255, 0.25) inset;
+  }
+  .btn-fire:hover:not(:disabled) {
+    transform: translateY(-2px);
+    filter: brightness(1.08);
+  }
+  .btn-fire:active:not(:disabled) {
+    transform: translateY(0) scale(0.99);
+  }
+
+  .lift {
+    transition: transform 0.2s cubic-bezier(0.22, 0.8, 0.3, 1), border-color 0.2s ease, box-shadow 0.25s ease;
+  }
+  .lift:hover {
+    transform: translateY(-2px);
+    border-color: #3d3d46;
+    box-shadow: 0 16px 32px -16px rgba(0, 0, 0, 0.8);
+  }
+
+  /* The remove control lives above the tile and slides down on hover —
+     a "cutting bar" descending from the top edge. */
+  .cutbar {
+    transform: translateY(-110%);
+    opacity: 0;
+    transition: transform 0.28s cubic-bezier(0.22, 0.8, 0.3, 1), opacity 0.2s ease;
+  }
+  .group:hover .cutbar, .group:focus-within .cutbar {
+    transform: translateY(0);
+    opacity: 1;
   }
 
   .text-gradient {
-    @apply bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-cyan-400 animate-shimmer;
-    background-size: 200% auto;
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-orange-400 to-amber-300;
   }
 
-
-
   .focus-ring-glow:focus-within {
-    @apply ring-2 ring-blue-500/50 shadow-[0_0_15px_rgba(59,130,246,0.3)];
+    @apply ring-2;
+    --tw-ring-color: rgba(255, 90, 31, 0.5);
+    box-shadow: 0 0 0 1px rgba(255, 90, 31, 0.35), 0 8px 22px -12px rgba(255, 90, 31, 0.45);
+  }
+
+  @keyframes flux-rise {
+    from { opacity: 0; transform: translateY(16px) scale(0.995); }
+    to { opacity: 1; transform: none; }
+  }
+  .rise {
+    animation: flux-rise 0.6s cubic-bezier(0.22, 0.8, 0.3, 1) both;
+  }
+  .r1 { animation-delay: 0.04s; }
+  .r2 { animation-delay: 0.1s; }
+  .r3 { animation-delay: 0.16s; }
+  .r4 { animation-delay: 0.22s; }
+  .r5 { animation-delay: 0.28s; }
+
+  @keyframes flux-flow {
+    to { background-position: 26px 0; }
+  }
+  .working {
+    background-image: linear-gradient(45deg, rgba(255, 255, 255, 0.3) 25%, transparent 25%, transparent 50%, rgba(255, 255, 255, 0.3) 50%, rgba(255, 255, 255, 0.3) 75%, transparent 75%);
+    background-size: 26px 26px;
+    animation: flux-flow 0.7s linear infinite;
+  }
+
+  @keyframes flux-breathe {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+  .breathe {
+    animation: flux-breathe 1.6s ease-in-out infinite;
+  }
+
+  @keyframes flux-render-glow {
+    0%, 100% { box-shadow: 0 12px 32px -10px rgba(255, 90, 31, 0.55); }
+    50% { box-shadow: 0 12px 44px -6px rgba(255, 90, 31, 0.8); }
+  }
+  .rendering-glow {
+    animation: flux-render-glow 2s ease-in-out infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.001s !important;
+      transition-duration: 0.001s !important;
+    }
   }
 }
