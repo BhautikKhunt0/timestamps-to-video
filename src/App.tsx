@@ -120,9 +120,16 @@ export default function App() {
   const [durations, setDurations] = useState<number[]>([]);
   const [progress, setProgress] = useState<number>(0);
   const [eta, setEta] = useState<number | null>(null);
+  const [stage, setStage] = useState<string>("");
+  const [stageDetail, setStageDetail] = useState<string>("");
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
   
   const [downloadingIndex, setDownloadingIndex] = useState<number | null>(null);
   const [downloadProgress, setDownloadProgress] = useState(0);
+  const [downloadingAll, setDownloadingAll] = useState(false);
+
+  // Output mode: "single" = whole output in one video, "chunks" = split per audio track.
+  const [outputMode, setOutputMode] = useState<"single" | "chunks">("single");
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
@@ -207,6 +214,7 @@ export default function App() {
 
   const handleCategoryDurationChange = (category: string, newDuration: number) => {
     if (category === "none") return;
+    if (loading) return;
     setCategoryDurations(prev => ({
       ...prev,
       [category]: newDuration
@@ -218,6 +226,8 @@ export default function App() {
   };
 
   const handleApplyToAll = (transType: string) => {
+    if (loading) return;
+    if (images.length <= 1) return;
     const needed = Math.max(0, images.length - 1);
     const chosenDur = categoryDurations[transType] || 0.5;
     setTransitions(new Array(needed).fill(transType));
@@ -228,6 +238,7 @@ export default function App() {
   };
 
   const handleSpecificTransition = (index: number, transType: string) => {
+    if (loading) return;
     setTransitions(prev => {
       const updated = [...prev];
       updated[index] = transType;
@@ -236,6 +247,7 @@ export default function App() {
   };
 
   const handleResetTransitions = () => {
+    if (loading) return;
     const needed = Math.max(0, images.length - 1);
     setTransitions(new Array(needed).fill("none"));
     setGlobalTransition("none");
@@ -324,7 +336,10 @@ export default function App() {
     setVideoUrls([]);
     setProgress(0);
     setEta(null);
+    setStage("");
+    setStageDetail("");
     setUploadProgress(0);
+    setActiveJobId(null);
     
     try {
       setUploading(true);
@@ -370,21 +385,26 @@ export default function App() {
 
       setUploading(false);
       setUploadStatusText("");
+      setActiveJobId(jobId);
 
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new WebSocket(`${protocol}//${window.location.host}/api/ws`);
+      let lastWsMsgAt = Date.now();
       
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
           if (data.jobId === jobId) {
+            lastWsMsgAt = Date.now();
             if (data.type === "progress") {
               setProgress(data.progress);
               if (data.eta !== undefined) setEta(data.eta);
+              if (data.stage !== undefined) setStage(data.stage);
+              if (data.detail !== undefined) setStageDetail(data.detail);
             } else if (data.type === "chunk_ready") {
               setVideoUrls(prev => {
                 if (!prev.includes(data.chunkUrl)) {
-                   return [...prev, data.chunkUrl];
+                    return [...prev, data.chunkUrl];
                 }
                 return prev;
               });
@@ -392,12 +412,18 @@ export default function App() {
               if (data.chunks) setVideoUrls(data.chunks);
               setProgress(100);
               setEta(0);
+              setStage("done");
+              setStageDetail("");
               setSuccessMessage("Video segments generated successfully!");
               setLoading(false);
+              setActiveJobId(null);
+              stopActiveTracking();
               ws.close();
             } else if (data.type === "error") {
               setError("Generation failed: " + (data.error || "Unknown error"));
               setLoading(false);
+              setActiveJobId(null);
+              stopActiveTracking();
               ws.close();
             }
           }
@@ -405,6 +431,42 @@ export default function App() {
       };
 
       activeEventSourceRef.current = ws as any;
+
+      // Fallback poller: if WS drops/stale (proxy, HMR), poll /api/progress so
+      // large 300+ image jobs never look "stuck" with a frozen %.
+      if (activePollIntervalRef.current) clearInterval(activePollIntervalRef.current);
+      activePollIntervalRef.current = setInterval(async () => {
+        // only poll while this job is still loading
+        try {
+          const r = await fetch(`/api/progress/${jobId}`);
+          if (!r.ok) return;
+          const j = await r.json();
+          if (typeof j.progress === "number") {
+            // Don't move the bar backwards; WS is authoritative when fresh.
+            const wsStale = Date.now() - lastWsMsgAt > 8000;
+            if (wsStale) {
+              setProgress(j.progress);
+              if (j.eta !== undefined) setEta(j.eta);
+              if (j.stage) setStage(j.stage);
+              if (j.detail) setStageDetail(j.detail);
+            }
+          }
+          if (j.status === "completed" && j.chunks) {
+            setVideoUrls(j.chunks);
+            setProgress(100);
+            setEta(0);
+            setSuccessMessage("Video segments generated successfully!");
+            setLoading(false);
+            setActiveJobId(null);
+            stopActiveTracking();
+          } else if (j.status === "error") {
+            setError("Generation failed: " + (j.error || "Unknown error"));
+            setLoading(false);
+            setActiveJobId(null);
+            stopActiveTracking();
+          }
+        } catch {}
+      }, 5000);
 
       const response = await fetch("/api/generate", {
         method: "POST",
@@ -417,7 +479,8 @@ export default function App() {
           durations: finalDurations,
           transitions,
           transitionDurations: transitions.map(t => t === "none" ? 0 : (categoryDurations[t] || 0.5)),
-          transitionDuration: categoryDurations["fade"] || 0.5
+          transitionDuration: categoryDurations["fade"] || 0.5,
+          outputMode
         })
       });
 
@@ -431,8 +494,27 @@ export default function App() {
       setError(err.message || "An error occurred");
       setLoading(false);
       setUploading(false);
+      setActiveJobId(null);
       stopActiveTracking();
     }
+  };
+
+  const handleCancel = async () => {
+    if (!activeJobId) {
+      stopActiveTracking();
+      setLoading(false);
+      setUploading(false);
+      return;
+    }
+    try {
+      await fetch(`/api/cancel/${activeJobId}`, { method: "POST" });
+    } catch {}
+    stopActiveTracking();
+    setLoading(false);
+    setUploading(false);
+    setActiveJobId(null);
+    setStage("cancelled");
+    setStageDetail("");
   };
 
   const formatEta = (seconds: number | null) => {
@@ -458,6 +540,36 @@ export default function App() {
         setDownloadingIndex(null);
         setDownloadProgress(0);
       }, 1000);
+    }
+  };
+
+  const handleDownloadAll = async () => {
+    if (videoUrls.length === 0 || downloadingAll || loading) return;
+    setDownloadingAll(true);
+    setError("");
+    try {
+      for (let i = 0; i < videoUrls.length; i++) {
+        setDownloadingIndex(i);
+        const link = document.createElement("a");
+        link.href = videoUrls[i] + "?download=1";
+        link.download = `rendered_video_${i + 1}_of_${videoUrls.length}.mp4`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        // Stagger downloads so browsers don't block them as popups.
+        if (i < videoUrls.length - 1) {
+          await new Promise(r => setTimeout(r, 900));
+        }
+      }
+      setSuccessMessage(`Started download of all ${videoUrls.length} chunks. Check your downloads folder.`);
+      setTimeout(() => setSuccessMessage(""), 5000);
+    } catch (err) {
+      console.error('Download all error:', err);
+      setError("Failed to download all chunks. Try downloading them one by one.");
+    } finally {
+      setDownloadingAll(false);
+      setDownloadingIndex(null);
+      setDownloadProgress(0);
     }
   };
 
@@ -704,6 +816,11 @@ export default function App() {
                 )}
               </div>
 
+              <p className="text-[11px] text-neutral-500 relative z-10 -mt-2">
+                Each transition sits exactly on its cut — half from the outgoing image, half from the incoming
+                (e.g. 0.3s = 0.15s + 0.15s). Totals always match your timestamps.
+              </p>
+
               {/* Category Presets */}
               <div className="space-y-4 relative z-30">
                 <div className="grid grid-cols-2 gap-3">
@@ -756,10 +873,11 @@ export default function App() {
                           {images.length > 1 && (
                             <button
                               type="button"
+                              disabled={loading}
                               onClick={() => handleApplyToAll(item.id)}
-                              className="w-full py-1.5 text-xs font-semibold bg-white/5 hover:bg-white/10 text-neutral-200 border border-white/5 rounded-lg transition-colors"
+                              className="w-full py-1.5 text-xs font-semibold bg-white/5 hover:bg-white/10 text-neutral-200 border border-white/5 rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                             >
-                              {item.id === "none" ? "Apply Cut to All" : "Apply to All"}
+                              {loading ? "Rendering..." : (item.id === "none" ? "Apply Cut to All" : "Apply to All")}
                             </button>
                           )}
                         </div>
@@ -862,6 +980,25 @@ export default function App() {
 
               {videoUrls.length > 0 ? (
                 <div className="space-y-4 relative z-10">
+                  {videoUrls.length > 1 && (
+                    <button
+                      onClick={handleDownloadAll}
+                      disabled={downloadingAll || loading}
+                      className="w-full inline-flex items-center justify-center gap-2 px-5 py-3 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 active:scale-[0.99] text-white text-sm font-bold rounded-xl transition-all shadow-[0_0_20px_rgba(16,185,129,0.3)] disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {downloadingAll ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          <span>Downloading {downloadingIndex !== null ? downloadingIndex + 1 : 1} of {videoUrls.length}...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Download className="w-4 h-4" />
+                          <span>Download All ({videoUrls.length} chunks)</span>
+                        </>
+                      )}
+                    </button>
+                  )}
                   {videoUrls.map((url, index) => (
                     <div key={index} className="rounded-xl overflow-hidden bg-black/80 border border-white/10 shadow-2xl flex flex-col group backdrop-blur-md">
                       <div className="aspect-video relative flex items-center justify-center">
@@ -882,7 +1019,7 @@ export default function App() {
                         <div className="flex gap-2">
                           <button 
                             onClick={() => handleDownload(url, index)}
-                            disabled={downloadingIndex === index}
+                            disabled={downloadingIndex === index || downloadingAll}
                             className="inline-flex items-center gap-2 px-5 py-2 bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 active:scale-95 text-white text-xs font-bold rounded-lg transition-all shadow-[0_0_15px_rgba(59,130,246,0.3)] disabled:opacity-50 disabled:cursor-not-allowed"
                           >
                             {downloadingIndex === index ? (
@@ -914,7 +1051,39 @@ export default function App() {
                 </div>
               )}
 
-              <div className="pt-2 relative z-10">
+              <div className="pt-2 relative z-10 space-y-3">
+                {/* Output mode: single video vs chunks */}
+                <div className="bg-white/[0.03] border border-white/5 rounded-xl p-3">
+                  <div className="text-xs font-semibold text-neutral-300 mb-2">Output Format</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      disabled={loading}
+                      onClick={() => setOutputMode("single")}
+                      className={`px-3 py-2.5 rounded-lg text-xs font-semibold border transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
+                        outputMode === "single"
+                          ? "bg-blue-500/20 text-blue-300 border-blue-500/40 shadow-[0_0_15px_rgba(59,130,246,0.25)]"
+                          : "bg-white/5 text-neutral-400 border-white/10 hover:bg-white/10"
+                      }`}
+                    >
+                      <div>Single Video</div>
+                      <div className="text-[10px] font-normal opacity-70 mt-0.5">Whole output in one file</div>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={loading}
+                      onClick={() => setOutputMode("chunks")}
+                      className={`px-3 py-2.5 rounded-lg text-xs font-semibold border transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
+                        outputMode === "chunks"
+                          ? "bg-cyan-500/20 text-cyan-300 border-cyan-500/40 shadow-[0_0_15px_rgba(34,211,238,0.25)]"
+                          : "bg-white/5 text-neutral-400 border-white/10 hover:bg-white/10"
+                      }`}
+                    >
+                      <div>Chunks</div>
+                      <div className="text-[10px] font-normal opacity-70 mt-0.5">Split per audio track</div>
+                    </button>
+                  </div>
+                </div>
                 <button
                   onClick={handleGenerate}
                   disabled={loading || images.length === 0}
@@ -962,16 +1131,31 @@ export default function App() {
                 </button>
                 
                 {loading && (
-                  <div className="mt-4 flex items-center justify-between px-2 text-xs font-mono">
-                    <span className="flex items-center gap-2 text-blue-400">
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                      {uploading ? (uploadStatusText || 'Transferring media...') : 'Encoding with FFmpeg Engine...'}
-                    </span>
-                    {!uploading && progress > 0 && (
-                      <span className="text-cyan-400 font-bold bg-cyan-500/10 px-2 py-0.5 rounded border border-cyan-500/20 shadow-inner">
-                        ETA: {formatEta(eta)}
+                  <div className="mt-4 space-y-2 px-2 text-xs font-mono">
+                    <div className="flex items-center justify-between">
+                      <span className="flex items-center gap-2 text-blue-400">
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                        {uploading
+                          ? (uploadStatusText || 'Transferring media...')
+                          : (stageDetail || (stage ? `${stage}...` : 'Encoding with FFmpeg Engine...'))}
                       </span>
+                      {!uploading && progress > 0 && (
+                        <span className="text-cyan-400 font-bold bg-cyan-500/10 px-2 py-0.5 rounded border border-cyan-500/20 shadow-inner">
+                          ETA: {formatEta(eta)}
+                        </span>
+                      )}
+                    </div>
+                    {!uploading && images.length > 50 && (
+                      <div className="text-[11px] text-neutral-500">
+                        Large job ({images.length} images with transitions renders in segments — progress updates per segment, preview chunks appear as they finish.
+                      </div>
                     )}
+                    <button
+                      onClick={handleCancel}
+                      className="w-full py-2 text-xs font-semibold bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 border border-rose-500/20 rounded-lg transition-colors"
+                    >
+                      Cancel Job
+                    </button>
                   </div>
                 )}
               </div>

@@ -1,7 +1,8 @@
 Added Features: 
 
-1. Transition 
+1. Transitions 
 2. Redesigned
 
 Fixed Issues:
 1. No Audio Cuts
+2. Speed Increased
