@@ -1,17 +1,77 @@
 import React, { useState, useRef, useEffect } from "react";
-import { 
-  Upload, FileVideo, AlertCircle, Loader2, Video, X, CheckCircle2, 
-  Download, Play, Music, RefreshCw, ExternalLink, Clock, 
-  Sparkles, Scissors, ArrowLeft, ArrowRight, ChevronDown, ChevronUp, Shuffle
+import {
+  Upload, AlertCircle, Loader2, X, CheckCircle2,
+  Download, Play, Pause, Music, RefreshCw, Clock,
+  Sparkles, Scissors, ArrowLeft, ArrowRight, ChevronDown,
+  MoveLeft, MoveRight, MoveUp, MoveDown
 } from "lucide-react";
 import { parseTimestamps } from "./utils/parser";
 
 const TRANSITIONS_CONFIG = [
-  { id: "none", name: "None (Cut)", icon: Scissors, color: "text-neutral-400", border: "border-neutral-700/60", bg: "bg-neutral-800" },
-  { id: "fade", name: "Fade", icon: Sparkles, color: "text-blue-400", border: "border-blue-500/60", bg: "bg-blue-950/40" },
-  { id: "smoothleft", name: "Smooth Slide Left", icon: ArrowLeft, color: "text-cyan-400", border: "border-cyan-500/60", bg: "bg-cyan-950/40" },
-  { id: "smoothright", name: "Smooth Slide Right", icon: ArrowRight, color: "text-teal-400", border: "border-teal-500/60", bg: "bg-teal-950/40" }
+  { id: "none", name: "Hard Cut", icon: Scissors, color: "text-neutral-400", border: "border-neutral-700/60", bg: "bg-neutral-800" },
+  { id: "fade", name: "Cross Fade", icon: Sparkles, color: "text-blue-400", border: "border-blue-500/60", bg: "bg-blue-950/40" },
+  { id: "smoothleft", name: "Wipe Left", icon: ArrowLeft, color: "text-cyan-400", border: "border-cyan-500/60", bg: "bg-cyan-950/40" },
+  { id: "smoothright", name: "Wipe Right", icon: ArrowRight, color: "text-teal-400", border: "border-teal-500/60", bg: "bg-teal-950/40" },
+  { id: "slideleft", name: "Slide Left", icon: MoveLeft, color: "text-indigo-400", border: "border-indigo-500/60", bg: "bg-indigo-950/40" },
+  { id: "slideright", name: "Slide Right", icon: MoveRight, color: "text-violet-400", border: "border-violet-500/60", bg: "bg-violet-950/40" },
+  { id: "slideup", name: "Slide Up", icon: MoveUp, color: "text-amber-400", border: "border-amber-500/60", bg: "bg-amber-950/40" },
+  { id: "slidedown", name: "Slide Down", icon: MoveDown, color: "text-rose-400", border: "border-rose-500/60", bg: "bg-rose-950/40" }
 ];
+
+const TRANSITION_DESC: Record<string, string> = {
+  none: "Frame swaps instantly. Zero frames of blend — the sharpest edit.",
+  fade: "Both frames blend through the cut. Soft, cinematic, always safe.",
+  smoothleft: "New frame sweeps across from the right behind a soft edge — a wipe.",
+  smoothright: "New frame sweeps across from the left behind a soft edge. Mirror of wipe-left.",
+  slideleft: "Old frame pushes off to the left while the new slides in — a true push.",
+  slideright: "Old frame pushes off to the right while the new slides in. Mirror of slide-left.",
+  slideup: "Frames travel upward — the incoming frame rises from below.",
+  slidedown: "Frames travel downward — the incoming frame drops from above."
+};
+
+const STEPS = [
+  { label: "Footage" },
+  { label: "Timeline" },
+  { label: "Motion" },
+  { label: "Editor" }
+];
+
+const pad2 = (n: number) => String(Math.max(0, Math.floor(n))).padStart(2, "0");
+
+const toTimecode = (sec: number) => {
+  // Derive from whole frames so the readout always equals the 30fps render
+  // grid (rounds to nearest frame; no :29 clamp edge at .999s boundaries).
+  const total = Math.max(0, Math.round((sec || 0) * 30));
+  const ff = total % 30;
+  const totalSec = (total - ff) / 30;
+  return `${pad2(totalSec / 3600)}:${pad2((totalSec % 3600) / 60)}:${pad2(totalSec % 60)}:${pad2(ff)}`;
+};
+
+const pvClassFor = (id: string) =>
+  id === "none" ? "pv-cut"
+  : id === "fade" ? "pv-fade"
+  : id === "smoothleft" ? "pv-left"
+  : id === "smoothright" ? "pv-right"
+  : id === "slideleft" ? "pv-slide-l"
+  : id === "slideright" ? "pv-slide-r"
+  : id === "slideup" ? "pv-slide-u"
+  : "pv-slide-d";
+
+const pvLabelFor = (id: string) =>
+  id === "none" ? "HARD"
+  : id === "fade" ? "DISSOLVE"
+  : id === "smoothleft" || id === "smoothright" ? "WIPE"
+  : "PUSH";
+
+const markerModFor = (t?: string) =>
+  t === "none" ? "none"
+  : t === "smoothleft" ? "left"
+  : t === "smoothright" ? "right"
+  : t === "slideleft" ? "sl"
+  : t === "slideright" ? "sr"
+  : t === "slideup" ? "su"
+  : t === "slidedown" ? "sd"
+  : "";
 
 const safeParseResponse = async (res: Response): Promise<{ ok: boolean; data: any; error?: string }> => {
   try {
@@ -56,27 +116,19 @@ const CustomSelect = ({ value, onChange, options, className = "", dropdownUp = f
   const selectedOption = options.find((opt: any) => opt.value === value) || options[0];
 
   return (
-    <div className={`relative ${className}`} ref={containerRef}>
-      <button
-        type="button"
-        onClick={() => setIsOpen(!isOpen)}
-        className="w-full flex items-center justify-between gap-3 px-3 py-1.5 rounded-lg text-sm transition-all focus:outline-none"
-        style={{ background: "rgba(0,0,0,0.5)", border: "1px solid var(--flux-line2)", color: "var(--flux-ink)" }}
-      >
-        <span className="truncate">{selectedOption?.label}</span>
-        <ChevronDown className={`w-3.5 h-3.5 transition-transform ${isOpen ? "rotate-180" : ""}`} style={{ color: "var(--flux-ink3)" }} />
+    <div className={`cselect ${className}`} ref={containerRef}>
+      <button type="button" className="cselect-btn" onClick={() => setIsOpen(!isOpen)}>
+        <span className="trunc">{selectedOption?.label}</span>
+        <ChevronDown className={`ic ic-14 sel-chev ${isOpen ? "open" : ""}`} />
       </button>
-      
+
       {isOpen && (
-        <div className={`absolute z-50 w-full rounded-lg shadow-2xl py-1 max-h-48 overflow-y-auto custom-scrollbar ${dropdownUp ? "bottom-full mb-1" : "top-full mt-1"}`} style={{ background: "#17171b", border: "1px solid var(--flux-line2)" }}>
+        <div className={`cselect-menu ${dropdownUp ? "up" : ""}`}>
           {options.map((opt: any) => (
             <button
               key={opt.value}
               type="button"
-              className="w-full text-left px-3 py-2 text-sm transition-colors"
-              style={opt.value === value
-                ? { background: "var(--flux-acc-soft)", color: "var(--flux-acc)", fontWeight: 600 }
-                : { color: "var(--flux-ink2)" }}
+              className={`cselect-opt ${opt.value === value ? "on" : ""}`}
               onClick={() => {
                 onChange(opt.value);
                 setIsOpen(false);
@@ -96,7 +148,7 @@ export default function App() {
   const [imageUrls, setImageUrls] = useState<string[]>([]);
   const [script, setScript] = useState("");
   const [defaultDurationPerImage, setDefaultDurationPerImage] = useState(5);
-  
+
   const [audioFiles, setAudioFiles] = useState<File[]>([]);
 
   // Transition States
@@ -104,7 +156,11 @@ export default function App() {
   const [categoryDurations, setCategoryDurations] = useState<Record<string, number>>({
     fade: 0.5,
     smoothleft: 0.5,
-    smoothright: 0.5
+    smoothright: 0.5,
+    slideleft: 0.5,
+    slideright: 0.5,
+    slideup: 0.5,
+    slidedown: 0.5
   });
   const [transitions, setTransitions] = useState<string[]>([]);
   const [showAllCuts, setShowAllCuts] = useState<boolean>(false);
@@ -115,7 +171,7 @@ export default function App() {
   const [uploadStatusText, setUploadStatusText] = useState("");
   const [error, setError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
-  
+
   const [videoUrls, setVideoUrls] = useState<string[]>([]);
   const [durations, setDurations] = useState<number[]>([]);
   const [progress, setProgress] = useState<number>(0);
@@ -123,17 +179,30 @@ export default function App() {
   const [stage, setStage] = useState<string>("");
   const [stageDetail, setStageDetail] = useState<string>("");
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
-  
+
   const [downloadingIndex, setDownloadingIndex] = useState<number | null>(null);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadingAll, setDownloadingAll] = useState(false);
 
   // Output mode: "single" = whole output in one video, "chunks" = split per audio track.
   const [outputMode, setOutputMode] = useState<"single" | "chunks">("single");
-  
+
+  // ── Design-only view state (no business logic) ──────────────────
+  const [view, setView] = useState(0);              // 0 Footage · 1 Timeline · 2 Motion · 3 Editor
+  const [activeVideo, setActiveVideo] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+  // Scrollable viewport height for the imported-media grid (≈15 tiles visible).
+  const [mediaGridVh, setMediaGridVh] = useState(0);
+  const trCardsRef = useRef<HTMLDivElement>(null);
+  const [trCardsVh, setTrCardsVh] = useState(0);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
-  
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const viewerRef = useRef<HTMLDivElement>(null);
+  const mediaGridRef = useRef<HTMLDivElement>(null);
+
   const activeEventSourceRef = useRef<WebSocket | null>(null);
   const activePollIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -142,6 +211,46 @@ export default function App() {
     setImageUrls(urls);
     return () => urls.forEach(url => URL.revokeObjectURL(url));
   }, [images]);
+
+  // Cap the imported-media grid to a ~15-tile viewport; everything past it scrolls.
+  useEffect(() => {
+    const el = mediaGridRef.current;
+    if (!el) return;
+    const measure = () => {
+      const tile = el.querySelector<HTMLElement>(".asset-tile:not(.add)");
+      if (!tile) { setMediaGridVh(0); return; }
+      const gap = 11;        // .asset-grid gap
+      const minTile = 158;   // .asset-grid minmax(...) minimum
+      const cols = Math.max(1, Math.floor((el.clientWidth + gap) / (minTile + gap)));
+      const rowH = tile.offsetHeight + gap;
+      setMediaGridVh(Math.ceil(15 / cols) * rowH - gap); // ≈ 15 tiles visible
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [images.length, view]);
+
+  // Cap the motion picker to 4 visible transition cards; the rest scrolls
+  // (one row on desktop, two on the 2-col small-screen layout).
+  useEffect(() => {
+    const el = trCardsRef.current;
+    if (!el) return;
+    const measure = () => {
+      const card = el.querySelector<HTMLElement>(".tr-card");
+      if (!card) { setTrCardsVh(0); return; }
+      const gap = 13; // .tr-cards gap
+      const cols = Math.max(1, getComputedStyle(el).gridTemplateColumns.split(" ").filter(Boolean).length);
+      const rows = Math.ceil(4 / cols); // exactly 4 cards visible at once
+      setTrCardsVh(rows * (card.offsetHeight + gap) - gap);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    const firstCard = el.querySelector<HTMLElement>(".tr-card");
+    if (firstCard) ro.observe(firstCard);
+    return () => ro.disconnect();
+  }, [view]);
 
   useEffect(() => {
     return () => {
@@ -276,16 +385,16 @@ export default function App() {
   };
 
   const uploadBatchChunked = async (jobId: string, files: File[]) => {
-    const BATCH_SIZE = 5; 
+    const BATCH_SIZE = 5;
     let uploadedCount = 0;
-    
+
     for (let i = 0; i < files.length; i += BATCH_SIZE) {
       const chunk = files.slice(i, i + BATCH_SIZE);
       const chunkIndices = Array.from({ length: chunk.length }, (_, idx) => i + idx);
-      
+
       let attempt = 0;
       const retries = 3;
-      
+
       while (attempt < retries) {
         attempt++;
         try {
@@ -293,7 +402,7 @@ export default function App() {
           formData.append("jobId", jobId);
           formData.append("indices", JSON.stringify(chunkIndices));
           chunk.forEach(f => formData.append("images", f));
-          
+
           const res = await fetch("/api/upload-batch", { method: "POST", body: formData });
           const parsed = await safeParseResponse(res);
           if (!parsed.ok) {
@@ -315,7 +424,7 @@ export default function App() {
       setError("Please upload at least one image.");
       return;
     }
-    
+
     stopActiveTracking();
 
     let finalDurations = [...durations];
@@ -340,26 +449,26 @@ export default function App() {
     setStageDetail("");
     setUploadProgress(0);
     setActiveJobId(null);
-    
+
     try {
       setUploading(true);
       setUploadStatusText("Initializing backend job...");
       const initRes = await fetch("/api/init-job");
       const initParsed = await safeParseResponse(initRes);
-      
+
       if (!initParsed.ok) {
         throw new Error(initParsed.error || "Failed to initialize job on the server");
       }
-      
+
       const jobId = initParsed.data.jobId;
 
       setUploadStatusText("Uploading images...");
       await uploadBatchChunked(jobId, images);
-      
+
       if (audioFiles.length > 0) {
         for (let i = 0; i < audioFiles.length; i++) {
           setUploadStatusText(`Uploading audio track ${i + 1} of ${audioFiles.length}...`);
-          
+
           let attempt = 0;
           const retries = 3;
           while (attempt < retries) {
@@ -368,7 +477,7 @@ export default function App() {
               const audioData = new FormData();
               audioData.append("jobId", jobId);
               audioData.append("audio", audioFiles[i]);
-              
+
               const audioRes = await fetch("/api/upload-audio", { method: "POST", body: audioData });
               const audioParsed = await safeParseResponse(audioRes);
               if (!audioParsed.ok) {
@@ -390,7 +499,7 @@ export default function App() {
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new WebSocket(`${protocol}//${window.location.host}/api/ws`);
       let lastWsMsgAt = Date.now();
-      
+
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
@@ -470,7 +579,7 @@ export default function App() {
 
       const response = await fetch("/api/generate", {
         method: "POST",
-        headers: { 
+        headers: {
           "Content-Type": "application/json",
           "Accept": "application/json"
         },
@@ -590,681 +699,1004 @@ export default function App() {
     let best = "none";
     let bestCount = 0;
     for (const t of TRANSITIONS_CONFIG) {
-      const c = transitions.filter(x => x === t.id).length;
+      const c = transitions.filter(x => x.id === t.id).length;
       if (t.id !== "none" && c > bestCount) { best = t.id; bestCount = c; }
     }
     return bestCount > 0 ? best : "none";
   })();
 
-  return (
-    <div className="min-h-screen font-sans" style={{ color: "var(--flux-ink)" }}>
+  /* ── derived display values (design only) ─────────────────────── */
+  const totalSeconds = displayDurations.reduce((a, b) => a + b, 0);
+  const totalLabel = `${pad2(totalSeconds / 60)}:${(totalSeconds % 60).toFixed(1).padStart(4, "0")}`;
+  const liveTransitions = transitions.filter(t => t !== "none").length;
+  const cutIndices = images.length > 1 ? transitions.map((_, i) => i) : [];
+  const visibleCuts = showAllCuts ? cutIndices : cutIndices.slice(0, 6);
+  const currentVideoUrl =
+    videoUrls.length > 0 ? videoUrls[Math.min(activeVideo, videoUrls.length - 1)] : "";
+  const hasVideo = !!currentVideoUrl;
 
-      {/* Brand line (not a navbar — signature + live project status) */}
-      <div className="max-w-[860px] mx-auto px-4 sm:px-6 pt-8 pb-2 flex items-center gap-2.5 rise">
-        <span className="w-8 h-8 rounded-[11px] inline-flex items-center justify-center" style={{ background: "#1c1c21", border: "1px solid var(--flux-line2)" }}>
-          <span className="w-3 h-3 rounded-full border-2" style={{ borderColor: "var(--flux-acc)" }} />
-        </span>
-        <span className="font-semibold tracking-tight text-[17px]">Fluxcut</span>
-        <div className="ml-auto flex items-center gap-2">
-          {images.length > 0 ? (
-            <span className="inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-[12px]" style={{ border: "1px solid var(--flux-line2)", background: "rgba(255,255,255,0.025)" }}>
-              <span className="w-1.5 h-1.5 rounded-full" style={{ background: "var(--flux-acc)" }} />
-              <span className="font-semibold">{images.length} frames</span>
-              <span className="font-mono-d" style={{ color: "var(--flux-ink3)" }}>
-                {displayDurations.reduce((a, b) => a + b, 0).toFixed(1)}s
-              </span>
-            </span>
-          ) : null}
-          {loading ? (
-            <span className="inline-flex items-center gap-1.5 text-[12px] font-semibold" style={{ color: "var(--flux-acc)" }}>
-              <span className="w-1.5 h-1.5 rounded-full breathe" style={{ background: "var(--flux-acc)" }} />
-              Rendering {Math.round(uploading ? uploadProgress : progress)}%
-            </span>
-          ) : videoUrls.length > 0 ? (
-            <span className="inline-flex items-center gap-1.5 text-[12px] font-semibold" style={{ color: "var(--flux-ok)" }}>
-              <span className="w-1.5 h-1.5 rounded-full" style={{ background: "var(--flux-ok)" }} />
-              Ready
-            </span>
-          ) : (
-            <span className="text-[12px] font-medium" style={{ color: "var(--flux-ink3)" }}>New project</span>
-          )}
-        </div>
+  const stepGo = (i: number) => setView(Math.max(0, Math.min(3, i)));
+
+  const clearAllImages = () => {
+    setImages([]);
+    setTransitions([]);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const seekBy = (delta: number) => {
+    const v = videoRef.current;
+    if (!v) return;
+    const dur = isFinite(v.duration) ? v.duration : 0;
+    v.currentTime = Math.max(0, Math.min(dur, v.currentTime + delta));
+  };
+
+  const togglePlay = () => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (v.paused) v.play().catch(() => {});
+    else v.pause();
+  };
+
+  const toggleMute = () => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.muted = !v.muted;
+    setIsMuted(v.muted);
+  };
+
+  const transitionName = (id: string) => TRANSITIONS_CONFIG.find(t => t.id === id)?.name || id;
+
+  /* ── shared fragments ─────────────────────────────────────────── */
+  const stepper = (
+    <nav className="stepper" aria-label="Project progress">
+      <div className="step-track">
+        <div className="step-fill" style={{ width: `${(view / 3) * 100}%` }} />
       </div>
+      {STEPS.map((s, i) => (
+        <button
+          key={s.label}
+          type="button"
+          className={`step ${i === view ? "active" : i < view ? "done" : ""}`}
+          onClick={() => stepGo(i)}
+        >
+          <span className="step-dot">
+            {i < view ? <CheckCircle2 className="ic ic-12" /> : <i>{i + 1}</i>}
+            {i === 3 && loading && <span className="step-live" />}
+          </span>
+          <span className="step-lbl">{s.label}</span>
+        </button>
+      ))}
+    </nav>
+  );
 
-      <main className="max-w-[860px] mx-auto px-4 sm:px-6 pb-16">
-            {/* 01. Footage */}
-            <section className="flux-card p-6 sm:p-8 mb-4 rise r1">
-              <div className="flex items-baseline gap-3 pb-1">
-                <span className="flux-stepnum">01</span>
-                <h2 className="font-serif-d text-[24px] font-semibold tracking-tight">Footage</h2>
+  const navButtons = (
+    <div className="tb-right">
+      {view > 0 && (
+        <button type="button" className="btn btn-ghost" onClick={() => stepGo(view - 1)}>
+          <ArrowLeft className="ic ic-14" />
+          {STEPS[view - 1].label}
+        </button>
+      )}
+      {view < 3 && (
+        <button type="button" className="btn btn-accent" onClick={() => stepGo(view + 1)}>
+          {view === 0 ? "Continue to Timeline" : view === 1 ? "Continue to Motion" : "Open Editor"}
+          <ArrowRight className="ic ic-14" />
+        </button>
+      )}
+    </div>
+  );
+
+  /* ═══════════════ VIEW 01 · FOOTAGE ═══════════════ */
+  const footageView = (
+    <main className="page-body">
+      <div className="page-shell">
+        <div className="page-hero">
+          <span className="eyebrow">Step 01 — Source material</span>
+          <h1 className="h-display">Bring in your <em>footage</em></h1>
+          <p className="lede">
+            Drop frames and a soundtrack. Everything is sorted A→Z automatically, so your file
+            names become the story order — no dragging required.
+          </p>
+        </div>
+
+        <div className="media-grid">
+          <div className="media-main">
+            <div
+              id="drop-zone"
+              className="drop-hero"
+              onClick={() => fileInputRef.current?.click()}
+              onDrop={handleDrop}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+            >
+              <span className="corner tl mono">DROP ZONE</span>
+              <span className="corner br mono">JPG · PNG · WEBP</span>
+              <div className="orb"><Upload className="ic ic-26" /></div>
+              <h3>{images.length > 0 ? "Drop more frames" : "Drop frames here"}</h3>
+              <div className="or">OR</div>
+              <div className="drop-actions">
+                <button
+                  type="button"
+                  className="mini-btn accent"
+                  onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }}
+                >
+                  <Upload className="ic ic-12" /> Browse files
+                </button>
                 {images.length > 0 && (
-                  <span className="ml-auto font-mono-d text-[11px]" style={{ color: "var(--flux-ink3)" }}>
-                    {images.length} FRAMES · A–Z
-                  </span>
+                  <button type="button" className="mini-btn danger" onClick={(e) => { e.stopPropagation(); clearAllImages(); }}>
+                    <X className="ic ic-12" /> Clear all
+                  </button>
                 )}
               </div>
-              <p className="flux-eyebrow pb-5" style={{ color: "var(--flux-ink3)" }}>SOURCE MATERIAL</p>
-              {images.length > 0 && (
-                <div className="flex justify-end pb-3">
-                  <button 
-                    onClick={() => {
-                      setImages([]);
-                      setTransitions([]);
-                      if (fileInputRef.current) fileInputRef.current.value = "";
-                    }}
-                    className="text-xs font-semibold text-rose-400 hover:text-rose-300 bg-rose-500/10 hover:bg-rose-500/20 px-3 py-1.5 rounded-lg transition-all"
-                  >
-                    Clear All
-                  </button>
-                </div>
-              )}
-              
-              <div 
-                id="drop-zone"
-                className="border-2 border-dashed rounded-2xl p-10 cursor-pointer group transition-all duration-300 ease-out lift"
-                style={{ borderColor: "#3a3a42", background: "rgba(255,255,255,0.015)" }}
-                onClick={() => fileInputRef.current?.click()}
-                onDrop={handleDrop}
-                onDragOver={handleDragOver}
-                onDragLeave={handleDragLeave}
-              >
-                <div className="flex flex-col items-center justify-center gap-4 h-full">
-                  <input 
-                    type="file" 
-                    ref={fileInputRef} 
-                    multiple 
-                    accept="image/*"
-                    onChange={handleImageChange}
-                    className="hidden" 
-                  />
-                  <div className="p-4 rounded-full transition-all duration-300 group-hover:scale-110" style={{ background: "var(--flux-acc-soft)", color: "var(--flux-acc)" }}>
-                    <Upload className="w-8 h-8" />
-                  </div>
-                  <div className="text-center">
-                    <h3 className="font-semibold text-lg" style={{ color: "var(--flux-ink)" }}>Click to Browse or Drag &amp; Drop</h3>
-                    <p className="text-sm mt-1" style={{ color: "var(--flux-ink2)" }}>JPG, PNG, WebP • Auto-sorted alphabetically</p>
-                  </div>
-                </div>
+              <div className="drop-tags">
+                <span className="tag">AUTO-SORT A→Z</span>
+                <span className="tag">RENAME TO REORDER</span>
+                <span className="tag">NO SIZE LIMIT</span>
               </div>
+            </div>
 
-              {/* Audio Upload Pill */}
-              <div 
-                className="flex items-center gap-4 rounded-xl p-3 cursor-pointer transition-colors group mt-5"
-                style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--flux-line)" }}
-                onClick={() => audioInputRef.current?.click()}
+            <div className="sec-head">
+              <span className="sec-title">Imported <b>{images.length}</b></span>
+              <span className="sec-tools">
+                <span className="chip">A–Z SORTED</span>
+                {images.length > 0 && (
+                  <button type="button" className="mini-btn danger" onClick={clearAllImages}>Clear all</button>
+                )}
+              </span>
+            </div>
+
+            {images.length > 0 ? (
+              <div
+                className="asset-grid"
+                ref={mediaGridRef}
+                style={mediaGridVh ? { maxHeight: mediaGridVh } : undefined}
               >
-                <input
-                  type="file"
-                  ref={audioInputRef}
-                  multiple
-                  accept="audio/*"
-                  onChange={handleAudioChange}
-                  className="hidden"
-                />
-                <div className="p-2.5 rounded-[10px] transition-colors shrink-0" style={{ background: "var(--flux-acc-soft)", color: "var(--flux-acc)" }}>
-                  <Music className="w-5 h-5" />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <h3 className="text-sm font-semibold truncate" style={{ color: "var(--flux-ink)" }}>Soundtrack</h3>
-                  <p className="text-xs truncate font-mono-d" style={{ color: "var(--flux-ink3)" }}>
-                    {audioFiles.length > 0 ? `${audioFiles.length} TRACKS · LOOPED TO FILL · NEVER MUTE` : "Optional • Select MP3, WAV"}
-                  </p>
-                </div>
-              </div>
-
-              {/* Audio Files List */}
-              {audioFiles.length > 0 && (
-                <div className="space-y-2 max-h-32 overflow-y-auto custom-scrollbar pr-2 mt-3">
-                  {audioFiles.map((file, idx) => (
-                    <div key={`${file.name}-${idx}`} className="flex items-center justify-between p-3 rounded-xl" style={{ background: "rgba(0,0,0,0.35)", border: "1px solid var(--flux-line)" }}>
-                      <div className="flex items-center gap-3 min-w-0">
-                        <span className="text-[10px] px-1.5 py-0.5 rounded font-mono-d shrink-0" style={{ background: "var(--flux-acc-soft)", color: "var(--flux-acc)" }}>Track {idx + 1}</span>
-                        <span className="text-xs font-medium truncate" style={{ color: "var(--flux-ink)" }}>{file.name}</span>
-                        <span className="text-[10px] shrink-0 font-mono-d" style={{ color: "var(--flux-ink3)" }}>{(file.size / 1024 / 1024).toFixed(2)} MB</span>
-                      </div>
-                      <button 
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setAudioFiles(prev => prev.filter((_, i) => i !== idx));
-                        }}
-                        className="p-1.5 rounded-lg shrink-0 transition-colors hover:bg-white/10"
-                        style={{ color: "var(--flux-ink2)" }}
+                {images.map((file, index) => (
+                  <div key={`${file.name}-${index}`} className="asset-tile">
+                    <div className={`tile-thumb t${(index % 7) + 1}`}>
+                      <img src={imageUrls[index]} alt={file.name} className="tile-img" />
+                      <span className="tile-idx">{pad2(index + 1)}</span>
+                      <button
+                        type="button"
+                        className="tile-x"
+                        onClick={() => removeImage(index)}
                         aria-label={`Remove ${file.name}`}
                       >
-                        <X className="w-4 h-4" />
+                        <X className="ic ic-12" />
                       </button>
                     </div>
-                  ))}
-                </div>
-              )}
-
-              {/* Image Grid */}
-              {images.length > 0 && (
-                <div className="grid grid-cols-4 sm:grid-cols-5 md:grid-cols-6 gap-3 max-h-64 overflow-y-auto pr-2 custom-scrollbar pt-4">
-                  {images.map((file, index) => (
-                    <div key={`${file.name}-${index}`} className="relative group aspect-square rounded-[14px] overflow-hidden lift" style={{ background: "#000", border: "1px solid var(--flux-line2)" }}>
-                      <img 
-                        src={imageUrls[index]} 
-                        alt={file.name} 
-                        className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105" 
-                      />
-                      {/* Cutting bar: descends from the top edge on hover */}
-                      <div className="cutbar absolute top-0 left-0 right-0 flex items-center justify-between gap-1 px-1.5 py-1.5" style={{ background: "rgba(11,11,13,0.88)", borderBottom: "1px solid var(--flux-acc)", backdropFilter: "blur(6px)" }}>
-                        <span className="text-[9px] font-mono-d font-bold truncate" style={{ color: "var(--flux-acc)" }}>CUT</span>
-                        <button 
-                          onClick={(e) => { e.stopPropagation(); removeImage(index); }}
-                          className="p-1 rounded-md text-white transition-colors shrink-0"
-                          style={{ background: "var(--flux-acc)" }}
-                          aria-label={`Remove ${file.name}`}
-                        >
-                          <X className="w-3 h-3" />
-                        </button>
-                      </div>
-                      <div className="absolute bottom-1.5 left-1.5 flex items-center gap-1">
-                        <span className="px-1.5 py-0.5 rounded text-[10px] font-mono-d font-bold text-white" style={{ background: "rgba(0,0,0,0.6)" }}>
-                          {index + 1}
-                        </span>
-                        <span className="px-1.5 py-0.5 rounded text-[9px] font-mono-d" style={{ background: "rgba(0,0,0,0.6)", color: "var(--flux-acc)" }}>
-                          {(displayDurations[index] ?? defaultDurationPerImage).toFixed(1)}s
-                        </span>
-                      </div>
+                    <div className="tile-bar">
+                      <span className="tile-name">{file.name}</span>
+                      <span className="tile-dur">{(displayDurations[index] ?? defaultDurationPerImage).toFixed(1)}s</span>
                     </div>
-                  ))}
+                  </div>
+                ))}
+                <button type="button" className="asset-tile add" onClick={() => fileInputRef.current?.click()}>
+                  <span><Upload className="ic ic-20" /> ADD FRAMES</span>
+                </button>
+              </div>
+            ) : (
+              <div className="empty-note">No frames yet — drop files above to start your sequence.</div>
+            )}
+
+            <div className="sec-head">
+              <span className="sec-title">Soundtrack <b>{audioFiles.length}</b></span>
+              <span className="mono muted" style={{ fontSize: "9.5px", letterSpacing: ".14em" }}>
+                OPTIONAL · LOOPED TO FILL · NEVER MUTE
+              </span>
+            </div>
+
+            <button type="button" className="audio-row" onClick={() => audioInputRef.current?.click()}>
+              <span className="au-ic"><Music className="ic" /></span>
+              <span className="au-meta">
+                <b>{audioFiles.length > 0 ? "Add another track" : "Add soundtrack"}</b>
+                <i>MP3 · WAV · M4A</i>
+              </span>
+              <span className="chip">BROWSE</span>
+            </button>
+
+            {audioFiles.length > 0 && (
+              <div className="audio-files">
+                {audioFiles.map((file, idx) => (
+                  <span key={`${file.name}-${idx}`} className="audio-file" title={file.name}>
+                    <Music className="ic ic-12" />
+                    <span className="af-name">{file.name}</span>
+                    <button
+                      type="button"
+                      className="af-x"
+                      onClick={() => setAudioFiles(prev => prev.filter((_, i) => i !== idx))}
+                      aria-label={`Remove ${file.name}`}
+                    >
+                      <X className="ic ic-12" />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <aside className="media-aside">
+            <div className="panel">
+              <div className="panel-head">
+                <span className="panel-title">Session</span>
+                <span className="count mono">LIVE</span>
+              </div>
+              <div className="kv-list">
+                <div className="kv"><i>Frames</i><b>{images.length}</b></div>
+                <div className="kv"><i>Soundtracks</i><b>{audioFiles.length}</b></div>
+                <div className="kv"><i>Est. runtime</i><b className="acc-t">{totalSeconds.toFixed(1)}s</b></div>
+                <div className="kv"><i>Output</i><b>1080p30</b></div>
+              </div>
+            </div>
+
+            <div className="panel">
+              <div className="panel-head"><span className="panel-title">Ready check</span></div>
+              <div className="checklist">
+                <div className={`check ${images.length > 0 ? "ok" : ""}`}>
+                  <span className="bullet">{images.length > 0 ? <CheckCircle2 className="ic ic-12" /> : <i />}</span>
+                  Files sorted A → Z
+                </div>
+                <div className={`check ${audioFiles.length > 0 ? "ok" : ""}`}>
+                  <span className="bullet">{audioFiles.length > 0 ? <CheckCircle2 className="ic ic-12" /> : <i />}</span>
+                  Soundtrack attached
+                </div>
+                <div className={`check ${durations.length > 0 ? "ok" : ""}`}>
+                  <span className="bullet">{durations.length > 0 ? <CheckCircle2 className="ic ic-12" /> : <i />}</span>
+                  Timestamps parsed on step 02
+                </div>
+              </div>
+            </div>
+
+            <div className="panel tip-panel">
+              <span className="eyebrow">Pro tip</span>
+              <p>Name files like <b>01_intro.jpg</b> · <b>02_hook.jpg</b> and the order takes care of itself — forever.</p>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </main>
+  );
+
+  /* ═══════════════ VIEW 02 · TIMELINE ═══════════════ */
+  const timelineView = (
+    <main className="page-body">
+      <div className="page-shell">
+        <div className="page-hero">
+          <span className="eyebrow">Step 02 — Sequence</span>
+          <h1 className="h-display">Lay out the <em>timeline</em></h1>
+          <p className="lede">
+            Every frame gets a place and a duration. Write millisecond timestamps and they map
+            one-to-one onto your clips — or fall back to a uniform slide length.
+          </p>
+        </div>
+
+        <div className="tl-grid">
+          <div className="tl-main">
+            <section className="panel">
+              <div className="panel-head">
+                <span className="panel-title">Clip sequence</span>
+                <span className="count mono">{images.length} CLIPS · A→Z</span>
+              </div>
+
+              {images.length > 0 ? (
+                <>
+                  <div className="seq-strip">
+                    {images.map((file, index) => (
+                      <React.Fragment key={`${file.name}-${index}`}>
+                        <div className={`clip-card ${index === 0 ? "on" : ""}`}>
+                          <div className={`cc-thumb t${(index % 7) + 1}`}>
+                            <img src={imageUrls[index]} alt={file.name} className="tile-img" />
+                            <span className="cc-idx">{pad2(index + 1)}</span>
+                          </div>
+                          <div className="cc-meta">
+                            <span className="cc-name">{file.name}</span>
+                            <span className="cc-dur">SLIDE <b>{(displayDurations[index] ?? defaultDurationPerImage).toFixed(1)}s</b></span>
+                          </div>
+                        </div>
+                        {index < images.length - 1 && (
+                          <div className={`seq-marker ${markerModFor(transitions[index])}`}>
+                            <span className="dia" />
+                            <span className="m-lab">
+                              {transitions[index] === "none" || !transitions[index]
+                                ? "CUT"
+                                : `${categoryDurations[transitions[index]] || 0.5}s`}
+                            </span>
+                          </div>
+                        )}
+                      </React.Fragment>
+                    ))}
+                    <button type="button" className="clip-add" onClick={() => fileInputRef.current?.click()}>
+                      <span><Upload className="ic ic-20" /> ADD CLIP</span>
+                    </button>
+                  </div>
+                  <div className="strip-foot">
+                    <span>RENAME FILES TO REORDER · DURATIONS COME FROM YOUR SCRIPT</span>
+                    <span>Σ {totalSeconds.toFixed(1)}S · {transitions.length} CUTS</span>
+                  </div>
+                </>
+              ) : (
+                <div className="empty-note" style={{ marginTop: 12 }}>
+                  No frames yet — add them on step 01 to build the sequence.
                 </div>
               )}
             </section>
 
-            {/* 02. Story */}
-            <section className="flux-card p-6 sm:p-8 mb-4 rise r2">
-              <div className="flex items-baseline gap-3 pb-1">
-                <span className="flux-stepnum">02</span>
-                <h2 className="font-serif-d text-[24px] font-semibold tracking-tight">Story</h2>
-                {durations.length > 0 ? (
-                  <span className="ml-auto font-mono-d text-[11px] font-bold" style={{ color: "var(--flux-ok)" }}>
-                    ✓ {durations.length} RANGES · Σ {durations.reduce((a, b) => a + b, 0).toFixed(1)}s
-                  </span>
-                ) : (
-                  <span className="ml-auto font-mono-d text-[11px]" style={{ color: "var(--flux-ink3)" }}>AWAITING SCRIPT</span>
-                )}
+            <section className="panel">
+              <div className="panel-head">
+                <span className="panel-title">Script — timestamps</span>
+                <span className="count mono">
+                  {durations.length} RANGES · Σ {(durations.reduce((a, b) => a + b, 0)).toFixed(1)}S
+                </span>
               </div>
-              <p className="flux-eyebrow pb-5" style={{ color: "var(--flux-ink3)" }}>TIMESTAMPS · MILLISECOND PRECISE</p>
-              <div className="relative focus-ring-glow rounded-xl transition-all duration-300 mt-4">
-                <textarea 
-                  className="w-full h-36 p-4 rounded-xl focus:outline-none text-[12.5px] font-mono-d resize-none leading-[1.9] custom-scrollbar"
-                  style={{ background: "#0e0e11", color: "var(--flux-ink)", border: "1px solid var(--flux-line2)" }}
-                  placeholder={"0:00.000 - 0:03.250 intro\n0:03.250 - 0:05.750 hook\n0:05.750 - 0:08.500 demo …"}
-                  value={script}
-                  onChange={(e) => setScript(e.target.value)}
-                />
+              <textarea
+                className="script-ta"
+                placeholder={"0:00.000 - 0:03.250 intro\n0:03.250 - 0:05.750 hook\n0:05.750 - 0:08.500 demo …"}
+                value={script}
+                onChange={(e) => setScript(e.target.value)}
+              />
+              <div className="strip-foot">
+                <span>MILLISECOND PRECISE · ONE RANGE PER CLIP</span>
+                <span className={durations.length > 0 ? "ok-t" : ""}>
+                  {durations.length > 0 ? "✓ PARSED" : "AWAITING SCRIPT"}
+                </span>
               </div>
+            </section>
+          </div>
 
-              <div className="flex flex-wrap items-center gap-2 pt-4">
+          <aside className="tl-aside">
+            <div className="panel">
+              <div className="panel-head"><span className="panel-title">Timing</span></div>
+              <div className="field-row" style={{ marginTop: 10 }}>
+                <label>Default per slide</label>
+                <span className="chip acc">{defaultDurationPerImage}s</span>
+              </div>
+              <div className="dur-opts">
+                {[2, 3, 4, 5, 8, 10].map(v => (
+                  <button
+                    key={v}
+                    type="button"
+                    className={`dur-opt ${defaultDurationPerImage === v ? "on" : ""}`}
+                    onClick={() => setDefaultDurationPerImage(v)}
+                  >
+                    {v}s
+                  </button>
+                ))}
+              </div>
+              <p className="panel-note">Used only when no script ranges are present.</p>
+              <div style={{ marginTop: 10 }}>
                 {durations.length === 0 ? (
-                  <span className="px-3 py-1.5 text-[12px] font-semibold rounded-full" style={{ border: "1px solid var(--flux-line2)", color: "var(--flux-ink3)" }}>
-                    No timestamps yet — uniform {defaultDurationPerImage}s slides
-                  </span>
+                  <div className="empty-note">No timestamps yet — uniform {defaultDurationPerImage}s slides</div>
                 ) : (
-                  <span className="inline-flex items-center gap-2 px-3 py-1.5 text-[12px] rounded-full" style={{ border: "1px solid var(--flux-line2)" }}>
-                    <CheckCircle2 className="w-3.5 h-3.5" style={{ color: "var(--flux-ok)" }} />
-                    <strong>{images.length} slides × {durations.length} ranges</strong>
-                    <span style={{ color: "var(--flux-ink3)" }}>fit the timeline</span>
-                  </span>
+                  <div className="note">
+                    <CheckCircle2 className="ic ic-14" />
+                    <span>{durations.length} ranges parsed — timestamps override the default.</span>
+                  </div>
                 )}
-                <span className="ml-auto font-mono-d text-[11px]" style={{ color: "var(--flux-ink3)" }}>
-                  TOTAL <strong className="text-[14px]" style={{ color: "var(--flux-ink)" }}>
-                    {(durations.length > 0 ? durations.reduce((a, b) => a + b, 0) : displayDurations.reduce((a, b) => a + b, 0)).toFixed(1)}s
-                  </strong>
+              </div>
+            </div>
+
+            <div className="panel">
+              <div className="panel-head">
+                <span className="panel-title">Runtime</span>
+                <span className="count mono">TARGET</span>
+              </div>
+              <div className="big-total">
+                <b>{totalLabel}</b>
+                <i>MINUTES : SECONDS</i>
+              </div>
+              <div className="stat-grid" style={{ marginTop: 10 }}>
+                <div className="stat"><i>Clips</i><b>{images.length}</b></div>
+                <div className="stat"><i>Ranges</i><b className={durations.length ? "ok-t" : ""}>{durations.length}</b></div>
+                <div className="stat"><i>Avg slide</i><b>{images.length ? (totalSeconds / images.length).toFixed(1) : "0.0"}s</b></div>
+                <div className="stat"><i>Frames</i><b>{Math.round(totalSeconds * 30)}</b></div>
+              </div>
+            </div>
+
+            <div className="panel">
+              <div className="panel-head"><span className="panel-title">Sequence</span></div>
+              <div className="kv-list">
+                <div className="kv"><i>Order</i><b>A → Z (auto)</b></div>
+                <div className="kv"><i>Script ranges</i><b>{durations.length}</b></div>
+                <div className="kv"><i>Transitions</i><b>{transitions.length}</b></div>
+                <div className="kv"><i>Fit</i>
+                  <b className={durations.length === 0 || durations.length === images.length ? "ok-t" : ""}>
+                    {durations.length === 0 ? "UNIFORM" : durations.length === images.length ? "EXACT" : "MISMATCH"}
+                  </b>
+                </div>
+              </div>
+              {durations.length > 0 && images.length > 0 && durations.length !== images.length && (
+                <div className="note warn" style={{ marginTop: 10 }}>
+                  <AlertCircle className="ic ic-14" />
+                  <span>{images.length} images vs {durations.length} timestamps</span>
+                </div>
+              )}
+            </div>
+          </aside>
+        </div>
+      </div>
+    </main>
+  );
+
+  /* ═══════════════ VIEW 03 · MOTION ═══════════════ */
+  const motionView = (
+    <main className="page-body">
+      <div className="page-shell">
+        <div className="page-hero">
+          <span className="eyebrow">Step 03 — Motion</span>
+          <h1 className="h-display">Direct every <em>cut</em></h1>
+          <p className="lede">
+            Pick a transition once and push it across the whole sequence, or tune a single cut.
+            Every transition lands exactly on its cut — half from the outgoing frame, half from
+            the incoming — and your runtime never changes.
+          </p>
+        </div>
+
+        <div className="motion-grid">
+          <div className="motion-main">
+            <div
+              className={`tr-cards ${loading ? "veil" : ""}`}
+              ref={trCardsRef}
+              style={trCardsVh ? { maxHeight: trCardsVh } : undefined}
+            >
+              {TRANSITIONS_CONFIG.map((item) => {
+                const Icon = item.icon;
+                const dur = categoryDurations[item.id] || 0.5;
+                const count = transitions.filter(t => t === item.id).length;
+                const isTop = item.id === topTransitionId;
+
+                return (
+                  <div key={item.id} className={`tr-card ${isTop ? "on" : ""}`}>
+                    <div className={`tr-preview ${pvClassFor(item.id)}`}>
+                      {imageUrls.length >= 2 ? (
+                        <div
+                          className="pv-stage"
+                          style={{ "--pv-dur": `${item.id === "none" ? 1.8 : Math.max(0.3, dur) / 0.35}s` } as React.CSSProperties}
+                        >
+                          <img className="pv-a" src={imageUrls[0]} alt="" />
+                          <img className="pv-b" src={imageUrls[1]} alt="" />
+                        </div>
+                      ) : (
+                        <>
+                          {item.id === "smoothleft" && <span className="pv-arrow">←</span>}
+                          {item.id === "smoothright" && <span className="pv-arrow">→</span>}
+                          {item.id === "slideleft" && <span className="pv-arrow">←</span>}
+                          {item.id === "slideright" && <span className="pv-arrow">→</span>}
+                          {item.id === "slideup" && <span className="pv-arrow">↑</span>}
+                          {item.id === "slidedown" && <span className="pv-arrow">↓</span>}
+                          <span className="pv-lab">{pvLabelFor(item.id)}</span>
+                        </>
+                      )}
+                    </div>
+                    <div className="tr-head">
+                      <b style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <Icon className="ic ic-14" style={{ color: isTop ? "var(--acc)" : "var(--ink-3)" }} />
+                        {item.name}
+                      </b>
+                      <i>{item.id === "none" ? "0.0s" : `${dur}s`}</i>
+                    </div>
+                    <p className="tr-desc">{TRANSITION_DESC[item.id]}</p>
+
+                    {item.id !== "none" && (
+                      <div className="tr-dur">
+                        <span>Seconds</span>
+                        <CustomSelect
+                          value={dur}
+                          onChange={(val: any) => handleCategoryDurationChange(item.id, Number(val))}
+                          options={[
+                            { value: 0.3, label: '0.3s' },
+                            { value: 0.5, label: '0.5s' },
+                            { value: 0.8, label: '0.8s' },
+                            { value: 1.0, label: '1.0s' },
+                            { value: 1.5, label: '1.5s' },
+                            { value: 2.0, label: '2.0s' },
+                          ]}
+                          className="w-20"
+                          dropdownUp
+                        />
+                      </div>
+                    )}
+
+                    <div className="tr-foot">
+                      <span className={`chip ${count > 0 ? "acc" : ""}`}>{count} CUTS</span>
+                      <button
+                        type="button"
+                        className={`mini-btn ${isTop ? "accent" : ""}`}
+                        disabled={loading || images.length <= 1}
+                        onClick={() => handleApplyToAll(item.id)}
+                      >
+                        {loading ? "Rendering…" : "Apply to all"}
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <section className="panel">
+              <div className="panel-head">
+                <span className="panel-title">Cut map</span>
+                <span className="count mono">{cutIndices.length} CUTS · {liveTransitions} LIVE</span>
+                <span className="head-actions">
+                  {liveTransitions > 0 && (
+                    <button type="button" className="mini-btn danger" onClick={handleResetTransitions}>Reset all</button>
+                  )}
                 </span>
               </div>
 
-              <div className="flex flex-wrap items-center justify-between gap-4 p-3 rounded-xl mt-3" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--flux-line)" }}>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs" style={{ color: "var(--flux-ink2)" }}>Parsed Timestamps:</span>
-                  <span className="px-2.5 py-1 rounded-md text-xs font-mono-d font-bold" style={{ background: "var(--flux-acc-soft)", color: "var(--flux-acc)", border: "1px solid var(--flux-acc-line)" }}>
-                    {durations.length}
-                  </span>
-                  {durations.length > 0 && (
-                    <span className="text-xs font-mono-d" style={{ color: "var(--flux-ink3)" }}>
-                      (~{durations.reduce((a, b) => a + b, 0).toFixed(1)}s total)
-                    </span>
-                  )}
-                </div>
+              {cutIndices.length > 0 ? (
+                <>
+                  <div className="cut-map">
+                    {visibleCuts.map(idx => {
+                      const trans = transitions[idx] || "none";
+                      const imgFrom = images[idx]?.name || `Img ${idx + 1}`;
+                      const imgTo = images[idx + 1]?.name || `Img ${idx + 2}`;
+                      const isActive = trans !== "none";
+                      const thisDur = categoryDurations[trans] || 0.5;
 
-                {durations.length === 0 && (
-                  <div className="flex items-center gap-2 text-xs" style={{ color: "var(--flux-ink2)" }}>
-                    <Clock className="w-3.5 h-3.5" style={{ color: "var(--flux-acc)" }} />
-                    <span>Default duration:</span>
-                    <CustomSelect
-                      value={defaultDurationPerImage}
-                      onChange={(val: any) => setDefaultDurationPerImage(Number(val))}
-                      options={[
-                        { value: 2, label: '2s / slide' },
-                        { value: 3, label: '3s / slide' },
-                        { value: 4, label: '4s / slide' },
-                        { value: 5, label: '5s / slide' },
-                        { value: 8, label: '8s / slide' },
-                        { value: 10, label: '10s / slide' },
-                      ]}
-                      className="w-32"
-                    />
+                      return (
+                        <div key={idx} className="cut-row">
+                          <span className="cut-num">CUT #{idx + 1}</span>
+                          <span className="cut-thumbs">
+                            <span className={`th t${(idx % 7) + 1}`}>
+                              {imageUrls[idx] && <img src={imageUrls[idx]} alt="" />}
+                            </span>
+                            <span className={`cut-dia ${markerModFor(trans)}`}><span className="dia" /></span>
+                            <span className={`th t${((idx + 1) % 7) + 1}`}>
+                              {imageUrls[idx + 1] && <img src={imageUrls[idx + 1]} alt="" />}
+                            </span>
+                          </span>
+                          <span className="cut-label">
+                            <b>{imgFrom} → {imgTo}</b>
+                            <i>{isActive ? `${thisDur}s · CENTERED ON CUT` : "HARD CUT · 0 FRAMES"}</i>
+                          </span>
+                          <CustomSelect
+                            value={trans}
+                            onChange={(val: any) => handleSpecificTransition(idx, String(val))}
+                            options={[
+                              { value: "none", label: "None" },
+                              { value: "fade", label: "Fade" },
+                              { value: "smoothleft", label: "Wipe Left" },
+                              { value: "smoothright", label: "Wipe Right" },
+                              { value: "slideleft", label: "Slide Left" },
+                              { value: "slideright", label: "Slide Right" },
+                              { value: "slideup", label: "Slide Up" },
+                              { value: "slidedown", label: "Slide Down" },
+                            ]}
+                            className="w-32"
+                            dropdownUp={idx > cutIndices.length - 3}
+                          />
+                        </div>
+                      );
+                    })}
                   </div>
-                )}
 
-                {durations.length > 0 && images.length > 0 && durations.length !== images.length && (
-                  <span className="flex items-center gap-1.5 text-xs font-medium px-3 py-1 rounded-lg" style={{ color: "#fbbf24", background: "rgba(251,191,36,0.08)", border: "1px solid rgba(251,191,36,0.25)" }}>
-                    <AlertCircle className="w-3.5 h-3.5" />
-                    {images.length} images vs {durations.length} timestamps
-                  </span>
-                )}
-              </div>
-            </section>
-
-            {/* 03. Motion — transitions live here, single-column flow continues */}
-            
-            {/* 03. Motion */}
-            <section className="flux-card p-6 sm:p-8 mb-4 rise r3">
-              <div className="flex items-baseline gap-3 pb-1">
-                <span className="flux-stepnum">03</span>
-                <h2 className="font-serif-d text-[24px] font-semibold tracking-tight">Motion</h2>
-                {images.length > 1 ? (
-                  <span className="ml-auto px-3 py-1 text-[11px] font-semibold rounded-full" style={{ color: "var(--flux-acc)", background: "var(--flux-acc-soft)", border: "1px solid var(--flux-acc-line)" }}>
-                    {transitions.filter(t => t !== "none").length} transitions live
-                  </span>
-                ) : (
-                  <span className="ml-auto px-3 py-1 text-[11px] rounded-full" style={{ border: "1px solid var(--flux-line2)", color: "var(--flux-ink3)" }}>
-                    needs 2+ frames
-                  </span>
-                )}
-                {images.length > 1 && transitions.some(t => t !== "none") && (
-                  <button
-                    type="button"
-                    onClick={handleResetTransitions}
-                    className="px-3 py-1.5 text-xs font-medium rounded-lg transition-colors"
-                    style={{ background: "rgba(255,255,255,0.05)", color: "var(--flux-ink2)", border: "1px solid var(--flux-line2)" }}
-                  >
-                    Reset All
-                  </button>
-                )}
-              </div>
-              <p className="flux-eyebrow pb-4" style={{ color: "var(--flux-ink3)" }}>CENTERED ON EVERY CUT</p>
-
-              <p className="text-[13px] pb-5 max-w-[560px] leading-relaxed" style={{ color: "var(--flux-ink2)" }}>
-                Each transition lands <em className="font-serif-d">exactly</em> on its cut — half from the outgoing frame, half from the incoming
-                <span className="font-mono-d text-[12px]" style={{ color: "var(--flux-ink)" }}> (0.3s = 0.15s + 0.15s)</span>. Totals always match your timestamps.
-              </p>
-
-              {/* Category Presets — choose seconds per transition, apply to one cut or all */}
-              <div className={loading ? "opacity-40 pointer-events-none saturate-50 transition-opacity" : "transition-opacity"}>
-                <div className="grid grid-cols-2 gap-3">
-                  {TRANSITIONS_CONFIG.map((item) => {
-                    const Icon = item.icon;
-                    const dur = categoryDurations[item.id] || 0.5;
-                    const count = transitions.filter(t => t === item.id).length;
-                    const isTop = item.id === topTransitionId;
-
-                    return (
-                      <div
-                        key={item.id}
-                        className={`rounded-2xl p-3.5 flex flex-col gap-3 lift ${isTop ? "glow-acc" : ""}`}
-                        style={{ background: "rgba(255,255,255,0.015)", border: "1px solid var(--flux-line2)" }}
-                      >
-                        <div className="flex items-center gap-2.5">
-                          <div className={`p-2 rounded-[10px] ${item.bg} ${item.color}`}>
-                            <Icon className="w-4 h-4" />
-                          </div>
-                          <div>
-                            <div className="text-sm font-semibold" style={{ color: "var(--flux-ink)" }}>
-                              {item.name}
-                              {isTop && (
-                                <span className="ml-1.5 text-[9px] font-mono-d font-bold px-1.5 py-0.5 rounded-full text-white align-middle" style={{ background: "var(--flux-acc)" }}>
-                                  TOP
-                                </span>
-                              )}
-                            </div>
-                            <div className="text-[10px] font-mono-d mt-0.5" style={{ color: "var(--flux-ink3)" }}>
-                              {count} active
-                            </div>
-                          </div>
-                        </div>
-
-                        <div className="space-y-2.5 mt-auto pt-2" style={{ borderTop: "1px solid var(--flux-line)" }}>
-                          {item.id !== "none" ? (
-                            <div className="flex items-center justify-between text-xs">
-                              <span style={{ color: "var(--flux-ink2)" }}>Seconds:</span>
-                              <CustomSelect
-                                value={dur}
-                                onChange={(val: any) => handleCategoryDurationChange(item.id, Number(val))}
-                                options={[
-                                  { value: 0.3, label: '0.3s' },
-                                  { value: 0.5, label: '0.5s' },
-                                  { value: 0.8, label: '0.8s' },
-                                  { value: 1.0, label: '1.0s' },
-                                  { value: 1.5, label: '1.5s' },
-                                  { value: 2.0, label: '2.0s' },
-                                ]}
-                                className="w-24 font-mono"
-                              />
-                            </div>
-                          ) : (
-                            <div className="text-[11px] py-1 font-mono-d" style={{ color: "var(--flux-ink3)" }}>
-                              Hard Cut (0s)
-                            </div>
-                          )}
-
-                          {images.length > 1 && (
-                            <button
-                              type="button"
-                              disabled={loading}
-                              onClick={() => handleApplyToAll(item.id)}
-                              className="w-full py-1.5 text-xs font-semibold rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed lift"
-                              style={isTop
-                                ? { background: "var(--flux-acc-soft)", color: "var(--flux-acc)", border: "1px solid var(--flux-acc-line)" }
-                                : { background: "rgba(255,255,255,0.04)", color: "var(--flux-ink)", border: "1px solid var(--flux-line2)" }}
-                            >
-                              {loading ? "Rendering..." : (item.id === "none" ? "Apply Cut to All" : "Apply to All")}
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* Granular Cuts Accordion */}
-              {images.length > 1 ? (
-                <div className="rounded-xl mt-4" style={{ background: "rgba(0,0,0,0.3)", border: "1px solid var(--flux-line)" }}>
-                  <button
-                    onClick={() => setShowAllCuts(!showAllCuts)}
-                    className="w-full p-3 flex items-center justify-between text-xs font-semibold transition-colors hover:bg-white/[0.03] rounded-xl"
-                    style={{ color: "var(--flux-ink2)" }}
-                  >
-                    <span className="flex items-center gap-2">
-                      <Scissors className="w-3.5 h-3.5" style={{ color: "var(--flux-acc)" }} />
-                      Individual Cut Settings
+                  <div className="strip-foot" style={{ marginTop: 12 }}>
+                    <span>
+                      {Math.min(visibleCuts.length, cutIndices.length)} OF {cutIndices.length} CUTS SHOWN ·
+                      TRANSITIONS CENTER ON THE CUT
                     </span>
-                    {showAllCuts ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                  </button>
-                  
-                  {showAllCuts && (
-                    <div className="p-3 max-h-60 overflow-y-auto custom-scrollbar space-y-2" style={{ borderTop: "1px solid var(--flux-line)", background: "rgba(0,0,0,0.2)" }}>
-                      {transitions.map((trans, idx) => {
-                        const imgFrom = images[idx]?.name || `Img ${idx + 1}`;
-                        const imgTo = images[idx + 1]?.name || `Img ${idx + 2}`;
-                        const isActive = trans !== "none";
-                        const thisDur = categoryDurations[trans] || 0.5;
-
-  return (
-                          <div key={idx} className="flex items-center justify-between p-2.5 rounded-lg transition-colors hover:bg-white/[0.04]" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid var(--flux-line)", borderLeft: isActive ? "2px solid var(--flux-acc)" : "2px solid #3a3a42" }}>
-                            <div className="flex items-center gap-2.5 min-w-0 flex-1">
-                              {imageUrls[idx] && (
-                                <img src={imageUrls[idx]} alt="" className="w-9 h-9 rounded-[10px] object-cover shrink-0" style={{ border: "1px solid var(--flux-line2)" }} />
-                              )}
-                              <div className="flex flex-col min-w-0">
-                                <span className="text-[10px] font-mono-d font-bold" style={{ color: isActive ? "var(--flux-acc)" : "var(--flux-ink3)" }}>CUT #{idx + 1}</span>
-                                <div className="flex items-center gap-1.5 text-xs mt-0.5" style={{ color: "var(--flux-ink2)" }}>
-                                  <span className="truncate max-w-[80px]">{imgFrom}</span>
-                                  <span style={{ color: "var(--flux-ink3)" }}>→</span>
-                                  <span className="truncate max-w-[80px]">{imgTo}</span>
-                                </div>
-                              </div>
-                            </div>
-                            
-                            <div className="flex items-center gap-2 shrink-0">
-                              <CustomSelect
-                                value={trans}
-                                onChange={(val: any) => handleSpecificTransition(idx, String(val))}
-                                options={[
-                                  { value: "none", label: "None" },
-                                  { value: "fade", label: "Fade" },
-                                  { value: "smoothleft", label: "Slide Left" },
-                                  { value: "smoothright", label: "Slide Right" },
-                                ]}
-                                className="w-32"
-                                dropdownUp={idx > transitions.length - 3}
-                              />
-                              {isActive ? (
-                                <span className="px-2 py-1 rounded-md text-[10px] font-mono-d min-w-[3rem] text-center" style={{ background: "rgba(255,255,255,0.04)", border: "1px solid var(--flux-line2)", color: "var(--flux-ink)" }}>
-                                  {thisDur}s
-                                </span>
-                              ) : (
-                                <span className="w-12"></span>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
+                    {cutIndices.length > 6 && (
+                      <button type="button" className="mini-btn" onClick={() => setShowAllCuts(!showAllCuts)}>
+                        {showAllCuts ? "Show fewer" : `Show all ${cutIndices.length}`}
+                      </button>
+                    )}
+                  </div>
+                </>
               ) : (
-                <div className="p-4 rounded-xl text-xs text-center mt-4" style={{ background: "rgba(255,255,255,0.03)", border: "1px solid var(--flux-line)", color: "var(--flux-ink2)" }}>
+                <div className="empty-note" style={{ marginTop: 12 }}>
                   Upload at least 2 frames to customize transitions.
                 </div>
               )}
             </section>
+          </div>
 
-            {/* 04. Export */}
-            <section className="flux-card p-6 sm:p-8 mb-4 rise r4">
-              <div className="flex items-baseline gap-3 pb-1">
-                <span className="flux-stepnum">04</span>
-                <h2 className="font-serif-d text-[24px] font-semibold tracking-tight">Export</h2>
-                {videoUrls.length > 0 ? (
-                  <span className="ml-auto font-mono-d text-[11px] font-bold" style={{ color: "var(--flux-ok)" }}>● 1080p READY</span>
-                ) : loading ? (
-                  <span className="ml-auto font-mono-d text-[11px] font-bold breathe" style={{ color: "var(--flux-acc)" }}>● RENDERING {Math.round(uploading ? uploadProgress : progress)}%</span>
-                ) : null}
+          <aside className="motion-aside">
+            <div className="panel">
+              <div className="panel-head"><span className="panel-title">Active preset</span></div>
+              <div className="kv-list">
+                <div className="kv"><i>Global</i><b className="acc-t">{transitionName(globalTransition)}</b></div>
+                <div className="kv"><i>Cuts configured</i><b>{transitions.length}</b></div>
+                <div className="kv"><i>Live transitions</i><b>{liveTransitions}</b></div>
+                <div className="kv"><i>Runtime impact</i><b className="ok-t">0.0s</b></div>
               </div>
-              <p className="flux-eyebrow pb-5" style={{ color: "var(--flux-ink3)" }}>ONE FILE OR CHAPTERS</p>
-              
-              {error && (
-                <div className="p-4 rounded-xl flex items-start gap-3 mb-4" style={{ background: "rgba(244,63,94,0.07)", border: "1px solid rgba(244,63,94,0.25)" }}>
-                  <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" style={{ color: "#fb7185" }} />
-                  <div className="flex-1 min-w-0">
-                    <h3 className="text-sm font-semibold" style={{ color: "#fda4af" }}>Something needs attention</h3>
-                    <p className="text-xs mt-1" style={{ color: "rgba(253,164,175,0.75)" }}>{error}</p>
-                  </div>
+              <p className="panel-note">
+                Motion eats into the slides, never past them — totals always match your timestamps.
+              </p>
+            </div>
+
+            <div className="panel">
+              <div className="panel-head"><span className="panel-title">Rules</span></div>
+              <div className="rule-list">
+                <div className="rule">
+                  <CheckCircle2 className="ic ic-14" />
+                  <span>Every transition is <b>centered</b> on its cut — half in, half out.</span>
                 </div>
-              )}
-              
-              {successMessage && (
-                <div className="p-4 rounded-xl flex items-start gap-3 mb-4" style={{ background: "rgba(52,211,153,0.07)", border: "1px solid rgba(52,211,153,0.25)" }}>
-                  <CheckCircle2 className="w-5 h-5 shrink-0 mt-0.5" style={{ color: "var(--flux-ok)" }} />
-                  <div className="flex-1 min-w-0">
-                    <h3 className="text-sm font-semibold" style={{ color: "var(--flux-ok)" }}>Done</h3>
-                    <p className="text-xs mt-1" style={{ color: "var(--flux-ink2)" }}>{successMessage}</p>
-                  </div>
+                <div className="rule">
+                  <CheckCircle2 className="ic ic-14" />
+                  <span>Your <b>{totalSeconds.toFixed(1)}s</b> runtime never changes.</span>
                 </div>
+                <div className="rule">
+                  <CheckCircle2 className="ic ic-14" />
+                  <span>Hard cuts stay <b>0 frames</b> — no accidental dissolve.</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="panel tip-panel">
+              <span className="eyebrow">Signature move</span>
+              <p><b>Fade</b> carries the story, <b>slides</b> mark the beat changes. One directional slide per chapter keeps motion from feeling random.</p>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </main>
+  );
+
+  /* ═══════════════ VIEW 04 · EDITOR ═══════════════ */
+  const editorView = (
+    <>
+      <div className="editor-body">
+        <section className="stage">
+          <div className="viewer-wrap">
+            <div className="viewer" ref={viewerRef}>
+              {hasVideo ? (
+                <video
+                  ref={videoRef}
+                  className="video-el"
+                  src={currentVideoUrl}
+                  controls
+                  playsInline
+                  muted={isMuted}
+                  onPlay={() => setIsPlaying(true)}
+                  onPause={() => setIsPlaying(false)}
+                  onEnded={() => setIsPlaying(false)}
+                />
+              ) : images.length > 0 ? (
+                <>
+                  <img src={imageUrls[0]} alt="" className="video-el" />
+                  <div className="scene" style={{ opacity: 0.18 }} />
+                </>
+              ) : (
+                <>
+                  <div className="scene">
+                    <div className="sky-glow" />
+                    <div className="skyline" />
+                    <div className="street" />
+                  </div>
+                  <div className="v-copy">
+                    <span className="v-kicker">Program monitor · seq 01</span>
+                    <span className="v-title">Your premiere starts here</span>
+                    <span className="v-rule" />
+                  </div>
+                </>
               )}
 
-              {videoUrls.length > 0 ? (
-                <div className="space-y-4">
-                  {videoUrls.length > 1 && (
-                    <button
-                      onClick={handleDownloadAll}
-                      disabled={downloadingAll || loading}
-                      className="w-full inline-flex items-center justify-center gap-2 px-5 py-3.5 text-white text-sm font-bold rounded-2xl transition-all lift disabled:opacity-50 disabled:cursor-not-allowed"
-                      style={{ background: "var(--flux-ok)", boxShadow: "0 14px 30px -12px rgba(52,211,153,0.55)" }}
-                    >
-                      {downloadingAll ? (
-                        <>
-                          <Loader2 className="w-4 h-4 animate-spin" />
-                          <span>Downloading {downloadingIndex !== null ? downloadingIndex + 1 : 1} of {videoUrls.length}...</span>
-                        </>
-                      ) : (
-                        <>
-                          <Download className="w-4 h-4" />
-                          <span>Download All ({videoUrls.length} {outputMode === "single" ? "videos" : "chunks"})</span>
-                        </>
-                      )}
-                    </button>
-                  )}
+              <div className="v-top">
+                <span className="v-badge">
+                  <i className={`dot ${hasVideo ? "acc" : "idle"}`} />
+                  {hasVideo
+                    ? (outputMode === "single" ? `PROGRAM · FILM ${Math.min(activeVideo, videoUrls.length - 1) + 1}` : `PROGRAM · CHAPTER ${Math.min(activeVideo, videoUrls.length - 1) + 1}`)
+                    : "PROGRAM · SEQ 01"}
+                </span>
+                <span className="v-badge ghost">1080P · 30FPS</span>
+              </div>
+
+              {!hasVideo && (
+                <div className="v-bottom">
+                  <div className="v-note">
+                    <span>
+                      {images.length > 0
+                        ? <><b>{images[0].name}</b> · SOURCE FRAME 01</>
+                        : <>NO MEDIA · ADD FRAMES ON STEP 01</>}
+                    </span>
+                    <span className="acc-t">
+                      {images.length > 0 ? "PRESS RENDER TO FILL THE PROGRAM" : "AWAITING FOOTAGE"}
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="transport">
+            <div className="t-group">
+              <span className="tc-now">{toTimecode(totalSeconds)}</span>
+              <span className="tc-sub">SEQ DUR</span>
+            </div>
+
+            <div className="t-buttons">
+              <button type="button" className="tbtn sm" disabled={!hasVideo} onClick={() => seekBy(-5)} aria-label="Back 5 seconds">
+                <svg className="ic ic-14 ic-fill" viewBox="0 0 24 24"><path d="M11 6v12l-8-6zM19 6v12l-8-6z" /></svg>
+              </button>
+              <button type="button" className="tbtn" disabled={!hasVideo} onClick={togglePlay} aria-label={isPlaying ? "Pause" : "Play"}>
+                {isPlaying
+                  ? <Pause className="ic ic-fill" />
+                  : <Play className="ic ic-fill" />}
+              </button>
+              <button type="button" className="tbtn sm" disabled={!hasVideo} onClick={() => seekBy(5)} aria-label="Forward 5 seconds">
+                <svg className="ic ic-14 ic-fill" viewBox="0 0 24 24"><path d="M13 6v12l8-6zM5 6v12l8-6z" /></svg>
+              </button>
+            </div>
+
+            <div className="t-right">
+              <span className="chip">{images.length} CLIPS</span>
+              <span className="chip">30 FPS</span>
+              <button type="button" className="tbtn sm" disabled={!hasVideo} onClick={toggleMute} aria-label="Mute">
+                <svg className="ic ic-14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M11 5L6.5 9H3v6h3.5L11 19z" />
+                  {!isMuted ? <path d="M15 9.5a3.5 3.5 0 010 5" /> : <path d="M16 10l4 4M20 10l-4 4" />}
+                </svg>
+              </button>
+              <button
+                type="button"
+                className="tbtn sm"
+                disabled={!hasVideo}
+                onClick={() => viewerRef.current?.requestFullscreen?.()}
+                aria-label="Fullscreen"
+              >
+                <svg className="ic ic-14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </section>
+
+        {/* ══════════ EXPORT-ONLY SETTINGS ══════════ */}
+        <aside className="export-panel">
+          <div className="exp-head">
+            <div className="panel-head">
+              <span className="panel-title">Export</span>
+              <span className={`badge ${videoUrls.length > 0 ? "ok" : loading ? "" : "idle"}`}>
+                {loading
+                  ? <><i className="dot acc" />RENDERING</>
+                  : videoUrls.length > 0
+                    ? <><i className="dot ok" />READY</>
+                    : <><i className="dot idle" />IDLE</>}
+              </span>
+            </div>
+            <p className="exp-sub mono">
+              SEQ 01 · {images.length} FRAMES · {totalSeconds.toFixed(1)}S · 30FPS
+            </p>
+          </div>
+
+          <div className="exp-scroll">
+            <section className="exp-sec">
+              <div className="exp-label">Deliver as</div>
+              <div className="mode-grid">
+                <button
+                  type="button"
+                  className={`mode ${outputMode === "single" ? "on" : ""}`}
+                  disabled={loading}
+                  onClick={() => setOutputMode("single")}
+                >
+                  <b>One film</b>
+                  <i>Whole story, single file</i>
+                </button>
+                <button
+                  type="button"
+                  className={`mode ${outputMode === "chunks" ? "on" : ""}`}
+                  disabled={loading}
+                  onClick={() => setOutputMode("chunks")}
+                >
+                  <b>Chapters</b>
+                  <i>Split per soundtrack</i>
+                </button>
+              </div>
+            </section>
+
+            <section className="exp-sec">
+              <div className="exp-label">Format</div>
+              <div className="spec-list">
+                <div className="spec-row"><span>Container</span><b>MP4</b></div>
+                <div className="spec-row"><span>Codec</span><b>H.264 + AAC</b></div>
+                <div className="spec-row"><span>Resolution</span><b>1920 × 1080</b></div>
+                <div className="spec-row"><span>Frame rate</span><b>30 fps</b></div>
+              </div>
+            </section>
+
+            {loading && (
+              <section className="exp-sec">
+                <div className="exp-label">Progress</div>
+                <div className="exp-progress">
+                  <div className="ep-top">
+                    <span className="ep-state">
+                      <RefreshCw className="ic ic-12 spin" style={{ display: "inline", verticalAlign: "-2px", marginRight: 5 }} />
+                      {uploading
+                        ? (uploadStatusText || "Transferring media…")
+                        : (stageDetail || (stage ? `${stage}…` : "Firing the render engine…"))}
+                    </span>
+                  </div>
+                  <div className="bar">
+                    <i style={{ width: `${uploading ? uploadProgress : progress}%` }} />
+                  </div>
+                  <div className="ep-top">
+                    <span className="ep-eta">
+                      {uploading ? `UPLOAD ${uploadProgress}%` : `${Math.round(progress)}%`} · {images.length} FRAMES
+                    </span>
+                    <span className="ep-eta">
+                      {!uploading && progress > 0 ? formatEta(eta) : ""}
+                    </span>
+                  </div>
+                </div>
+                {!uploading && images.length > 50 && (
+                  <p className="panel-note">
+                    Large job ({images.length} frames) renders in segments — progress lands per segment,
+                    chapters appear as they finish.
+                  </p>
+                )}
+                <button type="button" className="mini-btn danger wide" style={{ marginTop: 10 }} onClick={handleCancel}>
+                  Cancel render
+                </button>
+              </section>
+            )}
+
+            {videoUrls.length > 0 && (
+              <section className="exp-sec">
+                <div className="exp-label">Deliveries · {videoUrls.length}</div>
+                {videoUrls.length > 1 && (
+                  <button
+                    type="button"
+                    className="mini-btn wide"
+                    disabled={downloadingAll || loading}
+                    onClick={handleDownloadAll}
+                  >
+                    {downloadingAll
+                      ? `Downloading ${downloadingIndex !== null ? downloadingIndex + 1 : 1} of ${videoUrls.length}…`
+                      : `Download all (${videoUrls.length} ${outputMode === "single" ? "videos" : "chunks"})`}
+                  </button>
+                )}
+                <div className="deliver-list">
                   {videoUrls.map((url, index) => (
-                    <div key={index} className="rounded-2xl overflow-hidden flex flex-col lift" style={{ background: "#000", border: "1px solid var(--flux-line2)" }}>
-                      <div className="aspect-video relative flex items-center justify-center">
-                        <video 
-                          controls 
-                          className="w-full h-full object-contain"
-                          src={url}
-                          controlsList="nodownload"
-                        />
-                        <span className="absolute top-3 left-3 px-2 py-1 rounded-md text-[10px] font-mono-d font-bold pointer-events-none" style={{ background: "rgba(0,0,0,0.65)", color: "var(--flux-acc)", border: "1px solid var(--flux-line2)" }}>
-                          {outputMode === "single" ? `FILM ${index + 1}` : `CHAPTER ${index + 1}`}
+                    <div className="deliver-row" key={index}>
+                      <button
+                        type="button"
+                        className={`deliver-pick ${index === Math.min(activeVideo, videoUrls.length - 1) ? "on" : ""}`}
+                        onClick={() => setActiveVideo(index)}
+                      >
+                        <span className="deliver-idx">{pad2(index + 1)}</span>
+                        <span className="deliver-name">
+                          {outputMode === "single" ? `film_${index + 1}.mp4` : `chapter_${index + 1}.mp4`}
                         </span>
-                      </div>
-                      
-                      <div className="p-4 flex items-center justify-between" style={{ background: "rgba(255,255,255,0.02)", borderTop: "1px solid var(--flux-line)" }}>
-                        <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg" style={{ background: "rgba(0,0,0,0.4)" }}>
-                          <span className="w-2 h-2 rounded-full breathe" style={{ background: "var(--flux-ok)" }}></span>
-                          <span className="text-[10px] font-mono-d font-bold tracking-wider" style={{ color: "var(--flux-ink2)" }}>1080p READY</span>
-                        </div>
-                        
-                        <div className="flex gap-2">
-                          <button 
-                            onClick={() => handleDownload(url, index)}
-                            disabled={downloadingIndex === index || downloadingAll}
-                            className="inline-flex items-center gap-2 px-5 py-2 text-white text-xs font-bold rounded-xl transition-all lift disabled:opacity-50 disabled:cursor-not-allowed"
-                            style={{ background: "var(--flux-ink)", color: "#0b0b0d" }}
-                          >
-                            {downloadingIndex === index ? (
-                              <>
-                                <Loader2 className="w-4 h-4 animate-spin" />
-                                <span>{downloadProgress > 0 ? `${Math.round(downloadProgress)}%` : 'Saving...'}</span>
-                              </>
-                            ) : (
-                              <>
-                                <Download className="w-4 h-4" />
-                                <span>Download</span>
-                              </>
-                            )}
-                          </button>
-                        </div>
-                      </div>
+                      </button>
+                      <button
+                        type="button"
+                        className="mini-btn"
+                        disabled={downloadingIndex === index || downloadingAll}
+                        onClick={() => handleDownload(url, index)}
+                        aria-label={`Download segment ${index + 1}`}
+                      >
+                        {downloadingIndex === index
+                          ? <Loader2 className="ic ic-12 spin" />
+                          : <Download className="ic ic-12" />}
+                      </button>
                     </div>
                   ))}
                 </div>
-              ) : (
-                <div className="aspect-video rounded-2xl border border-dashed flex flex-col items-center justify-center gap-4 p-6 text-center" style={{ background: "rgba(255,255,255,0.015)", borderColor: "#3a3a42" }}>
-                  <div className="p-4 rounded-2xl" style={{ background: "rgba(255,255,255,0.03)" }}>
-                    <Video className="w-8 h-8" style={{ color: "var(--flux-ink3)" }} />
-                  </div>
-                  <div>
-                    <p className="text-sm font-semibold" style={{ color: "var(--flux-ink2)" }}>
-                      {loading ? "Rendering your film…" : "Your premiere starts here"}
-                    </p>
-                    <p className="text-[11px] mt-1 font-mono-d" style={{ color: "var(--flux-ink3)" }}>1080p · H.264 + AAC</p>
-                  </div>
-                </div>
-              )}
+              </section>
+            )}
 
-              <div className="pt-5 space-y-3">
-                {/* Output mode: one film or chapters */}
-                <div className="rounded-xl p-3" style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--flux-line)" }}>
-                  <div className="text-xs font-semibold mb-2" style={{ color: "var(--flux-ink2)" }}>Deliver as</div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      type="button"
-                      disabled={loading}
-                      onClick={() => setOutputMode("single")}
-                      className="px-3 py-2.5 rounded-xl text-xs font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed lift"
-                      style={outputMode === "single"
-                        ? { background: "var(--flux-acc-soft)", color: "var(--flux-acc)", border: "1px solid var(--flux-acc-line)" }
-                        : { background: "rgba(255,255,255,0.03)", color: "var(--flux-ink2)", border: "1px solid var(--flux-line2)" }}
-                    >
-                      <div>One film</div>
-                      <div className="text-[10px] font-normal opacity-70 mt-0.5">Whole story, single file</div>
-                    </button>
-                    <button
-                      type="button"
-                      disabled={loading}
-                      onClick={() => setOutputMode("chunks")}
-                      className="px-3 py-2.5 rounded-xl text-xs font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed lift"
-                      style={outputMode === "chunks"
-                        ? { background: "var(--flux-acc-soft)", color: "var(--flux-acc)", border: "1px solid var(--flux-acc-line)" }
-                        : { background: "rgba(255,255,255,0.03)", color: "var(--flux-ink2)", border: "1px solid var(--flux-line2)" }}
-                    >
-                      <div>Chapters</div>
-                      <div className="text-[10px] font-normal opacity-70 mt-0.5">Split per soundtrack</div>
-                    </button>
+            {!loading && videoUrls.length === 0 && (
+              <section className="exp-sec">
+                <div className="exp-label">Ready</div>
+                {images.length > 0 ? (
+                  <div className="note">
+                    <Clock className="ic ic-14" />
+                    <span>~{totalSeconds.toFixed(0)}s · {images.length} frames · 1080p30 · {transitions.length} cuts</span>
                   </div>
-                </div>
-                <button
-                  onClick={handleGenerate}
-                  disabled={loading || images.length === 0}
-                  className={`btn-fire relative w-full py-4 px-6 rounded-2xl font-bold text-base overflow-hidden flex items-center justify-center gap-3 select-none ${loading ? "rendering-glow cursor-wait" : images.length === 0 ? "opacity-40 cursor-not-allowed" : ""}`}
-                >
-                  {/* Progress Fill Background */}
-                  {loading && (
-                    <div 
-                      className="absolute left-0 top-0 bottom-0 transition-all duration-300 ease-out working"
-                      style={{ width: `${uploading ? uploadProgress : progress}%`, backgroundColor: "rgba(255,255,255,0.25)" }}
-                    />
-                  )}
-                  
-                  <span className="relative z-10 flex items-center gap-2.5 tracking-wide">
-                    {loading ? (
-                      <>
-                        <Loader2 className="w-5 h-5 animate-spin text-white" />
-                        {uploading ? (
-                          <span>Uploading ({uploadProgress}%)...</span>
-                        ) : progress >= 0 ? (
-                          <span>Rendering… {Math.round(progress)}%</span>
-                        ) : (
-                          <span>Starting Engine...</span>
-                        )}
-                      </>
-                    ) : (
-                      <>
-                        <Play className="w-5 h-5 fill-current" />
-                        <span>Render my film</span>
-                        {images.length > 0 && (
-                          <span className="font-mono-d font-normal opacity-70 text-[13px]">
-                            · ~{displayDurations.reduce((a, b) => a + b, 0).toFixed(0)}s · 1080p
-                          </span>
-                        )}
-                      </>
-                    )}
-                  </span>
-                </button>
-                
-                {loading && (
-                  <div className="mt-4 space-y-2 px-1 font-mono-d text-xs">
-                    <div className="flex items-center justify-between">
-                      <span className="flex items-center gap-2" style={{ color: "var(--flux-acc)" }}>
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                        {uploading
-                          ? (uploadStatusText || 'Transferring media...')
-                          : (stageDetail || (stage ? `${stage}...` : 'Firing the render engine...'))}
-                      </span>
-                      {!uploading && progress > 0 && (
-                        <span className="font-bold px-2 py-0.5 rounded" style={{ color: "var(--flux-acc)", background: "var(--flux-acc-soft)", border: "1px solid var(--flux-acc-line)" }}>
-                          ETA: {formatEta(eta)}
-                        </span>
-                      )}
-                    </div>
-                    {!uploading && images.length > 50 && (
-                      <div className="text-[11px]" style={{ color: "var(--flux-ink3)" }}>
-                        Large job ({images.length} frames render in segments — progress lands per segment, chapters appear as they finish.
-                      </div>
-                    )}
-                    <button
-                      onClick={handleCancel}
-                      className="w-full py-2 text-xs font-semibold rounded-lg transition-colors"
-                      style={{ background: "rgba(244,63,94,0.08)", color: "#fda4af", border: "1px solid rgba(244,63,94,0.25)" }}
-                    >
-                      Cancel render
-                    </button>
-                  </div>
+                ) : (
+                  <div className="empty-note">Add frames on step 01 to enable rendering.</div>
                 )}
+              </section>
+            )}
+          </div>
+
+          <div className="exp-foot">
+            <button
+              type="button"
+              className="btn-export"
+              onClick={handleGenerate}
+              disabled={loading || images.length === 0}
+            >
+              {loading && (
+                <span className="fill" style={{ width: `${uploading ? uploadProgress : progress}%` }} />
+              )}
+              <span className="lbl">
+                {loading ? (
+                  uploading ? (
+                    <><Loader2 className="ic ic-14 spin" /> Uploading {uploadProgress}%…</>
+                  ) : (
+                    <><Loader2 className="ic ic-14 spin" /> Rendering… {Math.round(progress)}%</>
+                  )
+                ) : (
+                  <>
+                    <Play className="ic ic-14 ic-fill" />
+                    Render my film
+                    {images.length > 0 && (
+                      <span style={{ fontFamily: "var(--font-mono)", fontWeight: 400, opacity: 0.75, fontSize: 11 }}>
+                        · ~{totalSeconds.toFixed(0)}s
+                      </span>
+                    )}
+                  </>
+                )}
+              </span>
+            </button>
+            <div className="foot-meta mono">
+              <span>1080P30 · H.264 + AAC</span>
+              <span>{images.length} FRAMES</span>
+            </div>
+          </div>
+        </aside>
+      </div>
+
+    </>
+  );
+
+  return (
+    <div className={`app ${view === 3 ? "app-editor" : ""}`}>
+      <header className="topbar">
+        <div className="tb-left">
+          <span className="brand">
+            <span className="brand-mark"><span /></span>
+            <span className="brand-name">Fluxcut</span>
+            <span className="brand-tag">STUDIO</span>
+          </span>
+        </div>
+
+        {stepper}
+        {navButtons}
+      </header>
+
+      {view === 0 && footageView}
+      {view === 1 && timelineView}
+      {view === 2 && motionView}
+      {view === 3 && editorView}
+
+      <input
+        type="file"
+        ref={fileInputRef}
+        multiple
+        accept="image/*"
+        onChange={handleImageChange}
+        className="hidden"
+      />
+      <input
+        type="file"
+        ref={audioInputRef}
+        multiple
+        accept="audio/*"
+        onChange={handleAudioChange}
+        className="hidden"
+      />
+
+      {(error || successMessage) && (
+        <div className="toast-stack">
+          {error && (
+            <div className="toast err">
+              <AlertCircle className="ic t-ic" />
+              <div className="toast-body">
+                <b>Something needs attention</b>
+                <p>{error}</p>
               </div>
-
-            </section>
-
-            <footer className="flex flex-wrap items-center justify-between gap-2 px-1 pt-2 pb-10 font-mono-d text-[10.5px]" style={{ color: "var(--flux-ink3)" }}>
-              <span>FLUXCUT · FFMPEG · 1080p30 · H.264 + AAC</span>
-              <span>CENTERED CUTS · EXACT TIMELINES · NO-MUTE AUDIO</span>
-            </footer>
-      </main>
+              <button type="button" className="toast-x" onClick={() => setError("")} aria-label="Dismiss">
+                <X className="ic ic-12" />
+              </button>
+            </div>
+          )}
+          {successMessage && (
+            <div className="toast ok">
+              <CheckCircle2 className="ic t-ic" />
+              <div className="toast-body">
+                <b>Done</b>
+                <p>{successMessage}</p>
+              </div>
+              <button type="button" className="toast-x" onClick={() => setSuccessMessage("")} aria-label="Dismiss">
+                <X className="ic ic-12" />
+              </button>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

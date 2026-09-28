@@ -27,6 +27,31 @@ const getMediaDuration = (filePath: string): Promise<number> => {
   });
 };
 
+// ---------- Frame-grid timeline (cut-accuracy fix) ----------
+// Output is 30fps, so every cut can only land on a whole frame: a script
+// timestamp like 00:18:14.582 sits inside frame 17 (0.5667s-0.6000s) and is
+// honored to the nearest frame (±16.7ms — the physical limit of the format).
+// The OLD code converted each slide duration to frames INDEPENDENTLY, so the
+// per-slide rounding error accumulated along the timeline: measured on a
+// 120-image job, cuts drifted ~200ms early (batch path) and ~350ms late
+// (xfade path), growing with every cut — the visible "cut lands away from its
+// timestamp" bug. Quantizing the CUMULATIVE timeline instead bounds every
+// cut's error to half a frame forever, and totals stay frame-exact.
+const RENDER_FPS = 30;
+const toFrames = (sec: number) => Math.round(sec * RENDER_FPS);
+const toSeconds = (frames: number) => frames / RENDER_FPS;
+const quantizeTimelineToFrames = (durs: number[]): number[] => {
+  let prevFrames = 0;
+  let cumSec = 0;
+  return durs.map((d) => {
+    cumSec += Number.isFinite(d) && d > 0 ? d : 0;
+    let f = toFrames(cumSec) - prevFrames;
+    if (f < 1) f = 1; // never emit an empty (sub-frame) slide
+    prevFrames += f;
+    return toSeconds(f);
+  });
+};
+
 // ---------- Transition pipeline helpers (fix for stuck transitions) ----------
 
 // ffmpeg xfade supports these in ffmpeg-static 5.x. Anything else falls back to fade
@@ -63,11 +88,19 @@ const HOLD_TUNE: string[] = ["-tune", "stillimage"];
 const RUN_PRESET = "veryfast"; // Phase 3b NEGATIVE RESULT: superfast gave +4% speed for
 const RUN_CRF = "20";         // +80% file size on typical runs (per-process overhead dominates
                               // small runs, not the encoder core) — reverted, size/quality stable.
-const HOLD_BATCH_CONCURRENCY = 6; // demuxer hold-batches are light; parallelize wide (Phase 2)
+const HOLD_BATCH_CONCURRENCY = 2; // Phase 5 (single-decode graph): hold pieces fell ~35s -> ~2.5s,
+                                  // so wide parallelism now loses to turbo/power limits — measured
+                                  // 3-wide (11.9s) slower than serial (7.4s) on 20-slide batches.
+                                  // 2 keeps overlap for tiny mode-B single-slide batches.
+const HOLD_THREADS = 4;           // Phase 5 measured: auto all-core x264 threads hurt these short
+                                  // pieces (2467ms -> 1914ms single; also best at 3-wide).
+const RUN_THREADS = 8;            // Phase 5 measured: run pieces stay CPU-bound after the graph
+                                  // fix; 3 concurrent x 8 threads beat auto (107.7s -> 98.6s).
 
 // 1080p canvas filter applied INLINE at encode time from the original upload
 // (Phase 2: the norm_*.png intermediate stage is gone — identical pixels,
 // zero intermediate I/O). Ends with format (callers may append fps etc).
+// Phase 5: runs ONCE per image (before the loop filter), never per frame.
 const SCALE_FILTER = "scale=w=1920:h=1080:force_original_aspect_ratio=decrease,pad=1920:1080:(1920-iw)/2:(1080-ih)/2:black,setsar=1,format=yuv420p";
 
 const app = express();
@@ -201,13 +234,20 @@ const computeSafeTransDurations = (
     // very short slides can't host a transition -> force cut
     if (Math.min(a, b) < 0.4) return 0;
     const maxAllowed = Math.min(a, b) * 0.8;
-    const clamped = Math.min(requested, Math.max(0.2, maxAllowed));
-    return Number(Math.min(2.0, Math.max(0.2, clamped)).toFixed(3));
+    // Whole-frame clamp (30fps): never exceed 0.8x the adjacent slides so the
+    // centered half+half fades stay inside both slides; band 0.2s..2.0s.
+    const maxFrames = Math.floor(maxAllowed * RENDER_FPS);
+    const wantFrames = toFrames(requested);
+    const frames = Math.max(Math.min(wantFrames, maxFrames, 2 * RENDER_FPS), toFrames(0.2));
+    return toSeconds(frames);
   });
 };
 
 // Build offsets for a standard overlapping xfade chain:
 // offset_k = sum(D[0..k]) - sum(T[0..k])
+// Inputs are frame-exact seconds (whole/half frames for the centered fades).
+// Full precision is REQUIRED here: the old toFixed(3) rounding pushed offsets
+// off the frame grid and shifted every fade center by up to ~2 frames.
 const computeXfadeOffsets = (durs: number[], transDurs: number[]): number[] => {
   const offsets: number[] = [];
   let sumD = 0;
@@ -215,7 +255,7 @@ const computeXfadeOffsets = (durs: number[], transDurs: number[]): number[] => {
   for (let k = 0; k < transDurs.length; k++) {
     sumD += durs[k];
     sumT += transDurs[k];
-    offsets.push(Number((sumD - sumT).toFixed(3)));
+    offsets.push(sumD - sumT);
   }
   return offsets;
 };
@@ -343,18 +383,29 @@ app.post("/api/generate", async (req, res) => {
     cancelled: false,
   });
   const perfT0 = Date.now();
-  perfMark(jobDir, perfT0, `start mode=${mode} slides=${Array.isArray(durations) ? durations.length : "?"} cpus=${os.cpus().length} settings={runConc:${RUN_CONCURRENCY},batchConc:${HOLD_BATCH_CONCURRENCY},probeConc:${PROBE_CONCURRENCY},muxConc:${MUX_CONCURRENCY},threads:auto,hold:${HOLD_PRESET}/crf${HOLD_CRF}${HOLD_TUNE.length ? "+" + HOLD_TUNE.join(" ") : ""},run:${RUN_PRESET}/crf${RUN_CRF}}`);
+  perfMark(jobDir, perfT0, `start mode=${mode} slides=${Array.isArray(durations) ? durations.length : "?"} cpus=${os.cpus().length} settings={runConc:${RUN_CONCURRENCY},batchConc:${HOLD_BATCH_CONCURRENCY},probeConc:${PROBE_CONCURRENCY},muxConc:${MUX_CONCURRENCY},threads:hold=${HOLD_THREADS}/run${RUN_THREADS},hold:${HOLD_PRESET}/crf${HOLD_CRF}${HOLD_TUNE.length ? "+" + HOLD_TUNE.join(" ") : ""},run:${RUN_PRESET}/crf${RUN_CRF}}`);
 
   // Render one static hold (single image -> mp4). Fast and never hangs.
   // Input is the RAW upload; canvas scaling happens inline (Phase 2).
   const renderHold = async (rawPath: string, dur: number, outPath: string, label: string) => {
-    const d = Number(Math.max(0.1, dur).toFixed(3));
+    // Whole frames only (no toFixed(3), which could push an exact frame count
+    // off the grid and add a stray frame); 0.1s floor kept for encode safety.
+    const frames = Math.max(toFrames(0.1), toFrames(dur));
+    const d = toSeconds(frames);
     await runFfmpeg([
       "-y", "-nostdin",
-      "-framerate", "30", "-loop", "1", "-t", d.toString(), "-i", rawPath,
-      "-vf", SCALE_FILTER,
+      "-framerate", "30", "-i", rawPath,
+      // Single-decode graph (Phase 5): decode + scale ONCE, then repeat the frame
+      // with the loop FILTER. The old -loop 1 demuxer re-read and re-decoded the
+      // file for EVERY output frame (~66% of hold time; 12MP sources rendered
+      // below realtime). NO fps filter after loop: it added exactly +1 frame per
+      // slide (boundary rounding) and pushed concat cuts late. setpts+settb pin
+      // the pts grid to exact 1/30 before the loop; trim forces multi-frame
+      // uploads to a still first frame so the timeline can never stretch.
+      "-vf", `trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${SCALE_FILTER},loop=loop=${frames - 1}:size=1`,
       "-r", "30", "-c:v", "libx264", "-preset", HOLD_PRESET,
       "-crf", HOLD_CRF, ...HOLD_TUNE, "-pix_fmt", "yuv420p",
+      "-threads", String(HOLD_THREADS),
       "-t", d.toString(),
       outPath,
     ], { jobDir, label, timeoutMs: 120000 });
@@ -362,25 +413,41 @@ app.post("/api/generate", async (req, res) => {
   };
 
   // Render a batch of consecutive static holds in ONE filter pass (Phase 2/4):
-  // per-image loop inputs joined by the concat FILTER — exact by construction.
+  // per-image single-decode inputs (loop FILTER) joined by the concat FILTER —
+  // exact by construction.
   // (The concat DEMUXER + trailer recipe proved nondeterministic at scale:
   // 2/8 batches lost ~1s each in the 300-soak, so it is banned from video.)
   const renderHoldBatch = async (items: { path: string; dur: number }[], outPath: string, label: string) => {
-    const total = Number(items.reduce((a, b) => a + b.dur, 0).toFixed(3));
+    // Frame-exact per-slide durations (cumulative quantization: idempotent for
+    // already-quantized input, absorbs stray values such as mid-chunk splits).
+    // Every -t and the output total are then exact multiples of 1/30s, so cuts
+    // land exactly where the timeline says — no per-slide drift.
+    const durs = quantizeTimelineToFrames(items.map((it) => it.dur));
+    const total = durs.reduce((a, b) => a + b, 0);
     const args: string[] = ["-y", "-nostdin"];
-    items.forEach((it) => {
-      args.push("-framerate", "30", "-loop", "1", "-t", it.dur.toString(), "-i", it.path);
+    items.forEach((it, i) => {
+      args.push("-framerate", "30", "-i", it.path);
     });
     let fc = "";
     items.forEach((_, i) => {
-      fc += `[${i}:v]${SCALE_FILTER},fps=30,settb=AVTB[v${i}];`;
+      // Single-decode graph (Phase 5): one decode + one scale per image, then the
+      // loop FILTER repeats it — identical pixels, but no per-frame re-decode
+      // (the old -loop 1 demuxer re-read the file for every output frame; that
+      // alone was ~66% of hold time). NO fps after loop — it added +1 frame per
+      // slide and drifted concat cuts (measured +642ms by slide 19). setpts+settb
+      // pin pts to the exact 1/30 grid before looping. frames is exact (durs is
+      // frame-quantized).
+      const frames = Math.max(1, Math.round(durs[i] * 30));
+      fc += `[${i}:v]trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${SCALE_FILTER},loop=loop=${frames - 1}:size=1,settb=AVTB[v${i}];`;
     });
     fc += items.map((_, i) => `[v${i}]`).join("") + `concat=n=${items.length}:v=1:a=0[vout]`;
     args.push(
       "-filter_complex", fc,
       "-map", "[vout]",
-      "-r", "30", "-c:v", "libx264", "-preset", HOLD_PRESET,
+      "-r", "30", "-filter_complex_threads", String(HOLD_THREADS),
+      "-c:v", "libx264", "-preset", HOLD_PRESET,
       "-crf", HOLD_CRF, ...HOLD_TUNE, "-pix_fmt", "yuv420p",
+      "-threads", String(HOLD_THREADS),
       "-t", total.toString(),
       outPath
     );
@@ -400,37 +467,53 @@ app.post("/api/generate", async (req, res) => {
     outPath: string, label: string
   ): Promise<number> => {
     const n = normPaths.length;
-    const inDurs = durs.map((d, i) => Number((d
-      + (i > 0 ? transDurs[i - 1] : 0) / 2
-      + (i < durs.length - 1 ? transDurs[i] : 0) / 2).toFixed(3)));
-    const expected = Number(durs.reduce((a, b) => a + b, 0).toFixed(3));
-    const offsets = computeXfadeOffsets(inDurs, transDurs);
+    // Frame-exact inputs: cumulative quantization for slide lengths, whole
+    // frames per transition (idempotent — callers already pass quantized
+    // values). Math stays in full-precision seconds: offsets land on the
+    // half-frame grid the centered half+half fades require; the old toFixed(3)
+    // pushed them off the frame grid and shifted every fade center by up to
+    // ~2 frames (measured drift: +350ms over a 120-image job).
+    const qDurs = quantizeTimelineToFrames(durs);
+    const qTrans = transDurs.map((t) => (t > 0 ? toSeconds(Math.max(1, toFrames(t))) : 0));
+    const inDurs = qDurs.map((d, i) => d
+      + (i > 0 ? qTrans[i - 1] : 0) / 2
+      + (i < qDurs.length - 1 ? qTrans[i] : 0) / 2);
+    const expected = qDurs.reduce((a, b) => a + b, 0);
+    const offsets = computeXfadeOffsets(inDurs, qTrans);
     const args: string[] = ["-y", "-nostdin"];
-    // Pad each input slightly so xfade never hits EOF exactly at offset+duration.
+    // Single-decode inputs (Phase 5): decode + scale ONCE per image, repeat the
+    // frame with the loop FILTER — the old -loop 1 demuxer re-read and re-decoded
+    // the file for every output frame (dominant run cost before the fix).
+    // Frame budget keeps the old "+0.5s so xfade never hits EOF exactly at
+    // offset+duration" pad: ceil never lands below it, extra tail frames are
+    // simply unused by xfade, so EOF behavior is unchanged.
     for (let i = 0; i < n; i++) {
-      args.push("-framerate", "30", "-loop", "1", "-t", (inDurs[i] + 0.5).toString(), "-i", normPaths[i]);
+      args.push("-framerate", "30", "-i", normPaths[i]);
     }
     let fc = "";
     for (let i = 0; i < n; i++) {
-      fc += `[${i}:v]${SCALE_FILTER},fps=30,settb=AVTB[v${i}];`;
+      const frames = Math.max(1, Math.ceil((inDurs[i] + 0.5) * 30 + 1e-6));
+      fc += `[${i}:v]trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${SCALE_FILTER},loop=loop=${frames - 1}:size=1,settb=AVTB[v${i}];`;
     }
     let cur = "[v0][v1]";
     let outLabel = "[x1]";
     // first transition
-    fc += `${cur}xfade=transition=${trans[0]}:duration=${transDurs[0]}:offset=${offsets[0]}${outLabel};`;
+    fc += `${cur}xfade=transition=${trans[0]}:duration=${qTrans[0]}:offset=${offsets[0]}${outLabel};`;
     for (let k = 1; k < trans.length; k++) {
       const nextIn = `[v${k + 1}]`;
       const prevOut = outLabel;
       outLabel = `[x${k + 1}]`;
-      fc += `${prevOut}${nextIn}xfade=transition=${trans[k]}:duration=${transDurs[k]}:offset=${offsets[k]}${outLabel};`;
+      fc += `${prevOut}${nextIn}xfade=transition=${trans[k]}:duration=${qTrans[k]}:offset=${offsets[k]}${outLabel};`;
     }
     const finalLabel = outLabel;
     fc += `${finalLabel}format=yuv420p[vout]`;
     args.push(
       "-filter_complex", fc,
       "-map", "[vout]",
-      "-r", "30", "-c:v", "libx264", "-preset", RUN_PRESET,
+      "-r", "30", "-filter_complex_threads", String(RUN_THREADS),
+      "-c:v", "libx264", "-preset", RUN_PRESET,
       "-crf", RUN_CRF, "-pix_fmt", "yuv420p",
+      "-threads", String(RUN_THREADS),
       "-t", expected.toString(),
       outPath
     );
@@ -536,9 +619,12 @@ app.post("/api/generate", async (req, res) => {
       finalDurations.push(finalDurations[finalDurations.length - 1] || 5);
     }
     finalDurations = finalDurations.slice(0, rawImages.length);
+    // Honor every script timestamp to the nearest frame WITHOUT accumulating
+    // rounding error along the timeline (see quantizeTimelineToFrames).
+    finalDurations = quantizeTimelineToFrames(finalDurations);
 
     // ---- Parse + sanitize transitions ----
-    const allowedIn = new Set(["none", "fade", "smoothleft", "smoothright", "slideleft", "slideright"]);
+    const allowedIn = new Set(["none", "fade", "smoothleft", "smoothright", "slideleft", "slideright", "slideup", "slidedown"]);
     let parsedTransitions: string[] = [];
     if (Array.isArray(transitions)) {
       parsedTransitions = transitions.map((t: any) => {
@@ -816,9 +902,10 @@ app.post("/api/generate", async (req, res) => {
             try {
               // Retry 1: force fade (most compatible transition)
               const fadeDurs = run.transDurs.map(() => 0.5);
-              // re-clamp fades to fit
+              // re-clamp fades to fit (whole frames, same 0.2s..0.5s band)
               const maxAllowed = Math.min(...run.durs) * 0.8;
-              const fd = fadeDurs.map(d => Number(Math.min(d, Math.max(0.2, maxAllowed)).toFixed(3)));
+              const fdFrames = Math.max(Math.min(toFrames(0.5), Math.floor(maxAllowed * RENDER_FPS)), toFrames(0.2));
+              const fd = fadeDurs.map(() => toSeconds(fdFrames));
               await renderXfadeRun(run.imgPaths, run.durs, run.trans.map(() => "fade"), fd, run.outPath, label + "_retryFade");
               run.estDur = Number(run.durs.reduce((a, b) => a + b, 0).toFixed(3));
               piece.estDur = run.estDur;
@@ -1010,6 +1097,14 @@ app.get("/api/video/job/:jobId/:filename", async (req, res) => {
     res.writeHead(200, head);
     fs.createReadStream(filePath).pipe(res);
   }
+});
+
+// Anything under /api that did not match a route above would otherwise fall through to
+// Vite's SPA middleware (dev) or the static handler (prod) and return index.html with a
+// 200 — which the client then reports as "Proxy or server returned HTML fallback".
+// Answer with a real JSON 404 so a missing/misspelled endpoint is obvious.
+app.use("/api", (req, res) => {
+  res.status(404).json({ error: `No API endpoint for ${req.method} ${req.originalUrl}` });
 });
 
 // Vite middleware for dev
