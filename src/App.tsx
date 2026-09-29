@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useMemo } from "react";
 import {
   Upload, AlertCircle, Loader2, X, CheckCircle2,
   Download, Play, Pause, Music, RefreshCw, Clock,
@@ -6,6 +6,7 @@ import {
   MoveLeft, MoveRight, MoveUp, MoveDown
 } from "lucide-react";
 import { parseTimestamps } from "./utils/parser";
+import { planMotion, motionBadge, introCutoff, MOTION_INTRO_SECONDS } from "./utils/motion";
 
 const TRANSITIONS_CONFIG = [
   { id: "none", name: "Hard Cut", icon: Scissors, color: "text-neutral-400", border: "border-neutral-700/60", bg: "bg-neutral-800" },
@@ -172,6 +173,19 @@ export default function App() {
   const [error, setError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
 
+  // Auto-dismiss render toasts after 3s — error on failure, done on complete.
+  useEffect(() => {
+    if (!error) return;
+    const t = setTimeout(() => setError(""), 3000);
+    return () => clearTimeout(t);
+  }, [error]);
+
+  useEffect(() => {
+    if (!successMessage) return;
+    const t = setTimeout(() => setSuccessMessage(""), 3000);
+    return () => clearTimeout(t);
+  }, [successMessage]);
+
   const [videoUrls, setVideoUrls] = useState<string[]>([]);
   const [durations, setDurations] = useState<number[]>([]);
   const [progress, setProgress] = useState<number>(0);
@@ -186,6 +200,52 @@ export default function App() {
 
   // Output mode: "single" = whole output in one video, "chunks" = split per audio track.
   const [outputMode, setOutputMode] = useState<"single" | "chunks">("single");
+
+  // Pro Camera (Ken Burns) motion — one shared planner drives both the server
+  // render and these cut-map badges, so preview and output always agree.
+  const [motionOn, setMotionOn] = useState(true);
+  const [motionStyle, setMotionStyle] = useState<"subtle" | "mixed" | "dynamic">("mixed");
+  const [motionSeed, setMotionSeed] = useState(() => Math.floor(Math.random() * 1_000_000_000));
+
+  // Badge plan — mirrors the EXACT arrays handleGenerate sends (sized durations
+  // + per-join transition durations) so badges match the rendered camera moves.
+  const sizedDurs = useMemo(() => {
+    let d = durations.length ? [...durations] : [];
+    if (d.length === 0) {
+      d = new Array(images.length).fill(defaultDurationPerImage);
+    } else if (d.length < images.length) {
+      const lastDur = d[d.length - 1] || defaultDurationPerImage;
+      while (d.length < images.length) d.push(lastDur);
+    } else if (d.length > images.length) {
+      d = d.slice(0, images.length);
+    }
+    return d;
+  }, [durations, images.length, defaultDurationPerImage]);
+
+  // Intro-only motion: when camera motion is on, shots starting in the first
+  // MOTION_INTRO_SECONDS keep their transitions — the tail renders as
+  // straight cuts on the fast path. The stored `transitions` state is left
+  // intact (turning motion off restores it); everything below — badges,
+  // payload, markers — reads the effective timeline so preview == output.
+  const introEnd = useMemo(
+    () => introCutoff(sizedDurs, { imageCount: images.length }),
+    [sizedDurs, images.length]
+  );
+  const effTransitions = useMemo(
+    () => (motionOn ? transitions.map((t, i) => (i < introEnd ? t : "none")) : transitions),
+    [transitions, motionOn, introEnd]
+  );
+  const effTransDurs = useMemo(
+    () => effTransitions.map(t => (t === "none" ? 0 : (categoryDurations[t] || 0.5))),
+    [effTransitions, categoryDurations]
+  );
+
+  const badgePlan = useMemo(
+    () => planMotion(sizedDurs, effTransitions, effTransDurs,
+      { enabled: motionOn, style: motionStyle, seed: motionSeed },
+      { imageCount: images.length }),
+    [sizedDurs, effTransitions, effTransDurs, motionOn, motionStyle, motionSeed, images.length]
+  );
 
   // ── Design-only view state (no business logic) ──────────────────
   const [view, setView] = useState(0);              // 0 Footage · 1 Timeline · 2 Motion · 3 Editor
@@ -331,7 +391,6 @@ export default function App() {
 
     const categoryName = TRANSITIONS_CONFIG.find(c => c.id === category)?.name || category;
     setSuccessMessage(`Updated all ${categoryName} transitions duration to ${newDuration}s.`);
-    setTimeout(() => setSuccessMessage(""), 3500);
   };
 
   const handleApplyToAll = (transType: string) => {
@@ -343,7 +402,6 @@ export default function App() {
     setGlobalTransition(transType);
     const catName = TRANSITIONS_CONFIG.find(t => t.id === transType)?.name || transType;
     setSuccessMessage(`Applied "${catName}" (${transType === "none" ? "Cut" : chosenDur + "s"}) to all ${needed} cuts.`);
-    setTimeout(() => setSuccessMessage(""), 4000);
   };
 
   const handleSpecificTransition = (index: number, transType: string) => {
@@ -361,7 +419,6 @@ export default function App() {
     setTransitions(new Array(needed).fill("none"));
     setGlobalTransition("none");
     setSuccessMessage("Reset all cuts to standard Cuts (None).");
-    setTimeout(() => setSuccessMessage(""), 3500);
   };
 
   const removeImage = (index: number) => {
@@ -586,9 +643,10 @@ export default function App() {
         body: JSON.stringify({
           jobId,
           durations: finalDurations,
-          transitions,
-          transitionDurations: transitions.map(t => t === "none" ? 0 : (categoryDurations[t] || 0.5)),
+          transitions: effTransitions,
+          transitionDurations: effTransDurs,
           transitionDuration: categoryDurations["fade"] || 0.5,
+          motion: { enabled: motionOn, style: motionStyle, seed: motionSeed },
           outputMode
         })
       });
@@ -671,7 +729,6 @@ export default function App() {
         }
       }
       setSuccessMessage(`Started download of all ${videoUrls.length} chunks. Check your downloads folder.`);
-      setTimeout(() => setSuccessMessage(""), 5000);
     } catch (err) {
       console.error('Download all error:', err);
       setError("Failed to download all chunks. Try downloading them one by one.");
@@ -708,7 +765,7 @@ export default function App() {
   /* ── derived display values (design only) ─────────────────────── */
   const totalSeconds = displayDurations.reduce((a, b) => a + b, 0);
   const totalLabel = `${pad2(totalSeconds / 60)}:${(totalSeconds % 60).toFixed(1).padStart(4, "0")}`;
-  const liveTransitions = transitions.filter(t => t !== "none").length;
+  const liveTransitions = effTransitions.filter(t => t !== "none").length;
   const cutIndices = images.length > 1 ? transitions.map((_, i) => i) : [];
   const visibleCuts = showAllCuts ? cutIndices : cutIndices.slice(0, 6);
   const currentVideoUrl =
@@ -994,12 +1051,12 @@ export default function App() {
                           </div>
                         </div>
                         {index < images.length - 1 && (
-                          <div className={`seq-marker ${markerModFor(transitions[index])}`}>
+                          <div className={`seq-marker ${markerModFor(effTransitions[index])}`}>
                             <span className="dia" />
                             <span className="m-lab">
-                              {transitions[index] === "none" || !transitions[index]
+                              {effTransitions[index] === "none" || !effTransitions[index]
                                 ? "CUT"
-                                : `${categoryDurations[transitions[index]] || 0.5}s`}
+                                : `${categoryDurations[effTransitions[index]] || 0.5}s`}
                             </span>
                           </div>
                         )}
@@ -1227,11 +1284,13 @@ export default function App() {
                 <>
                   <div className="cut-map">
                     {visibleCuts.map(idx => {
-                      const trans = transitions[idx] || "none";
+                      const trans = effTransitions[idx] || "none";
                       const imgFrom = images[idx]?.name || `Img ${idx + 1}`;
                       const imgTo = images[idx + 1]?.name || `Img ${idx + 2}`;
                       const isActive = trans !== "none";
                       const thisDur = categoryDurations[trans] || 0.5;
+                      const moveBadge = motionBadge(badgePlan[idx]);
+                      const tailCut = motionOn && idx >= introEnd;
 
                       return (
                         <div key={idx} className="cut-row">
@@ -1249,6 +1308,15 @@ export default function App() {
                             <b>{imgFrom} → {imgTo}</b>
                             <i>{isActive ? `${thisDur}s · CENTERED ON CUT` : "HARD CUT · 0 FRAMES"}</i>
                           </span>
+                          {moveBadge && <span className="cut-move">{moveBadge}</span>}
+                          {tailCut ? (
+                            <span
+                              className="cut-locked"
+                              title={transitions[idx] && transitions[idx] !== "none" ? `Stored: ${transitions[idx]} (restored when motion is off)` : "Intro-only motion: this join always renders as a hard cut"}
+                            >
+                              CUT-ONLY TAIL
+                            </span>
+                          ) : (
                           <CustomSelect
                             value={trans}
                             onChange={(val: any) => handleSpecificTransition(idx, String(val))}
@@ -1265,6 +1333,7 @@ export default function App() {
                             className="w-32"
                             dropdownUp={idx > cutIndices.length - 3}
                           />
+                          )}
                         </div>
                       );
                     })}
@@ -1291,6 +1360,62 @@ export default function App() {
           </div>
 
           <aside className="motion-aside">
+            <div className={`panel cam-card ${motionOn ? "" : "off"}`}>
+              <div className="panel-head">
+                <span className="panel-title">Camera motion</span>
+                <span className={`chip ${motionOn ? "acc" : ""}`}>{motionOn ? "ON" : "OFF"}</span>
+              </div>
+
+              <div className="mode-grid cam-switch">
+                <button
+                  type="button"
+                  className={`mode ${motionOn ? "on" : ""}`}
+                  disabled={loading}
+                  onClick={() => setMotionOn(true)}
+                >
+                  <b>On</b>
+                </button>
+                <button
+                  type="button"
+                  className={`mode ${!motionOn ? "on" : ""}`}
+                  disabled={loading}
+                  onClick={() => setMotionOn(false)}
+                >
+                  <b>Off</b>
+                </button>
+              </div>
+
+              <div className="tr-dur">
+                <span>Style</span>
+                <CustomSelect
+                  value={motionStyle}
+                  onChange={(val: any) => setMotionStyle(val)}
+                  options={[
+                    { value: "subtle", label: "Subtle" },
+                    { value: "mixed", label: "Mixed" },
+                    { value: "dynamic", label: "Dynamic" },
+                  ]}
+                  className="w-32"
+                />
+              </div>
+
+              <div className="tr-foot">
+                <span className="cam-seed">SEED #{motionSeed}</span>
+                <button
+                  type="button"
+                  className="mini-btn"
+                  disabled={loading}
+                  onClick={() => setMotionSeed(Math.floor(Math.random() * 1_000_000_000))}
+                >
+                  ⟳ Remix
+                </button>
+              </div>
+
+              <p className="panel-note">
+                Intro-only motion: shots starting in the first {MOTION_INTRO_SECONDS}s move in randomized mix — push, pull, drift on every shot. The rest render as straight cuts on the fast path.
+              </p>
+            </div>
+
             <div className="panel">
               <div className="panel-head"><span className="panel-title">Active preset</span></div>
               <div className="kv-list">

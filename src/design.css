@@ -946,6 +946,36 @@ button.audio-row:hover { transform: translateY(-2px); }
 }
 .cut-label i { font-style: normal; font-family: var(--font-mono); font-size: 9px; color: var(--ink-3); }
 
+/* Pro Camera move badge — the outgoing image's planned camera move.
+   Shrinks the label instead of itself (label is flex:1, this is flex:none). */
+.cut-move {
+  flex: none; align-self: center;
+  font-family: var(--font-mono);
+  font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase;
+  color: var(--ink-3);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 2px 6px;
+  white-space: nowrap;
+}
+.cut-row:hover .cut-move { border-color: var(--line-2); color: var(--ink-2); }
+
+/* Cut-only tail lock — joins past the motion intro always render as hard
+   cuts while motion is on (fast static path). Same badge geometry as
+   .cut-move so rows don't shift. */
+.cut-locked {
+  flex: none; align-self: center;
+  font-family: var(--font-mono);
+  font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase;
+  color: var(--ink-3);
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  padding: 2px 6px;
+  white-space: nowrap;
+}
+
 /* custom select (transition pickers) */
 .cselect { position: relative; flex: none; }
 .cselect-btn {
@@ -1194,6 +1224,27 @@ button.audio-row:hover { transform: translateY(-2px); }
 .mode.on i { color: rgba(255, 176, 140, 0.85); }
 .mode:disabled { opacity: 0.5; }
 
+/* ── Pro Camera card (03 · Motion aside) ──────────────────────────
+   Reuses .mode (on/off), .tr-dur (style row), .tr-foot (seed row),
+   .chip, .mini-btn — only the compact On/Off sizing is new. */
+.cam-switch { margin-top: 11px; }
+.cam-card .mode {
+  flex-direction: row; justify-content: center; align-items: center;
+  padding: 7px 10px; text-align: center;
+}
+.cam-card .mode b { font-size: 11px; }
+.cam-seed {
+  font-family: var(--font-mono);
+  font-size: 9.5px; letter-spacing: 0.06em;
+  color: var(--ink-3); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+/* Off = muted: the switch + chip stay readable, the rest dims. */
+.cam-card.off .tr-dur,
+.cam-card.off .tr-foot,
+.cam-card.off .panel-note { opacity: 0.5; }
+.cam-card.off .panel-title { color: var(--ink-3); }
+
 .spec-list { display: flex; flex-direction: column; }
 .spec-row {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
@@ -1367,4 +1418,11 @@ button.audio-row:hover { transform: translateY(-2px); }
   .editor-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
   .export-panel { border-left: none; border-top: 1px solid var(--line); max-height: 46vh; }
   .au-meta { width: auto; flex: 1; }
+}
+/* Cut map: the camera-move badge would squeeze the row past its min-width
+   here — let the label hold a full line and the badge/select wrap instead
+   (label is the only shrinkable item; num/thumbs/select are flex:none). */
+@media (max-width: 620px) {
+  .cut-row { flex-wrap: wrap; }
+  .cut-label { flex: 1 1 140px; }
 }

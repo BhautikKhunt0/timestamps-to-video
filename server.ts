@@ -9,6 +9,13 @@ import ffmpegPath from "ffmpeg-static";
 
 import { WebSocketServer, WebSocket } from "ws";
 import http from "http";
+import {
+  planMotion,
+  buildMotionBranch,
+  normalizeMotionConfig,
+  introCutoff,
+  type ShotMotion,
+} from "./src/utils/motion";
 
 
 const getMediaDuration = (filePath: string): Promise<number> => {
@@ -356,7 +363,7 @@ app.post("/api/cancel/:jobId", (req, res) => {
 });
 
 app.post("/api/generate", async (req, res) => {
-  const { jobId, durations, transitions, transitionDurations, transitionDuration, outputMode } = req.body;
+  const { jobId, durations, transitions, transitionDurations, transitionDuration, outputMode, motion } = req.body;
   if (!jobId || !durations || !Array.isArray(durations)) {
     return res.status(400).json({ error: "Invalid payload" });
   }
@@ -387,28 +394,53 @@ app.post("/api/generate", async (req, res) => {
 
   // Render one static hold (single image -> mp4). Fast and never hangs.
   // Input is the RAW upload; canvas scaling happens inline (Phase 2).
-  const renderHold = async (rawPath: string, dur: number, outPath: string, label: string) => {
+  const renderHold = async (rawPath: string, dur: number, outPath: string, label: string,
+    motion?: { shot: ShotMotion; tOff?: number } | null) => {
     // Whole frames only (no toFixed(3), which could push an exact frame count
     // off the grid and add a stray frame); 0.1s floor kept for encode safety.
     const frames = Math.max(toFrames(0.1), toFrames(dur));
     const d = toSeconds(frames);
-    await runFfmpeg([
-      "-y", "-nostdin",
-      "-framerate", "30", "-i", rawPath,
-      // Single-decode graph (Phase 5): decode + scale ONCE, then repeat the frame
-      // with the loop FILTER. The old -loop 1 demuxer re-read and re-decoded the
-      // file for EVERY output frame (~66% of hold time; 12MP sources rendered
-      // below realtime). NO fps filter after loop: it added exactly +1 frame per
-      // slide (boundary rounding) and pushed concat cuts late. setpts+settb pin
-      // the pts grid to exact 1/30 before the loop; trim forces multi-frame
-      // uploads to a still first frame so the timeline can never stretch.
+    const head = ["-y", "-nostdin", "-framerate", "30", "-i", rawPath];
+    const tail = [
+      "-r", "30", "-c:v", "libx264", "-preset", HOLD_PRESET, "-crf", HOLD_CRF,
+      "-pix_fmt", "yuv420p", "-threads", String(HOLD_THREADS), "-t", d.toString(), outPath,
+    ];
+    const staticArgs = [
+      ...head,
       "-vf", `trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${SCALE_FILTER},loop=loop=${frames - 1}:size=1`,
-      "-r", "30", "-c:v", "libx264", "-preset", HOLD_PRESET,
-      "-crf", HOLD_CRF, ...HOLD_TUNE, "-pix_fmt", "yuv420p",
-      "-threads", String(HOLD_THREADS),
-      "-t", d.toString(),
-      outPath,
-    ], { jobDir, label, timeoutMs: 120000 });
+      ...tail.slice(0, 3), ...HOLD_TUNE, ...tail.slice(3),
+    ];
+    const args = motion
+      ? [
+          ...head,
+          "-filter_complex",
+          buildMotionBranch(motion.shot, {
+            mode: "fc", inputIdx: 0, outLabel: "vout",
+            loopFrames: frames, tOff: motion.tOff ?? 0,
+          }),
+          "-map", "[vout]",
+          // stillimage tune only fits static frames — moving content drops it.
+          ...tail,
+        ]
+      : staticArgs;
+    try {
+      await runFfmpeg(args, { jobDir, label, timeoutMs: 120000 });
+    } catch (e) {
+      // Motion safety net: the animated zoom re-initialises the scaler every
+      // frame and faults on some long shots in this ffmpeg build. One branch
+      // must never fail a whole job — redo it as a clean still instead.
+      if (!motion) throw e;
+      appendLog(jobDir, "ffmpeg.log", `[motion retry] ${label}: ${(e as Error).message}`);
+      try {
+        // The fault is intermittent (per-frame scaler reinit), so one retry
+        // usually keeps the camera move instead of dropping to a still.
+        await runFfmpeg(args, { jobDir, label: `${label} (motion retry)`, timeoutMs: 120000 });
+        return d;
+      } catch (e2) {
+        appendLog(jobDir, "ffmpeg.log", `[motion fallback to static] ${label}: ${(e2 as Error).message}`);
+        await runFfmpeg(staticArgs, { jobDir, label: `${label} (static)`, timeoutMs: 120000 });
+      }
+    }
     return d;
   };
 
@@ -417,41 +449,61 @@ app.post("/api/generate", async (req, res) => {
   // exact by construction.
   // (The concat DEMUXER + trailer recipe proved nondeterministic at scale:
   // 2/8 batches lost ~1s each in the 300-soak, so it is banned from video.)
-  const renderHoldBatch = async (items: { path: string; dur: number }[], outPath: string, label: string) => {
+  const renderHoldBatch = async (items: { path: string; dur: number; motion?: ShotMotion | null; tOff?: number }[], outPath: string, label: string) => {
     // Frame-exact per-slide durations (cumulative quantization: idempotent for
     // already-quantized input, absorbs stray values such as mid-chunk splits).
     // Every -t and the output total are then exact multiples of 1/30s, so cuts
     // land exactly where the timeline says — no per-slide drift.
     const durs = quantizeTimelineToFrames(items.map((it) => it.dur));
     const total = durs.reduce((a, b) => a + b, 0);
-    const args: string[] = ["-y", "-nostdin"];
-    items.forEach((it, i) => {
-      args.push("-framerate", "30", "-i", it.path);
-    });
-    let fc = "";
-    items.forEach((_, i) => {
-      // Single-decode graph (Phase 5): one decode + one scale per image, then the
-      // loop FILTER repeats it — identical pixels, but no per-frame re-decode
-      // (the old -loop 1 demuxer re-read the file for every output frame; that
-      // alone was ~66% of hold time). NO fps after loop — it added +1 frame per
-      // slide and drifted concat cuts (measured +642ms by slide 19). setpts+settb
-      // pin pts to the exact 1/30 grid before looping. frames is exact (durs is
-      // frame-quantized).
-      const frames = Math.max(1, Math.round(durs[i] * 30));
-      fc += `[${i}:v]trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${SCALE_FILTER},loop=loop=${frames - 1}:size=1,settb=AVTB[v${i}];`;
-    });
-    fc += items.map((_, i) => `[v${i}]`).join("") + `concat=n=${items.length}:v=1:a=0[vout]`;
-    args.push(
-      "-filter_complex", fc,
-      "-map", "[vout]",
-      "-r", "30", "-filter_complex_threads", String(HOLD_THREADS),
-      "-c:v", "libx264", "-preset", HOLD_PRESET,
-      "-crf", HOLD_CRF, ...HOLD_TUNE, "-pix_fmt", "yuv420p",
-      "-threads", String(HOLD_THREADS),
-      "-t", total.toString(),
-      outPath
-    );
-    await runFfmpeg(args, { jobDir, label, timeoutMs: 600000 });
+    const anyMotion = items.some(it => it.motion);
+    // Branch builder: withMotion=false reproduces today's static graph exactly
+    // (used both for non-motion items and as the whole-batch retry).
+    const buildBatch = (withMotion: boolean) => {
+      const head: string[] = ["-y", "-nostdin"];
+      items.forEach((it) => head.push("-framerate", "30", "-i", it.path));
+      let f = "";
+      items.forEach((_, i) => {
+        const frames = Math.max(1, Math.round(durs[i] * 30));
+        if (withMotion && items[i].motion) {
+          // Motion shot: same loop frame budget, animated crop window instead of
+          // the static scale/copy branch (branch string ends in ";" + [vN]).
+          f += buildMotionBranch(items[i].motion!, {
+            mode: "fc", inputIdx: i, outLabel: `v${i}`,
+            loopFrames: frames, tOff: items[i].tOff ?? 0,
+          });
+        } else {
+          f += `[${i}:v]trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${SCALE_FILTER},loop=loop=${frames - 1}:size=1,settb=AVTB[v${i}];`;
+        }
+      });
+      f += items.map((_, i) => `[v${i}]`).join("") + `concat=n=${items.length}:v=1:a=0[vout]`;
+      return [
+        ...head,
+        "-filter_complex", f,
+        "-map", "[vout]",
+        "-r", "30", "-filter_complex_threads", String(HOLD_THREADS),
+        "-c:v", "libx264", "-preset", HOLD_PRESET,
+        "-crf", HOLD_CRF, ...(withMotion ? [] : HOLD_TUNE), "-pix_fmt", "yuv420p",
+        "-threads", String(HOLD_THREADS),
+        "-t", total.toString(),
+        outPath,
+      ];
+    };
+    try {
+      await runFfmpeg(buildBatch(anyMotion), { jobDir, label, timeoutMs: 600000 });
+    } catch (e) {
+      // Motion safety net (see renderHold): a faulty motion branch must never
+      // fail the batch — rerun the identical timeline as clean stills.
+      if (!anyMotion) throw e;
+      appendLog(jobDir, "ffmpeg.log", `[motion retry] ${label}: ${(e as Error).message}`);
+      try {
+        await runFfmpeg(buildBatch(true), { jobDir, label: `${label} (motion retry)`, timeoutMs: 600000 });
+        return total;
+      } catch (e2) {
+        appendLog(jobDir, "ffmpeg.log", `[motion fallback to static] ${label}: ${(e2 as Error).message}`);
+        await runFfmpeg(buildBatch(false), { jobDir, label: `${label} (static)`, timeoutMs: 600000 });
+      }
+    }
     return total;
   };
 
@@ -464,7 +516,7 @@ app.post("/api/generate", async (req, res) => {
   // pasted timestamps — transitions never shrink or shift the timeline.
   const renderXfadeRun = async (
     normPaths: string[], durs: number[], trans: string[], transDurs: number[],
-    outPath: string, label: string
+    outPath: string, label: string, plan?: (ShotMotion | null)[]
   ): Promise<number> => {
     const n = normPaths.length;
     // Frame-exact inputs: cumulative quantization for slide lengths, whole
@@ -475,49 +527,82 @@ app.post("/api/generate", async (req, res) => {
     // ~2 frames (measured drift: +350ms over a 120-image job).
     const qDurs = quantizeTimelineToFrames(durs);
     const qTrans = transDurs.map((t) => (t > 0 ? toSeconds(Math.max(1, toFrames(t))) : 0));
+    // Whole-frame half-extensions (must mirror planMotion extFor): odd-frame
+    // transitions split floor-right / ceil-left so halves sum to the full
+    // transition and every offset lands exactly on the frame grid. A raw /2
+    // lands mid-frame (0.5s = 15f -> 7.5f) and misaligns each blend by 0.5f,
+    // breaking the mirror handoff's position/velocity match (visible pop).
+    const halfDownF = (frames: number) => Math.floor(frames / 2);
     const inDurs = qDurs.map((d, i) => d
-      + (i > 0 ? qTrans[i - 1] : 0) / 2
-      + (i < qDurs.length - 1 ? qTrans[i] : 0) / 2);
+      + (i > 0 ? toSeconds(toFrames(qTrans[i - 1]) - halfDownF(toFrames(qTrans[i - 1]))) : 0)
+      + (i < qDurs.length - 1 ? toSeconds(halfDownF(toFrames(qTrans[i]))) : 0));
     const expected = qDurs.reduce((a, b) => a + b, 0);
     const offsets = computeXfadeOffsets(inDurs, qTrans);
-    const args: string[] = ["-y", "-nostdin"];
-    // Single-decode inputs (Phase 5): decode + scale ONCE per image, repeat the
-    // frame with the loop FILTER — the old -loop 1 demuxer re-read and re-decoded
-    // the file for every output frame (dominant run cost before the fix).
-    // Frame budget keeps the old "+0.5s so xfade never hits EOF exactly at
-    // offset+duration" pad: ceil never lands below it, extra tail frames are
-    // simply unused by xfade, so EOF behavior is unchanged.
-    for (let i = 0; i < n; i++) {
-      args.push("-framerate", "30", "-i", normPaths[i]);
+    const anyMotion = !!plan?.some(Boolean);
+    // withMotion=false reproduces today's static branch graph exactly, and is
+    // also the whole-run retry if a motion branch faults (see renderHold).
+    const buildRun = (withMotion: boolean) => {
+      const a: string[] = ["-y", "-nostdin"];
+      // Single-decode inputs (Phase 5): decode + scale ONCE per image, repeat the
+      // frame with the loop FILTER — the old -loop 1 demuxer re-read and re-decoded
+      // the file for every output frame (dominant run cost before the fix).
+      // Frame budget keeps the old "+0.5s so xfade never hits EOF exactly at
+      // offset+duration" pad: ceil never lands below it, extra tail frames are
+      // simply unused by xfade, so EOF behavior is unchanged.
+      for (let i = 0; i < n; i++) a.push("-framerate", "30", "-i", normPaths[i]);
+      let f = "";
+      for (let i = 0; i < n; i++) {
+        const frames = Math.max(1, Math.ceil((inDurs[i] + 0.5) * 30 + 1e-6));
+        if (withMotion && plan?.[i]) {
+          // Motion shot: same "+0.5s" frame budget the static loop uses, but the
+          // crop window animates across the (extended) input span. On the
+          // retry-fade path transDurs differ from the plan's — the curve then
+          // clips or holds; fallback path only.
+          f += buildMotionBranch(plan[i]!, {
+            mode: "fc", inputIdx: i, outLabel: `v${i}`,
+            loopFrames: frames, tOff: 0,
+          });
+        } else {
+          f += `[${i}:v]trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${SCALE_FILTER},loop=loop=${frames - 1}:size=1,settb=AVTB[v${i}];`;
+        }
+      }
+      let cur = "[v0][v1]";
+      let outLabel = "[x1]";
+      // first transition
+      f += `${cur}xfade=transition=${trans[0]}:duration=${qTrans[0]}:offset=${offsets[0]}${outLabel};`;
+      for (let k = 1; k < trans.length; k++) {
+        const nextIn = `[v${k + 1}]`;
+        const prevOut = outLabel;
+        outLabel = `[x${k + 1}]`;
+        f += `${prevOut}${nextIn}xfade=transition=${trans[k]}:duration=${qTrans[k]}:offset=${offsets[k]}${outLabel};`;
+      }
+      f += `${outLabel}format=yuv420p[vout]`;
+      a.push(
+        "-filter_complex", f, "-map", "[vout]",
+        "-r", "30", "-filter_complex_threads", String(RUN_THREADS),
+        "-c:v", "libx264", "-preset", RUN_PRESET,
+        "-crf", RUN_CRF, "-pix_fmt", "yuv420p",
+        "-threads", String(RUN_THREADS),
+        "-t", expected.toString(),
+        outPath
+      );
+      return a;
+    };
+    try {
+      await runFfmpeg(buildRun(anyMotion), { jobDir, label, timeoutMs: 300000 });
+    } catch (e) {
+      // Motion safety net (see renderHold): rerun the identical run as static
+      // xfades rather than losing the job to a faulty motion branch.
+      if (!anyMotion) throw e;
+      appendLog(jobDir, "ffmpeg.log", `[motion retry] ${label}: ${(e as Error).message}`);
+      try {
+        await runFfmpeg(buildRun(true), { jobDir, label: `${label} (motion retry)`, timeoutMs: 300000 });
+        return expected;
+      } catch (e2) {
+        appendLog(jobDir, "ffmpeg.log", `[motion fallback to static] ${label}: ${(e2 as Error).message}`);
+        await runFfmpeg(buildRun(false), { jobDir, label: `${label} (static)`, timeoutMs: 300000 });
+      }
     }
-    let fc = "";
-    for (let i = 0; i < n; i++) {
-      const frames = Math.max(1, Math.ceil((inDurs[i] + 0.5) * 30 + 1e-6));
-      fc += `[${i}:v]trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${SCALE_FILTER},loop=loop=${frames - 1}:size=1,settb=AVTB[v${i}];`;
-    }
-    let cur = "[v0][v1]";
-    let outLabel = "[x1]";
-    // first transition
-    fc += `${cur}xfade=transition=${trans[0]}:duration=${qTrans[0]}:offset=${offsets[0]}${outLabel};`;
-    for (let k = 1; k < trans.length; k++) {
-      const nextIn = `[v${k + 1}]`;
-      const prevOut = outLabel;
-      outLabel = `[x${k + 1}]`;
-      fc += `${prevOut}${nextIn}xfade=transition=${trans[k]}:duration=${qTrans[k]}:offset=${offsets[k]}${outLabel};`;
-    }
-    const finalLabel = outLabel;
-    fc += `${finalLabel}format=yuv420p[vout]`;
-    args.push(
-      "-filter_complex", fc,
-      "-map", "[vout]",
-      "-r", "30", "-filter_complex_threads", String(RUN_THREADS),
-      "-c:v", "libx264", "-preset", RUN_PRESET,
-      "-crf", RUN_CRF, "-pix_fmt", "yuv420p",
-      "-threads", String(RUN_THREADS),
-      "-t", expected.toString(),
-      outPath
-    );
-    await runFfmpeg(args, { jobDir, label, timeoutMs: 300000 });
     return expected;
   };
 
@@ -642,6 +727,34 @@ app.post("/api/generate", async (req, res) => {
     parsedTransitions = parsedTransitions.map((t, i) => (t !== "none" && safeTransDurations[i] <= 0 ? "none" : t));
     safeTransDurations = safeTransDurations.map((d, i) => (parsedTransitions[i] === "none" ? 0 : d));
 
+    // ---- Camera motion (Ken Burns) plan: INTRO-ONLY ----
+    // Only the first SEGMENT_SIZE shots move; the tail renders as straight
+    // cuts on the fast static path (no supersample/zoompan cost, no xfade
+    // re-encodes). Purely additive when disabled: normalizeMotionConfig off
+    // yields [] and every render path below produces byte-identical ffmpeg
+    // args to the static pipeline.
+    const motionCfg = normalizeMotionConfig(motion);
+    // Intro-only: shots starting in the first MOTION_INTRO_SECONDS move;
+    // the tail renders as straight cuts on the fast static path.
+    const introEnd = introCutoff(finalDurations);
+    if (motionCfg.enabled) {
+      // Gate tail transitions BEFORE the motion plan so curve extensions
+      // match the rendered graph (tail joins are hard cuts => zero ext).
+      // The join between segments is already a hard cut (see below).
+      for (let i = introEnd; i < parsedTransitions.length; i++) parsedTransitions[i] = "none";
+      safeTransDurations = safeTransDurations.map((d, i) => (parsedTransitions[i] === "none" ? 0 : d));
+    }
+    const motionPlan: (ShotMotion | null)[] = motionCfg.enabled
+      ? planMotion(finalDurations, parsedTransitions, safeTransDurations, motionCfg).map((s, i) =>
+          i < introEnd ? s : null)
+      : [];
+    if (motionPlan.length) {
+      const moving = motionPlan.filter(Boolean).length;
+      const punches = motionPlan.filter((s) => s?.punch).length;
+      console.log(`[job ${jobId}] motion plan: style=${motionCfg.style} seed=${motionCfg.seed} moving=${moving}/${motionPlan.length} punches=${punches}`);
+      perfMark(jobDir, perfT0, `motion plan style=${motionCfg.style} seed=${motionCfg.seed} moving=${moving} punches=${punches}`);
+    }
+
     const hasActiveTransitions = rawImages.length > 1 && parsedTransitions.some(t => t !== "none");
     console.log(`[job ${jobId}] images=${rawImages.length} activeTrans=${parsedTransitions.filter(t => t !== "none").length} hasActive=${hasActiveTransitions} mode=${mode}`);
 
@@ -693,6 +806,9 @@ app.post("/api/generate", async (req, res) => {
       let currentChunkBlocks: any[] = [];
       for (const block of rawBlocks) {
         let remainingDur = block.dur;
+        // Camera-curve offset of the current slice WITHIN this image (a block
+        // split across chunk boundaries continues its motion curve).
+        let blockTOff = 0;
         while (remainingDur > 0.001) {
           checkCancelled(jobId);
           let spaceLeft = currentAudioTarget - currentChunkTime;
@@ -705,9 +821,10 @@ app.post("/api/generate", async (req, res) => {
             spaceLeft = currentAudioTarget;
           }
           const take = Math.min(remainingDur, spaceLeft);
-          currentChunkBlocks.push({ type: block.type, imgIndex: block.imgIndex, dur: take });
+          currentChunkBlocks.push({ type: block.type, imgIndex: block.imgIndex, dur: take, tOff: blockTOff });
           remainingDur -= take;
           currentChunkTime += take;
+          blockTOff += take;
         }
       }
       if (currentChunkBlocks.length > 0) {
@@ -716,10 +833,10 @@ app.post("/api/generate", async (req, res) => {
       // Render video via segment-bounded concat-filter batches (exact by
       // construction), then stream-copy them per chunk. Mid-image split takes
       // ride along as partial durations. Singletons use plain renderHold.
-      type BatchJob = { chunkIdx: number; items: { path: string; dur: number }[]; outPath: string };
+      type BatchJob = { chunkIdx: number; items: { path: string; dur: number; motion?: ShotMotion | null; tOff?: number }[]; outPath: string };
       const batchJobs: BatchJob[] = [];
       chunks.forEach((chunk: any, c: number) => {
-        let cur: { path: string; dur: number }[] = [];
+        let cur: { path: string; dur: number; motion?: ShotMotion | null; tOff?: number }[] = [];
         let curSeg = -1;
         const flush = () => {
           if (cur.length === 0) return;
@@ -730,7 +847,7 @@ app.post("/api/generate", async (req, res) => {
           const seg = Math.floor(block.imgIndex / SEGMENT_SIZE);
           if (cur.length > 0 && seg !== curSeg) flush();
           curSeg = seg;
-          cur.push({ path: slideFiles[block.imgIndex], dur: block.dur });
+          cur.push({ path: slideFiles[block.imgIndex], dur: block.dur, motion: motionPlan[block.imgIndex] ?? null, tOff: block.tOff || 0 });
         });
         flush();
         chunk.offset = chunks.slice(0, c).reduce((a: number, x: any) => a + x.dur, 0);
@@ -740,7 +857,8 @@ app.post("/api/generate", async (req, res) => {
         await mapPool(batchJobs, HOLD_BATCH_CONCURRENCY, async (bj) => {
           checkCancelled(jobId);
           if (bj.items.length === 1) {
-            await renderHold(bj.items[0].path, bj.items[0].dur, bj.outPath, `ahold_${bj.chunkIdx}`);
+            await renderHold(bj.items[0].path, bj.items[0].dur, bj.outPath, `ahold_${bj.chunkIdx}`,
+              bj.items[0].motion ? { shot: bj.items[0].motion, tOff: bj.items[0].tOff } : null);
           } else {
             await renderHoldBatch(bj.items, bj.outPath, `abatch_${bj.chunkIdx}x${bj.items.length}`);
           }
@@ -802,11 +920,12 @@ app.post("/api/generate", async (req, res) => {
       type Run = {
         imgPaths: string[]; durs: number[]; trans: string[]; transDurs: number[];
         outPath: string; estDur: number; segIdx: number; runIdx: number;
+        plan?: (ShotMotion | null)[];
       };
       // Pieces in timeline order. Consecutive single-image holds in a segment
       // batch into ONE demuxer encode; xfade runs render directly (Phase 2).
       type Piece =
-        | { kind: "batch"; outPath: string; estDur: number; segIdx: number; order: number; items: { path: string; dur: number }[] }
+        | { kind: "batch"; outPath: string; estDur: number; segIdx: number; order: number; items: { path: string; dur: number; motion?: ShotMotion | null; tOff?: number }[] }
         | { kind: "xrun"; outPath: string; estDur: number; segIdx: number; order: number; run: Run };
       const pieces: Piece[] = [];
       let runCounter = 0;
@@ -815,7 +934,7 @@ app.post("/api/generate", async (req, res) => {
         const end = Math.min((s + 1) * SEGMENT_SIZE, slideFiles.length);
         // Split segment at hard cuts ("none") into xfade-able runs.
         let runStart = start;
-        let streak: { path: string; dur: number }[] = [];
+        let streak: { path: string; dur: number; motion?: ShotMotion | null; tOff?: number }[] = [];
         const flushStreak = () => {
           if (streak.length === 0) return;
           pieces.push({
@@ -835,7 +954,7 @@ app.post("/api/generate", async (req, res) => {
             for (let k = runStart; k <= i; k++) idxs.push(k);
             if (idxs.length === 1) {
               const gi = idxs[0];
-              streak.push({ path: slideFiles[gi], dur: finalDurations[gi] });
+              streak.push({ path: slideFiles[gi], dur: finalDurations[gi], motion: motionPlan[gi] ?? null, tOff: 0 });
             } else {
               flushStreak();
               const t = idxs.slice(0, -1).map(k => parsedTransitions[k]);
@@ -848,6 +967,7 @@ app.post("/api/generate", async (req, res) => {
                 trans: t, transDurs: td,
                 outPath: path.join(jobDir, `run_${runCounter++}.mp4`),
                 estDur: est, segIdx: s, runIdx: pieces.length,
+                plan: motionPlan.length ? idxs.map(k => motionPlan[k]) : undefined,
               };
               pieces.push({ kind: "xrun", outPath: run.outPath, estDur: est, segIdx: s, order: pieces.length, run });
             }
@@ -880,7 +1000,8 @@ app.post("/api/generate", async (req, res) => {
           const holdPaths: string[] = [];
           for (let h = 0; h < b.items.length; h++) {
             const hp = path.join(jobDir, `batch_${b.order}_fb_${h}.mp4`);
-            await renderHold(b.items[h].path, b.items[h].dur, hp, `${label}_fb${h}`);
+            await renderHold(b.items[h].path, b.items[h].dur, hp, `${label}_fb${h}`,
+              b.items[h].motion ? { shot: b.items[h].motion, tOff: b.items[h].tOff } : null);
             holdPaths.push(hp);
           }
           await concatPieces(holdPaths, b.outPath, `${label}_fbConcat`);
@@ -896,7 +1017,7 @@ app.post("/api/generate", async (req, res) => {
           const run = piece.run;
           const label = `xfade_r${run.runIdx}_${run.trans.join("+")}`;
           try {
-            await renderXfadeRun(run.imgPaths, run.durs, run.trans, run.transDurs, run.outPath, label);
+            await renderXfadeRun(run.imgPaths, run.durs, run.trans, run.transDurs, run.outPath, label, run.plan);
           } catch (e1: any) {
             appendLog(jobDir, "ffmpeg.log", `[retry fade] ${label}: ${(e1 as Error).message}`);
             try {
@@ -906,7 +1027,7 @@ app.post("/api/generate", async (req, res) => {
               const maxAllowed = Math.min(...run.durs) * 0.8;
               const fdFrames = Math.max(Math.min(toFrames(0.5), Math.floor(maxAllowed * RENDER_FPS)), toFrames(0.2));
               const fd = fadeDurs.map(() => toSeconds(fdFrames));
-              await renderXfadeRun(run.imgPaths, run.durs, run.trans.map(() => "fade"), fd, run.outPath, label + "_retryFade");
+              await renderXfadeRun(run.imgPaths, run.durs, run.trans.map(() => "fade"), fd, run.outPath, label + "_retryFade", run.plan);
               run.estDur = Number(run.durs.reduce((a, b) => a + b, 0).toFixed(3));
               piece.estDur = run.estDur;
             } catch (e2: any) {
@@ -915,7 +1036,8 @@ app.post("/api/generate", async (req, res) => {
               const holdPaths: string[] = [];
               for (let h = 0; h < run.imgPaths.length; h++) {
                 const hp = path.join(jobDir, `run_${run.runIdx}_fb_${h}.mp4`);
-                await renderHold(run.imgPaths[h], run.durs[h], hp, `${label}_fb${h}`);
+                await renderHold(run.imgPaths[h], run.durs[h], hp, `${label}_fb${h}`,
+                  run.plan?.[h] ? { shot: run.plan[h]!, tOff: 0 } : null);
                 holdPaths.push(hp);
               }
               await concatPieces(holdPaths, run.outPath, `${label}_fbConcat`);
