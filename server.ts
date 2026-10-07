@@ -16,6 +16,16 @@ import {
   introCutoff,
   type ShotMotion,
 } from "./src/utils/motion";
+import {
+  normalizeSlideSpec,
+  layoutSlide,
+  buildSlideFilter,
+  SLIDE_W,
+  SLIDE_H,
+  SLIDE_FPS,
+  SLIDE_BG,
+  type SlideSpec,
+} from "./src/utils/slides";
 
 
 const getMediaDuration = (filePath: string): Promise<number> => {
@@ -109,6 +119,18 @@ const RUN_THREADS = 8;            // Phase 5 measured: run pieces stay CPU-bound
 // zero intermediate I/O). Ends with format (callers may append fps etc).
 // Phase 5: runs ONCE per image (before the loop filter), never per frame.
 const SCALE_FILTER = "scale=w=1920:h=1080:force_original_aspect_ratio=decrease,pad=1920:1080:(1920-iw)/2:(1080-ih)/2:black,setsar=1,format=yuv420p";
+// Pre-rendered slide clips are already 1920x1080 yuv420p CFR-30: branches
+// only normalize the timebase — never rescale (SCALE_FILTER would resample
+// identical pixels and soften them).
+const CLIP_TAIL = "setsar=1,format=yuv420p";
+// Slide pre-render encode (overlay choreography only, no camera motion).
+const SLIDE_PRESET = "ultrafast";
+const SLIDE_CRF = "18";
+const SLIDE_PRE_CONCURRENCY = 4;
+// Headline font, filesystem path (the filter graph uses the escaped
+// SLIDE_FONT_FILE from slides.ts). Missing file => slides render titleless,
+// never fail: the check runs per job in the slide pre-render step.
+const SLIDE_FONT_PATH = "C:/Windows/Fonts/arialbd.ttf";
 
 const app = express();
 const PORT = 3000;
@@ -363,7 +385,7 @@ app.post("/api/cancel/:jobId", (req, res) => {
 });
 
 app.post("/api/generate", async (req, res) => {
-  const { jobId, durations, transitions, transitionDurations, transitionDuration, outputMode, motion } = req.body;
+  const { jobId, durations, transitions, transitionDurations, transitionDuration, outputMode, motion, slides } = req.body;
   if (!jobId || !durations || !Array.isArray(durations)) {
     return res.status(400).json({ error: "Invalid payload" });
   }
@@ -394,22 +416,32 @@ app.post("/api/generate", async (req, res) => {
 
   // Render one static hold (single image -> mp4). Fast and never hangs.
   // Input is the RAW upload; canvas scaling happens inline (Phase 2).
+  // Pre-rendered slide clips (isClip) carry baked animation: consume their
+  // real frames via a range trim instead of freezing frame 0 + loop.
   const renderHold = async (rawPath: string, dur: number, outPath: string, label: string,
-    motion?: { shot: ShotMotion; tOff?: number } | null) => {
+    motion?: { shot: ShotMotion; tOff?: number } | null, isClip: boolean = false) => {
     // Whole frames only (no toFixed(3), which could push an exact frame count
     // off the grid and add a stray frame); 0.1s floor kept for encode safety.
     const frames = Math.max(toFrames(0.1), toFrames(dur));
     const d = toSeconds(frames);
-    const head = ["-y", "-nostdin", "-framerate", "30", "-i", rawPath];
+    const head = isClip
+      ? ["-y", "-nostdin", "-i", rawPath]
+      : ["-y", "-nostdin", "-framerate", "30", "-i", rawPath];
     const tail = [
       "-r", "30", "-c:v", "libx264", "-preset", HOLD_PRESET, "-crf", HOLD_CRF,
       "-pix_fmt", "yuv420p", "-threads", String(HOLD_THREADS), "-t", d.toString(), outPath,
     ];
-    const staticArgs = [
-      ...head,
-      "-vf", `trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${SCALE_FILTER},loop=loop=${frames - 1}:size=1`,
-      ...tail.slice(0, 3), ...HOLD_TUNE, ...tail.slice(3),
-    ];
+    const staticArgs = isClip
+      ? [
+          ...head,
+          "-vf", `trim=start_frame=0:end_frame=${frames},setpts=PTS-STARTPTS,settb=1/30,${CLIP_TAIL}`,
+          ...tail,
+        ]
+      : [
+          ...head,
+          "-vf", `trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${SCALE_FILTER},loop=loop=${frames - 1}:size=1`,
+          ...tail.slice(0, 3), ...HOLD_TUNE, ...tail.slice(3),
+        ];
     const args = motion
       ? [
           ...head,
@@ -417,6 +449,7 @@ app.post("/api/generate", async (req, res) => {
           buildMotionBranch(motion.shot, {
             mode: "fc", inputIdx: 0, outLabel: "vout",
             loopFrames: frames, tOff: motion.tOff ?? 0,
+            inputKind: isClip ? "video" : "still",
           }),
           "-map", "[vout]",
           // stillimage tune only fits static frames — moving content drops it.
@@ -449,7 +482,7 @@ app.post("/api/generate", async (req, res) => {
   // exact by construction.
   // (The concat DEMUXER + trailer recipe proved nondeterministic at scale:
   // 2/8 batches lost ~1s each in the 300-soak, so it is banned from video.)
-  const renderHoldBatch = async (items: { path: string; dur: number; motion?: ShotMotion | null; tOff?: number }[], outPath: string, label: string) => {
+  const renderHoldBatch = async (items: { path: string; dur: number; motion?: ShotMotion | null; tOff?: number; clip?: boolean }[], outPath: string, label: string) => {
     // Frame-exact per-slide durations (cumulative quantization: idempotent for
     // already-quantized input, absorbs stray values such as mid-chunk splits).
     // Every -t and the output total are then exact multiples of 1/30s, so cuts
@@ -457,11 +490,16 @@ app.post("/api/generate", async (req, res) => {
     const durs = quantizeTimelineToFrames(items.map((it) => it.dur));
     const total = durs.reduce((a, b) => a + b, 0);
     const anyMotion = items.some(it => it.motion);
+    const anyClip = items.some(it => it.clip);
     // Branch builder: withMotion=false reproduces today's static graph exactly
     // (used both for non-motion items and as the whole-batch retry).
     const buildBatch = (withMotion: boolean) => {
       const head: string[] = ["-y", "-nostdin"];
-      items.forEach((it) => head.push("-framerate", "30", "-i", it.path));
+      // -framerate is an image-demuxer flag: stills need it, clip .mp4s must
+      // not take it.
+      items.forEach((it) => it.clip
+        ? head.push("-i", it.path)
+        : head.push("-framerate", "30", "-i", it.path));
       let f = "";
       items.forEach((_, i) => {
         const frames = Math.max(1, Math.round(durs[i] * 30));
@@ -471,7 +509,11 @@ app.post("/api/generate", async (req, res) => {
           f += buildMotionBranch(items[i].motion!, {
             mode: "fc", inputIdx: i, outLabel: `v${i}`,
             loopFrames: frames, tOff: items[i].tOff ?? 0,
+            inputKind: items[i].clip ? "video" : "still",
           });
+        } else if (items[i].clip) {
+          // Baked slide animation: consume real frames, never rescale.
+          f += `[${i}:v]trim=start_frame=0:end_frame=${frames},setpts=PTS-STARTPTS,settb=1/30,${CLIP_TAIL},settb=AVTB[v${i}];`;
         } else {
           f += `[${i}:v]trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${SCALE_FILTER},loop=loop=${frames - 1}:size=1,settb=AVTB[v${i}];`;
         }
@@ -483,7 +525,8 @@ app.post("/api/generate", async (req, res) => {
         "-map", "[vout]",
         "-r", "30", "-filter_complex_threads", String(HOLD_THREADS),
         "-c:v", "libx264", "-preset", HOLD_PRESET,
-        "-crf", HOLD_CRF, ...(withMotion ? [] : HOLD_TUNE), "-pix_fmt", "yuv420p",
+        // stillimage tune fits still frames only — motion or clips drop it.
+        "-crf", HOLD_CRF, ...(withMotion || anyClip ? [] : HOLD_TUNE), "-pix_fmt", "yuv420p",
         "-threads", String(HOLD_THREADS),
         "-t", total.toString(),
         outPath,
@@ -516,7 +559,7 @@ app.post("/api/generate", async (req, res) => {
   // pasted timestamps — transitions never shrink or shift the timeline.
   const renderXfadeRun = async (
     normPaths: string[], durs: number[], trans: string[], transDurs: number[],
-    outPath: string, label: string, plan?: (ShotMotion | null)[]
+    outPath: string, label: string, plan?: (ShotMotion | null)[], clip?: boolean[]
   ): Promise<number> => {
     const n = normPaths.length;
     // Frame-exact inputs: cumulative quantization for slide lengths, whole
@@ -541,6 +584,8 @@ app.post("/api/generate", async (req, res) => {
     const anyMotion = !!plan?.some(Boolean);
     // withMotion=false reproduces today's static branch graph exactly, and is
     // also the whole-run retry if a motion branch faults (see renderHold).
+    // Clip inputs (baked slide animation) consume real frame windows and are
+    // never rescaled; stills keep the single-decode + loop filter path.
     const buildRun = (withMotion: boolean) => {
       const a: string[] = ["-y", "-nostdin"];
       // Single-decode inputs (Phase 5): decode + scale ONCE per image, repeat the
@@ -549,7 +594,10 @@ app.post("/api/generate", async (req, res) => {
       // Frame budget keeps the old "+0.5s so xfade never hits EOF exactly at
       // offset+duration" pad: ceil never lands below it, extra tail frames are
       // simply unused by xfade, so EOF behavior is unchanged.
-      for (let i = 0; i < n; i++) a.push("-framerate", "30", "-i", normPaths[i]);
+      for (let i = 0; i < n; i++) {
+        if (clip?.[i]) a.push("-i", normPaths[i]);
+        else a.push("-framerate", "30", "-i", normPaths[i]);
+      }
       let f = "";
       for (let i = 0; i < n; i++) {
         const frames = Math.max(1, Math.ceil((inDurs[i] + 0.5) * 30 + 1e-6));
@@ -561,7 +609,10 @@ app.post("/api/generate", async (req, res) => {
           f += buildMotionBranch(plan[i]!, {
             mode: "fc", inputIdx: i, outLabel: `v${i}`,
             loopFrames: frames, tOff: 0,
+            inputKind: clip?.[i] ? "video" : "still",
           });
+        } else if (clip?.[i]) {
+          f += `[${i}:v]trim=start_frame=0:end_frame=${frames},setpts=PTS-STARTPTS,settb=1/30,${CLIP_TAIL},settb=AVTB[v${i}];`;
         } else {
           f += `[${i}:v]trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${SCALE_FILTER},loop=loop=${frames - 1}:size=1,settb=AVTB[v${i}];`;
         }
@@ -699,11 +750,53 @@ app.post("/api/generate", async (req, res) => {
       throw new Error("No images found for job");
     }
 
+    // ---- Slide structure (multi-card slides, optional) ----
+    // Payload `slides` aligns with `durations`: one entry per timeline unit.
+    // Each entry groups raw images: {images:[rawIdx], layout, enter, title}.
+    // Strict validation — every raw image covered EXACTLY once, indices in
+    // range. Anything off => legacy per-image timeline (byte-identical).
+    // Trivial slides (1 image, no title, enter none) keep the still path.
+    let slideMode = false;
+    let unitSpecs: { spec: SlideSpec; rawPaths: string[]; clipPath: string }[] = [];
+    {
+      const sArr = Array.isArray(slides) ? slides : [];
+      const dArr = Array.isArray(durations) ? durations : [];
+      if (sArr.length > 0 && sArr.length === dArr.length) {
+        const seen = new Set<number>();
+        let ok = true;
+        const tmp: typeof unitSpecs = [];
+        for (let i = 0; i < sArr.length && ok; i++) {
+          const spec = normalizeSlideSpec({ ...(sArr[i] as any), duration: Number(dArr[i]) || 5 });
+          if (!spec) { ok = false; break; }
+          for (const ri of spec.images) {
+            if (ri >= rawImages.length || seen.has(ri)) { ok = false; break; }
+            seen.add(ri);
+          }
+          if (!ok) break;
+          tmp.push({
+            spec,
+            rawPaths: spec.images.map((ri) => path.join(jobDir, rawImages[ri])),
+            clipPath: path.join(jobDir, `slide_${i}.mp4`),
+          });
+        }
+        if (ok && seen.size === rawImages.length) {
+          slideMode = true;
+          unitSpecs = tmp;
+        } else {
+          appendLog(jobDir, "ffmpeg.log", `[slides] invalid structure; using legacy per-image timeline`);
+        }
+      }
+    }
+    // Timeline length in UNITS (slides when structured, images otherwise).
+    // Every array below (durations, transitions, motion plan, files) is
+    // unit-indexed from here on.
+    const unitCount = slideMode ? unitSpecs.length : rawImages.length;
+
     let finalDurations: number[] = [...durations].map((d: any) => Number(d) || 5);
-    while (finalDurations.length < rawImages.length) {
+    while (finalDurations.length < unitCount) {
       finalDurations.push(finalDurations[finalDurations.length - 1] || 5);
     }
-    finalDurations = finalDurations.slice(0, rawImages.length);
+    finalDurations = finalDurations.slice(0, unitCount);
     // Honor every script timestamp to the nearest frame WITHOUT accumulating
     // rounding error along the timeline (see quantizeTimelineToFrames).
     finalDurations = quantizeTimelineToFrames(finalDurations);
@@ -717,8 +810,8 @@ app.post("/api/generate", async (req, res) => {
         return normalizeTransition(allowedIn.has(s) ? s : "none");
       });
     }
-    while (parsedTransitions.length < rawImages.length - 1) parsedTransitions.push("none");
-    parsedTransitions = parsedTransitions.slice(0, Math.max(0, rawImages.length - 1));
+    while (parsedTransitions.length < unitCount - 1) parsedTransitions.push("none");
+    parsedTransitions = parsedTransitions.slice(0, Math.max(0, unitCount - 1));
 
     const rawTransDurs = Array.isArray(transitionDurations) ? transitionDurations : [];
     const baseTransDuration = typeof transitionDuration === "number" && transitionDuration > 0 ? transitionDuration : 0.5;
@@ -728,11 +821,11 @@ app.post("/api/generate", async (req, res) => {
     safeTransDurations = safeTransDurations.map((d, i) => (parsedTransitions[i] === "none" ? 0 : d));
 
     // ---- Camera motion (Ken Burns) plan: INTRO-ONLY ----
-    // Only the first SEGMENT_SIZE shots move; the tail renders as straight
-    // cuts on the fast static path (no supersample/zoompan cost, no xfade
-    // re-encodes). Purely additive when disabled: normalizeMotionConfig off
-    // yields [] and every render path below produces byte-identical ffmpeg
-    // args to the static pipeline.
+    // Shots starting in the first MOTION_INTRO_SECONDS move; the tail renders
+    // as straight cuts on the fast static path (no supersample/zoompan cost,
+    // no xfade re-encodes). Purely additive when disabled:
+    // normalizeMotionConfig off yields [] and every render path below produces
+    // byte-identical ffmpeg args to the static pipeline.
     const motionCfg = normalizeMotionConfig(motion);
     // Intro-only: shots starting in the first MOTION_INTRO_SECONDS move;
     // the tail renders as straight cuts on the fast static path.
@@ -755,20 +848,73 @@ app.post("/api/generate", async (req, res) => {
       perfMark(jobDir, perfT0, `motion plan style=${motionCfg.style} seed=${motionCfg.seed} moving=${moving} punches=${punches}`);
     }
 
-    const hasActiveTransitions = rawImages.length > 1 && parsedTransitions.some(t => t !== "none");
-    console.log(`[job ${jobId}] images=${rawImages.length} activeTrans=${parsedTransitions.filter(t => t !== "none").length} hasActive=${hasActiveTransitions} mode=${mode}`);
+    const hasActiveTransitions = unitCount > 1 && parsedTransitions.some(t => t !== "none");
+    console.log(`[job ${jobId}] units=${unitCount} slideMode=${slideMode} activeTrans=${parsedTransitions.filter(t => t !== "none").length} hasActive=${hasActiveTransitions} mode=${mode}`);
 
-    // ---- Slide inputs: raw uploads feed encodes directly (Phase 2) ----
-    // The old norm_*.png stage is deleted: canvas scaling runs inline in each
-    // encode from the original pixels (identical math, zero intermediate I/O).
-    setJobProgress(jobId, 1, "preparing", `Preparing ${rawImages.length} images...`);
-    const slideFiles: string[] = rawImages.map((img) => path.join(jobDir, img));
-    for (const f of slideFiles) {
+    // ---- Timeline unit inputs ----
+    // Legacy: raw uploads feed encodes directly (Phase 2) — canvas scaling
+    // runs inline in each encode from the original pixels (identical math,
+    // zero intermediate I/O). Slide mode: non-trivial slides pre-render to
+    // CFR-30 clips (baked card choreography); trivial slides keep the still
+    // path, so untouched jobs render byte-identical output.
+    setJobProgress(jobId, 1, "preparing", `Preparing ${unitCount} unit${unitCount === 1 ? "" : "s"}...`);
+    for (const img of rawImages) {
       checkCancelled(jobId);
+      const f = path.join(jobDir, img);
       if (!fs.existsSync(f)) throw new Error(`Missing image file ${path.basename(f)}`);
     }
-    setJobProgress(jobId, 2, "preparing", `Preparing ${rawImages.length} images...`);
-    perfMark(jobDir, perfT0, `prepare done (${rawImages.length} imgs, no PNG stage)`);
+    let slideFiles: string[] = rawImages.map((img) => path.join(jobDir, img));
+    let unitIsClip: boolean[] = new Array(unitCount).fill(false);
+    if (slideMode) {
+      // Extended-span mirror of renderXfadeRun's inDurs (same whole-frame
+      // halves): clips must cover the consumed span + the 0.5s anti-EOF pad.
+      const qD = quantizeTimelineToFrames(finalDurations);
+      const qT = safeTransDurations.map((t) => (t > 0 ? toSeconds(Math.max(1, toFrames(t))) : 0));
+      const halfDn = (fr: number) => Math.floor(fr / 2);
+      const spanOf = (i: number) => qD[i]
+        + (i > 0 ? toSeconds(toFrames(qT[i - 1]) - halfDn(toFrames(qT[i - 1]))) : 0)
+        + (i < qD.length - 1 ? toSeconds(halfDn(toFrames(qT[i]))) : 0);
+      const fontOk = fs.existsSync(SLIDE_FONT_PATH);
+      if (!fontOk) appendLog(jobDir, "ffmpeg.log", `[slides] headline font missing; rendering titleless`);
+      setJobProgress(jobId, 2, "preparing", `Compositing ${unitSpecs.length} slides...`);
+      const built = await mapPool(unitSpecs, SLIDE_PRE_CONCURRENCY, async (u, i) => {
+        checkCancelled(jobId);
+        const trivial = u.spec.images.length === 1 && !u.spec.title && u.spec.enter === "none";
+        if (trivial) return { path: u.rawPaths[0], clip: false };
+        try {
+          const D = finalDurations[i];
+          const totalFrames = Math.max(1, Math.round(((hasActiveTransitions ? spanOf(i) + 0.5 : D)) * SLIDE_FPS));
+          const totalLen = totalFrames / SLIDE_FPS;
+          const effSpec: SlideSpec = fontOk ? u.spec : { ...u.spec, title: "" };
+          const geom = layoutSlide(effSpec);
+          const { filter } = buildSlideFilter(effSpec, geom, totalLen);
+          const args: string[] = ["-y", "-nostdin"];
+          args.push("-f", "lavfi", "-i", `color=c=${SLIDE_BG}:s=${SLIDE_W}x${SLIDE_H}:r=${SLIDE_FPS}:d=${totalLen}`);
+          for (const rp of u.rawPaths) args.push("-framerate", "30", "-loop", "1", "-i", rp);
+          if (geom.title && effSpec.title) {
+            args.push("-f", "lavfi", "-i", `color=c=black:s=${SLIDE_W}x${geom.title.boxH}:r=${SLIDE_FPS}:d=${totalLen}`);
+          }
+          args.push(
+            "-filter_complex", filter, "-map", "[slide]",
+            "-r", "30", "-c:v", "libx264", "-preset", SLIDE_PRESET, "-crf", SLIDE_CRF,
+            "-pix_fmt", "yuv420p", "-t", String(totalLen), u.clipPath
+          );
+          await runFfmpeg(args, { jobDir, label: `slide_${i}x${u.spec.images.length}`, timeoutMs: 120000 });
+          return { path: u.clipPath, clip: true };
+        } catch (e) {
+          // One bad slide must never fail the job: fall back to its first
+          // image as a still (downstream handles still+motion already).
+          appendLog(jobDir, "ffmpeg.log", `[slides] slide ${i} pre-render failed, using still: ${(e as Error).message}`);
+          return { path: u.rawPaths[0], clip: false };
+        }
+      });
+      slideFiles = built.map((b) => b.path);
+      unitIsClip = built.map((b) => b.clip);
+      const nClip = unitIsClip.filter(Boolean).length;
+      perfMark(jobDir, perfT0, `slides composited (${nClip}/${unitSpecs.length} clips, rest stills)`);
+    }
+    setJobProgress(jobId, 2, "preparing", `Preparing ${unitCount} unit${unitCount === 1 ? "" : "s"}...`);
+    perfMark(jobDir, perfT0, `prepare done (${unitCount} units, slideMode=${slideMode})`);
 
     // ---- Audio discovery ----
     const audioFiles = files
@@ -833,10 +979,10 @@ app.post("/api/generate", async (req, res) => {
       // Render video via segment-bounded concat-filter batches (exact by
       // construction), then stream-copy them per chunk. Mid-image split takes
       // ride along as partial durations. Singletons use plain renderHold.
-      type BatchJob = { chunkIdx: number; items: { path: string; dur: number; motion?: ShotMotion | null; tOff?: number }[]; outPath: string };
+      type BatchJob = { chunkIdx: number; items: { path: string; dur: number; motion?: ShotMotion | null; tOff?: number; clip?: boolean }[]; outPath: string };
       const batchJobs: BatchJob[] = [];
       chunks.forEach((chunk: any, c: number) => {
-        let cur: { path: string; dur: number; motion?: ShotMotion | null; tOff?: number }[] = [];
+        let cur: { path: string; dur: number; motion?: ShotMotion | null; tOff?: number; clip?: boolean }[] = [];
         let curSeg = -1;
         const flush = () => {
           if (cur.length === 0) return;
@@ -847,7 +993,7 @@ app.post("/api/generate", async (req, res) => {
           const seg = Math.floor(block.imgIndex / SEGMENT_SIZE);
           if (cur.length > 0 && seg !== curSeg) flush();
           curSeg = seg;
-          cur.push({ path: slideFiles[block.imgIndex], dur: block.dur, motion: motionPlan[block.imgIndex] ?? null, tOff: block.tOff || 0 });
+          cur.push({ path: slideFiles[block.imgIndex], dur: block.dur, motion: motionPlan[block.imgIndex] ?? null, tOff: block.tOff || 0, clip: unitIsClip[block.imgIndex] });
         });
         flush();
         chunk.offset = chunks.slice(0, c).reduce((a: number, x: any) => a + x.dur, 0);
@@ -858,7 +1004,8 @@ app.post("/api/generate", async (req, res) => {
           checkCancelled(jobId);
           if (bj.items.length === 1) {
             await renderHold(bj.items[0].path, bj.items[0].dur, bj.outPath, `ahold_${bj.chunkIdx}`,
-              bj.items[0].motion ? { shot: bj.items[0].motion, tOff: bj.items[0].tOff } : null);
+              bj.items[0].motion ? { shot: bj.items[0].motion, tOff: bj.items[0].tOff } : null,
+              bj.items[0].clip ?? false);
           } else {
             await renderHoldBatch(bj.items, bj.outPath, `abatch_${bj.chunkIdx}x${bj.items.length}`);
           }
@@ -921,11 +1068,12 @@ app.post("/api/generate", async (req, res) => {
         imgPaths: string[]; durs: number[]; trans: string[]; transDurs: number[];
         outPath: string; estDur: number; segIdx: number; runIdx: number;
         plan?: (ShotMotion | null)[];
+        clip?: boolean[];
       };
       // Pieces in timeline order. Consecutive single-image holds in a segment
       // batch into ONE demuxer encode; xfade runs render directly (Phase 2).
       type Piece =
-        | { kind: "batch"; outPath: string; estDur: number; segIdx: number; order: number; items: { path: string; dur: number; motion?: ShotMotion | null; tOff?: number }[] }
+        | { kind: "batch"; outPath: string; estDur: number; segIdx: number; order: number; items: { path: string; dur: number; motion?: ShotMotion | null; tOff?: number; clip?: boolean }[] }
         | { kind: "xrun"; outPath: string; estDur: number; segIdx: number; order: number; run: Run };
       const pieces: Piece[] = [];
       let runCounter = 0;
@@ -934,7 +1082,7 @@ app.post("/api/generate", async (req, res) => {
         const end = Math.min((s + 1) * SEGMENT_SIZE, slideFiles.length);
         // Split segment at hard cuts ("none") into xfade-able runs.
         let runStart = start;
-        let streak: { path: string; dur: number; motion?: ShotMotion | null; tOff?: number }[] = [];
+        let streak: { path: string; dur: number; motion?: ShotMotion | null; tOff?: number; clip?: boolean }[] = [];
         const flushStreak = () => {
           if (streak.length === 0) return;
           pieces.push({
@@ -954,7 +1102,7 @@ app.post("/api/generate", async (req, res) => {
             for (let k = runStart; k <= i; k++) idxs.push(k);
             if (idxs.length === 1) {
               const gi = idxs[0];
-              streak.push({ path: slideFiles[gi], dur: finalDurations[gi], motion: motionPlan[gi] ?? null, tOff: 0 });
+              streak.push({ path: slideFiles[gi], dur: finalDurations[gi], motion: motionPlan[gi] ?? null, tOff: 0, clip: unitIsClip[gi] });
             } else {
               flushStreak();
               const t = idxs.slice(0, -1).map(k => parsedTransitions[k]);
@@ -968,6 +1116,7 @@ app.post("/api/generate", async (req, res) => {
                 outPath: path.join(jobDir, `run_${runCounter++}.mp4`),
                 estDur: est, segIdx: s, runIdx: pieces.length,
                 plan: motionPlan.length ? idxs.map(k => motionPlan[k]) : undefined,
+                clip: idxs.map(k => unitIsClip[k]),
               };
               pieces.push({ kind: "xrun", outPath: run.outPath, estDur: est, segIdx: s, order: pieces.length, run });
             }
@@ -1001,7 +1150,8 @@ app.post("/api/generate", async (req, res) => {
           for (let h = 0; h < b.items.length; h++) {
             const hp = path.join(jobDir, `batch_${b.order}_fb_${h}.mp4`);
             await renderHold(b.items[h].path, b.items[h].dur, hp, `${label}_fb${h}`,
-              b.items[h].motion ? { shot: b.items[h].motion, tOff: b.items[h].tOff } : null);
+              b.items[h].motion ? { shot: b.items[h].motion, tOff: b.items[h].tOff } : null,
+              b.items[h].clip ?? false);
             holdPaths.push(hp);
           }
           await concatPieces(holdPaths, b.outPath, `${label}_fbConcat`);
@@ -1017,7 +1167,7 @@ app.post("/api/generate", async (req, res) => {
           const run = piece.run;
           const label = `xfade_r${run.runIdx}_${run.trans.join("+")}`;
           try {
-            await renderXfadeRun(run.imgPaths, run.durs, run.trans, run.transDurs, run.outPath, label, run.plan);
+            await renderXfadeRun(run.imgPaths, run.durs, run.trans, run.transDurs, run.outPath, label, run.plan, run.clip);
           } catch (e1: any) {
             appendLog(jobDir, "ffmpeg.log", `[retry fade] ${label}: ${(e1 as Error).message}`);
             try {
@@ -1027,7 +1177,7 @@ app.post("/api/generate", async (req, res) => {
               const maxAllowed = Math.min(...run.durs) * 0.8;
               const fdFrames = Math.max(Math.min(toFrames(0.5), Math.floor(maxAllowed * RENDER_FPS)), toFrames(0.2));
               const fd = fadeDurs.map(() => toSeconds(fdFrames));
-              await renderXfadeRun(run.imgPaths, run.durs, run.trans.map(() => "fade"), fd, run.outPath, label + "_retryFade", run.plan);
+              await renderXfadeRun(run.imgPaths, run.durs, run.trans.map(() => "fade"), fd, run.outPath, label + "_retryFade", run.plan, run.clip);
               run.estDur = Number(run.durs.reduce((a, b) => a + b, 0).toFixed(3));
               piece.estDur = run.estDur;
             } catch (e2: any) {
@@ -1037,7 +1187,8 @@ app.post("/api/generate", async (req, res) => {
               for (let h = 0; h < run.imgPaths.length; h++) {
                 const hp = path.join(jobDir, `run_${run.runIdx}_fb_${h}.mp4`);
                 await renderHold(run.imgPaths[h], run.durs[h], hp, `${label}_fb${h}`,
-                  run.plan?.[h] ? { shot: run.plan[h]!, tOff: 0 } : null);
+                  run.plan?.[h] ? { shot: run.plan[h]!, tOff: 0 } : null,
+                  run.clip?.[h] ?? false);
                 holdPaths.push(hp);
               }
               await concatPieces(holdPaths, run.outPath, `${label}_fbConcat`);

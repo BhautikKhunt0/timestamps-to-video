@@ -489,6 +489,13 @@ export interface BranchOpts {
   loopFrames: number;
   /** offset into the curve domain for this slice (mode-A chunk splits) */
   tOff?: number;
+  /**
+   * Input kind. `still` (default) synthesizes duration from one frame via
+   * `loop`; `video` consumes F real frames starting at tOff (pre-rendered
+   * slide clips with baked animation). The animated crop/zoom reads t/on
+   * per frame either way, so the Ken Burns curve applies identically.
+   */
+  inputKind?: "still" | "video";
 }
 
 /**
@@ -499,21 +506,31 @@ export interface BranchOpts {
  *             push [at..D]) then concat — the punch lands exactly at
  *             round((at - tOff)*30) frames into the branch.
  *
- * The loop filter must run BEFORE crop: duplicated frames carry advancing
- * pts, so crop's eval=frame `t` advances and the window actually moves.
+ * The loop filter must run BEFORE crop on stills: duplicated frames carry
+ * advancing pts, so crop's eval=frame `t` advances and the window actually
+ * moves. Video inputs already advance — no loop, just a frame-window trim.
  */
 export function buildMotionBranch(shot: ShotMotion, opts: BranchOpts): string {
   const F = Math.max(1, Math.round(opts.loopFrames));
   const tOff = opts.tOff ?? 0;
   const fc = opts.mode === "fc";
-  const head = `${fc ? `[${opts.inputIdx ?? 0}:v]` : ""}trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${MOTION_COVER}`;
+  const video = (opts.inputKind ?? "still") === "video";
+  // Video inputs start mid-clip on chunk splits: trim the real frame window
+  // [S, S+F) so the baked slide animation continues seamlessly across the
+  // split (entrances finish in ~1.3s; a split mid-hold just continues it).
+  const start = video ? Math.max(0, Math.round(tOff * RENDER_FPS)) : 0;
+  const trim = video
+    ? `trim=start_frame=${start}:end_frame=${start + F}`
+    : `trim=end_frame=1`;
+  const head = `${fc ? `[${opts.inputIdx ?? 0}:v]` : ""}${trim},setpts=PTS-STARTPTS,settb=1/30,${MOTION_COVER}`;
 
-  // One sub-shot chain: loop the still frame FIRST (advancing pts), then the
-  // animated scale+crop reads t per duplicated frame. fc mode ends with
-  // settb=AVTB so downstream xfade/concat see the same timebase as static
-  // branches. Output is fixed 1920x1080 (crop guarantees it).
+  // One sub-shot chain: stills loop the frame FIRST (advancing pts), then the
+  // animated scale+crop reads t per frame; video already advances. fc mode
+  // ends with settb=AVTB so downstream xfade/concat see the same timebase as
+  // static branches. Output is fixed 1920x1080 (crop guarantees it).
+  const feed = (frames: number) => video ? "" : `loop=loop=${Math.max(0, frames - 1)}:size=1,`;
   const chain = (curve: WindowCurve, frames: number, D: number, tb: number, outRef: string): string =>
-    `loop=loop=${Math.max(0, frames - 1)}:size=1,${motionOps(curve, D, tb)},${outTail}` +
+    `${feed(frames)}${motionOps(curve, D, tb)},${outTail}` +
     (fc ? `,settb=AVTB${outRef}` : "");
 
   const p = shot.punch;

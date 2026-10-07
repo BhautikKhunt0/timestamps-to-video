@@ -976,6 +976,20 @@ button.audio-row:hover { transform: translateY(-2px); }
   white-space: nowrap;
 }
 
+/* Slide structure rows reuse cut-row geometry. */
+.slide-title-input {
+  flex: 1 1 120px; min-width: 90px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink-1);
+  font-size: 12px;
+  padding: 8px 10px;
+  outline: none;
+}
+.slide-title-input::placeholder { color: var(--ink-3); }
+.slide-ops { display: flex; gap: 6px; flex: none; align-self: center; }
+
 /* custom select (transition pickers) */
 .cselect { position: relative; flex: none; }
 .cselect-btn {

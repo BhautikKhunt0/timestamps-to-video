@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { parseTimestamps } from "./utils/parser";
 import { planMotion, motionBadge, introCutoff, MOTION_INTRO_SECONDS } from "./utils/motion";
+import type { SlideEnter } from "./utils/slides";
 
 const TRANSITIONS_CONFIG = [
   { id: "none", name: "Hard Cut", icon: Scissors, color: "text-neutral-400", border: "border-neutral-700/60", bg: "bg-neutral-800" },
@@ -144,6 +145,9 @@ const CustomSelect = ({ value, onChange, options, className = "", dropdownUp = f
   );
 };
 
+// One composited timeline unit: 1-3 images, one headline, one entrance.
+interface SlideItem { imageIndices: number[]; enter: SlideEnter; title: string }
+
 export default function App() {
   const [images, setImages] = useState<File[]>([]);
   const [imageUrls, setImageUrls] = useState<string[]>([]);
@@ -207,6 +211,12 @@ export default function App() {
   const [motionStyle, setMotionStyle] = useState<"subtle" | "mixed" | "dynamic">("mixed");
   const [motionSeed, setMotionSeed] = useState(() => Math.floor(Math.random() * 1_000_000_000));
 
+  // Slide structure: groups of 1-3 images rendered as ONE composited unit
+  // (staggered card entrances + headline). null = legacy auto (1/slide).
+  // Layout is always the member count; slide duration is the SUM of member
+  // image durations, so script timestamps keep working untouched.
+  const [slides, setSlides] = useState<SlideItem[] | null>(null);
+
   // Badge plan — mirrors the EXACT arrays handleGenerate sends (sized durations
   // + per-join transition durations) so badges match the rendered camera moves.
   const sizedDurs = useMemo(() => {
@@ -222,18 +232,92 @@ export default function App() {
     return d;
   }, [durations, images.length, defaultDurationPerImage]);
 
+  // Slide structure derivation: validated explicit groups, else legacy auto.
+  // structActive (anything non-trivial) switches durations / joins / badges /
+  // payload to unit level; otherwise every legacy per-image path runs
+  // untouched and output is byte-identical to before.
+  const autoSlides = useMemo<SlideItem[]>(
+    () => images.map((_, i) => ({ imageIndices: [i], enter: "none" as SlideEnter, title: "" })),
+    [images]
+  );
+  const structSlides = useMemo<SlideItem[] | null>(() => {
+    if (!slides || images.length === 0) return null;
+    const seen = new Set<number>();
+    const out: SlideItem[] = [];
+    for (const s of slides) {
+      const idx = (s.imageIndices || []).filter((v) => Number.isInteger(v) && v >= 0 && v < images.length && !seen.has(v));
+      if (idx.length === 0 || idx.length > 3) return null;
+      idx.forEach((v) => seen.add(v));
+      const enter: SlideEnter = s.enter === "up" || s.enter === "down" || s.enter === "left" || s.enter === "right" || s.enter === "none" ? s.enter : "none";
+      out.push({ imageIndices: idx, enter, title: typeof s.title === "string" ? s.title.slice(0, 60) : "" });
+    }
+    return seen.size === images.length ? out : null;
+  }, [slides, images]);
+  const structActive = !!structSlides && structSlides.some((s) => s.imageIndices.length > 1 || s.title !== "" || s.enter !== "none");
+  const unitSlides: SlideItem[] = structActive && structSlides ? structSlides : autoSlides;
+  // Unit durations: slide sums when structured, per-image otherwise.
+  const unitDurs = useMemo(() => {
+    if (!structActive || !structSlides) return sizedDurs;
+    return structSlides.map((s) => s.imageIndices.reduce((a, j) => a + (sizedDurs[j] ?? defaultDurationPerImage), 0));
+  }, [structActive, structSlides, sizedDurs, defaultDurationPerImage]);
+  // Unit joins: the image join at each slide boundary when structured.
+  const unitTransBase = useMemo(() => {
+    if (!structActive || !structSlides) return transitions;
+    const out: string[] = [];
+    for (let k = 0; k < structSlides.length - 1; k++) {
+      const last = structSlides[k].imageIndices[structSlides[k].imageIndices.length - 1];
+      out.push(transitions[last] || "none");
+    }
+    return out;
+  }, [structActive, structSlides, transitions]);
+  const unitCount = structActive && structSlides ? structSlides.length : images.length;
+
+  // Slide editing ops (merge keeps totals: durations are member sums).
+  const mergeSlide = (k: number) => setSlides((prev) => {
+    const base = prev ?? autoSlides;
+    if (k < 0 || k >= base.length - 1) return prev;
+    const a = base[k], b = base[k + 1];
+    if (a.imageIndices.length + b.imageIndices.length > 3) return prev;
+    const next = [...base];
+    next.splice(k, 2, { imageIndices: [...a.imageIndices, ...b.imageIndices], enter: a.enter, title: a.title });
+    return next;
+  });
+  const splitSlide = (k: number) => setSlides((prev) => {
+    const base = prev ?? autoSlides;
+    const s = base[k];
+    if (!s || s.imageIndices.length < 2) return prev;
+    const next = [...base];
+    next.splice(k, 1,
+      { imageIndices: [s.imageIndices[0]], enter: s.enter, title: s.title },
+      { imageIndices: s.imageIndices.slice(1), enter: "none" as SlideEnter, title: "" });
+    return next;
+  });
+  // Image join -> unit join (-1 = inside a slide, no rendered join).
+  const slideJoinAfter = (imgIdx: number): number => {
+    if (!structActive || !structSlides) return imgIdx;
+    for (let k = 0; k < structSlides.length - 1; k++) {
+      const last = structSlides[k].imageIndices[structSlides[k].imageIndices.length - 1];
+      if (last === imgIdx) return k;
+    }
+    return -1;
+  };
+  const slideBoundaryOf = (joinK: number): number => {
+    if (!structActive || !structSlides) return joinK;
+    return structSlides[joinK].imageIndices[structSlides[joinK].imageIndices.length - 1];
+  };
+
   // Intro-only motion: when camera motion is on, shots starting in the first
   // MOTION_INTRO_SECONDS keep their transitions — the tail renders as
   // straight cuts on the fast path. The stored `transitions` state is left
   // intact (turning motion off restores it); everything below — badges,
   // payload, markers — reads the effective timeline so preview == output.
   const introEnd = useMemo(
-    () => introCutoff(sizedDurs, { imageCount: images.length }),
-    [sizedDurs, images.length]
+    () => introCutoff(unitDurs, { imageCount: unitCount }),
+    [unitDurs, unitCount]
   );
   const effTransitions = useMemo(
-    () => (motionOn ? transitions.map((t, i) => (i < introEnd ? t : "none")) : transitions),
-    [transitions, motionOn, introEnd]
+    () => (motionOn ? unitTransBase.map((t, i) => (i < introEnd ? t : "none")) : unitTransBase),
+    [unitTransBase, motionOn, introEnd]
   );
   const effTransDurs = useMemo(
     () => effTransitions.map(t => (t === "none" ? 0 : (categoryDurations[t] || 0.5))),
@@ -241,10 +325,10 @@ export default function App() {
   );
 
   const badgePlan = useMemo(
-    () => planMotion(sizedDurs, effTransitions, effTransDurs,
+    () => planMotion(unitDurs, effTransitions, effTransDurs,
       { enabled: motionOn, style: motionStyle, seed: motionSeed },
-      { imageCount: images.length }),
-    [sizedDurs, effTransitions, effTransDurs, motionOn, motionStyle, motionSeed, images.length]
+      { imageCount: unitCount }),
+    [unitDurs, effTransitions, effTransDurs, motionOn, motionStyle, motionSeed, unitCount]
   );
 
   // ── Design-only view state (no business logic) ──────────────────
@@ -484,17 +568,8 @@ export default function App() {
 
     stopActiveTracking();
 
-    let finalDurations = [...durations];
-    if (finalDurations.length === 0) {
-      finalDurations = new Array(images.length).fill(defaultDurationPerImage);
-    } else if (finalDurations.length < images.length) {
-      const lastDur = finalDurations[finalDurations.length - 1] || defaultDurationPerImage;
-      while (finalDurations.length < images.length) {
-        finalDurations.push(lastDur);
-      }
-    } else if (finalDurations.length > images.length) {
-      finalDurations = finalDurations.slice(0, images.length);
-    }
+    // Unit durations mirror badgePlan exactly (slide sums when structured).
+    const finalDurations = [...unitDurs];
 
     setLoading(true);
     setError("");
@@ -647,6 +722,11 @@ export default function App() {
           transitionDurations: effTransDurs,
           transitionDuration: categoryDurations["fade"] || 0.5,
           motion: { enabled: motionOn, style: motionStyle, seed: motionSeed },
+          // Slide structure (omitted when legacy: server then runs the
+          // byte-identical per-image timeline).
+          slides: structActive && structSlides
+            ? structSlides.map((s) => ({ images: s.imageIndices, layout: s.imageIndices.length, enter: s.enter, title: s.title }))
+            : undefined,
           outputMode
         })
       });
@@ -766,7 +846,7 @@ export default function App() {
   const totalSeconds = displayDurations.reduce((a, b) => a + b, 0);
   const totalLabel = `${pad2(totalSeconds / 60)}:${(totalSeconds % 60).toFixed(1).padStart(4, "0")}`;
   const liveTransitions = effTransitions.filter(t => t !== "none").length;
-  const cutIndices = images.length > 1 ? transitions.map((_, i) => i) : [];
+  const cutIndices = effTransitions.length > 0 ? effTransitions.map((_, i) => i) : [];
   const visibleCuts = showAllCuts ? cutIndices : cutIndices.slice(0, 6);
   const currentVideoUrl =
     videoUrls.length > 0 ? videoUrls[Math.min(activeVideo, videoUrls.length - 1)] : "";
@@ -1050,16 +1130,23 @@ export default function App() {
                             <span className="cc-dur">SLIDE <b>{(displayDurations[index] ?? defaultDurationPerImage).toFixed(1)}s</b></span>
                           </div>
                         </div>
-                        {index < images.length - 1 && (
-                          <div className={`seq-marker ${markerModFor(effTransitions[index])}`}>
-                            <span className="dia" />
-                            <span className="m-lab">
-                              {effTransitions[index] === "none" || !effTransitions[index]
-                                ? "CUT"
-                                : `${categoryDurations[effTransitions[index]] || 0.5}s`}
-                            </span>
-                          </div>
-                        )}
+                        {index < images.length - 1 && (() => {
+                          const sj = slideJoinAfter(index);
+                          const mt = sj >= 0 ? (effTransitions[sj] || "none") : "none";
+                          const grouped = structActive && sj < 0;
+                          return (
+                            <div className={`seq-marker ${markerModFor(mt)}`}>
+                              <span className="dia" />
+                              <span className="m-lab">
+                                {grouped
+                                  ? "GROUPED"
+                                  : mt === "none"
+                                    ? "CUT"
+                                    : `${categoryDurations[mt] || 0.5}s`}
+                              </span>
+                            </div>
+                          );
+                        })()}
                       </React.Fragment>
                     ))}
                     <button type="button" className="clip-add" onClick={() => fileInputRef.current?.click()}>
@@ -1271,6 +1358,107 @@ export default function App() {
 
             <section className="panel">
               <div className="panel-head">
+                <span className="panel-title">Slide structure</span>
+                <span className="count mono">
+                  {unitSlides.length} SLIDE{unitSlides.length === 1 ? "" : "S"}
+                  {structActive ? " · COMPOSED" : " · 1/SLIDE"}
+                </span>
+                <span className="head-actions">
+                  {slides !== null && (
+                    <button type="button" className="mini-btn danger" onClick={() => setSlides(null)}>Reset to 1/slide</button>
+                  )}
+                </span>
+              </div>
+
+              {unitSlides.length > 0 ? (
+                <>
+                  <div className="cut-map">
+                    {unitSlides.map((sl, k) => {
+                      const slideBadge = motionBadge(badgePlan[k]);
+                      const canMerge = k < unitSlides.length - 1 &&
+                        sl.imageIndices.length + unitSlides[k + 1].imageIndices.length <= 3;
+                      const layoutName = sl.imageIndices.length === 1 ? "1-UP HERO"
+                        : sl.imageIndices.length === 2 ? "2-UP SPLIT" : "3-UP GRID";
+                      return (
+                        <div key={k} className="cut-row">
+                          <span className="cut-num">SLIDE #{k + 1}</span>
+                          <span className="cut-thumbs">
+                            {sl.imageIndices.map((gi) => (
+                              <span key={gi} className={`th t${(gi % 7) + 1}`}>
+                                {imageUrls[gi] && <img src={imageUrls[gi]} alt="" />}
+                              </span>
+                            ))}
+                          </span>
+                          <span className="cut-label">
+                            <b>{layoutName} · Σ {unitDurs[k].toFixed(1)}s</b>
+                            <i>{slideBadge ? `${slideBadge} · cards enter one-by-one` : "STATIC HOLD"}</i>
+                          </span>
+                          <input
+                            className="slide-title-input"
+                            value={sl.title}
+                            maxLength={60}
+                            placeholder="Headline…"
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              setSlides((prev) => {
+                                const base = prev ?? autoSlides;
+                                if (k >= base.length) return prev;
+                                const next = [...base];
+                                next[k] = { ...next[k], title: v.slice(0, 60) };
+                                return next;
+                              });
+                            }}
+                          />
+                          <CustomSelect
+                            value={sl.enter}
+                            onChange={(val: any) => {
+                              const enter = String(val) as SlideEnter;
+                              setSlides((prev) => {
+                                const base = prev ?? autoSlides;
+                                if (k >= base.length) return prev;
+                                const next = [...base];
+                                next[k] = { ...next[k], enter };
+                                return next;
+                              });
+                            }}
+                            options={[
+                              { value: "none", label: "Still" },
+                              { value: "up", label: "From bottom" },
+                              { value: "down", label: "From top" },
+                              { value: "left", label: "From left" },
+                              { value: "right", label: "From right" },
+                            ]}
+                            className="w-32"
+                          />
+                          <span className="slide-ops">
+                            {sl.imageIndices.length > 1 && (
+                              <button type="button" className="mini-btn" onClick={() => splitSlide(k)}>Split</button>
+                            )}
+                            {canMerge && (
+                              <button type="button" className="mini-btn" onClick={() => mergeSlide(k)}>Merge ↓</button>
+                            )}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="strip-foot" style={{ marginTop: 12 }}>
+                    <span>
+                      GROUP UP TO 3 IMAGES PER SLIDE · CARDS ENTER ONE-BY-ONE ·
+                      TITLES STAGGER FIRST
+                    </span>
+                  </div>
+                </>
+              ) : (
+                <div className="empty-note" style={{ marginTop: 12 }}>
+                  Upload frames to compose slides.
+                </div>
+              )}
+            </section>
+
+            <section className="panel">
+              <div className="panel-head">
                 <span className="panel-title">Cut map</span>
                 <span className="count mono">{cutIndices.length} CUTS · {liveTransitions} LIVE</span>
                 <span className="head-actions">
@@ -1285,23 +1473,36 @@ export default function App() {
                   <div className="cut-map">
                     {visibleCuts.map(idx => {
                       const trans = effTransitions[idx] || "none";
-                      const imgFrom = images[idx]?.name || `Img ${idx + 1}`;
-                      const imgTo = images[idx + 1]?.name || `Img ${idx + 2}`;
                       const isActive = trans !== "none";
                       const thisDur = categoryDurations[trans] || 0.5;
                       const moveBadge = motionBadge(badgePlan[idx]);
                       const tailCut = motionOn && idx >= introEnd;
+                      // Slide joins read the boundary images; legacy reads raw names.
+                      const fromSlide = structActive && structSlides ? structSlides[idx] : null;
+                      const toSlide = structActive && structSlides ? structSlides[idx + 1] : null;
+                      const imgFrom = fromSlide
+                        ? `Slide ${idx + 1} (${fromSlide.imageIndices.length}-up)`
+                        : (images[idx]?.name || `Img ${idx + 1}`);
+                      const imgTo = toSlide
+                        ? `Slide ${idx + 2} (${toSlide.imageIndices.length}-up)`
+                        : (images[idx + 1]?.name || `Img ${idx + 2}`);
+                      const thumbA = fromSlide
+                        ? fromSlide.imageIndices[fromSlide.imageIndices.length - 1]
+                        : idx;
+                      const thumbB = toSlide ? toSlide.imageIndices[0] : idx + 1;
+                      const onJoinChange = (val: any) => handleSpecificTransition(
+                        structActive ? slideBoundaryOf(idx) : idx, String(val));
 
                       return (
                         <div key={idx} className="cut-row">
                           <span className="cut-num">CUT #{idx + 1}</span>
                           <span className="cut-thumbs">
-                            <span className={`th t${(idx % 7) + 1}`}>
-                              {imageUrls[idx] && <img src={imageUrls[idx]} alt="" />}
+                            <span className={`th t${(thumbA % 7) + 1}`}>
+                              {imageUrls[thumbA] && <img src={imageUrls[thumbA]} alt="" />}
                             </span>
                             <span className={`cut-dia ${markerModFor(trans)}`}><span className="dia" /></span>
-                            <span className={`th t${((idx + 1) % 7) + 1}`}>
-                              {imageUrls[idx + 1] && <img src={imageUrls[idx + 1]} alt="" />}
+                            <span className={`th t${((thumbB) % 7) + 1}`}>
+                              {imageUrls[thumbB] && <img src={imageUrls[thumbB]} alt="" />}
                             </span>
                           </span>
                           <span className="cut-label">
@@ -1319,7 +1520,7 @@ export default function App() {
                           ) : (
                           <CustomSelect
                             value={trans}
-                            onChange={(val: any) => handleSpecificTransition(idx, String(val))}
+                            onChange={onJoinChange}
                             options={[
                               { value: "none", label: "None" },
                               { value: "fade", label: "Fade" },
