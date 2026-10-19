@@ -296,6 +296,37 @@ if (!fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
+/**
+ * Extension for an uploaded file: prefer a sane on-disk extension from the
+ * original name, else derive it from the browser's MIME type. Files with no
+ * usable extension still land (ffmpeg needs one to sniff the format), so the
+ * MIME fallback matters for clipboard pastes / extension-less uploads.
+ */
+const EXT_BY_MIME: Record<string, string> = {
+  "image/png": ".png",
+  "image/jpeg": ".jpg",
+  "image/jpg": ".jpg",
+  "image/webp": ".webp",
+  "image/gif": ".gif",
+  "image/avif": ".avif",
+  "image/bmp": ".bmp",
+  "audio/mpeg": ".mp3",
+  "audio/mp3": ".mp3",
+  "audio/mp4": ".m4a",
+  "audio/x-m4a": ".m4a",
+  "audio/aac": ".aac",
+  "audio/wav": ".wav",
+  "audio/x-wav": ".wav",
+  "audio/webm": ".webm",
+  "audio/ogg": ".ogg",
+  "video/mp4": ".mp4",
+};
+const fileExt = (file: Express.Multer.File): string => {
+  const raw = path.extname(file.originalname || "").toLowerCase();
+  if (/^\.[a-z0-9]{1,8}$/.test(raw)) return raw === ".jpeg" ? ".jpg" : raw;
+  return EXT_BY_MIME[String(file.mimetype || "").toLowerCase().split(";")[0]] || "";
+};
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const jobId = req.body.jobId;
@@ -304,11 +335,31 @@ const storage = multer.diskStorage({
     if (!fs.existsSync(jobDir)) fs.mkdirSync(jobDir, { recursive: true });
     cb(null, jobDir);
   },
+  // The temp name MUST be unique per file. Writing `file.originalname`
+  // verbatim made browsers that send several files with the SAME name
+  // (IMG_1234.png from two sources, three "image.jpg" exports) overwrite each
+  // other on disk; the rename below then hit ENOENT and failed the WHOLE batch
+  // with a 500, so images never landed. Unique names make the rename total.
   filename: (req, file, cb) => {
-    cb(null, file.originalname);
-  }
+    const uniq = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 9)}`;
+    cb(null, `up_${uniq}${fileExt(file)}`);
+  },
 });
 const upload = multer({ storage });
+
+// Multer/storage errors must be JSON like every other API response — an HTML
+// error page here reads as "proxy returned HTML" in the client. Wrapping the
+// multer middleware catches its errors too (they fire before the route handler).
+const uploadRoute = (mw: any, handler: (req: any, res: any) => void) => (req: any, res: any) =>
+  mw(req, res, (err: any) => {
+    if (err) {
+      if (!res.headersSent) res.status(500).json({ error: err?.message || "Upload failed" });
+      return;
+    }
+    Promise.resolve(handler(req, res)).catch((e: any) => {
+      if (!res.headersSent) res.status(500).json({ error: e?.message || "Upload failed" });
+    });
+  });
 
 // Generate unique job ID
 app.get("/api/init-job", (req, res) => {
@@ -319,7 +370,7 @@ app.get("/api/init-job", (req, res) => {
 });
 
 // Upload images in batch
-app.post("/api/upload-batch", upload.array("images"), (req, res) => {
+app.post("/api/upload-batch", uploadRoute(upload.array("images"), (req, res) => {
   try {
     const { indices, jobId } = req.body;
     const parsedIndices = indices ? JSON.parse(indices) : [];
@@ -331,21 +382,29 @@ app.post("/api/upload-batch", upload.array("images"), (req, res) => {
     const jobDir = path.join(UPLOAD_DIR, jobId);
     const files = req.files as Express.Multer.File[];
     
+    // One bad file must not sink the whole batch: rename per file and report
+    // exactly what landed. (Multer temp names are unique now, so these
+    // renames cannot collide the way original names did.)
+    const saved: number[] = [];
+    const failed: string[] = [];
     files.forEach((file, i) => {
       const originalIndex = parsedIndices[i] !== undefined ? parsedIndices[i] : i;
-      const ext = path.extname(file.originalname);
-      const newPath = path.join(jobDir, `raw_${originalIndex}${ext}`);
-      fs.renameSync(file.path, newPath);
+      try {
+        fs.renameSync(file.path, path.join(jobDir, `raw_${originalIndex}${fileExt(file)}`));
+        saved.push(originalIndex);
+      } catch (e: any) {
+        failed.push(`${file.originalname}: ${e.message}`);
+      }
     });
 
-    res.json({ success: true, count: files.length, indices: parsedIndices });
+    res.json({ success: failed.length === 0 && saved.length > 0, count: saved.length, indices: parsedIndices, failed });
   } catch (error: any) {
     res.status(500).json({ error: error.message || "Failed to process batch upload" });
   }
-});
+}));
 
 // Upload audio
-app.post("/api/upload-audio", upload.array("audio", 50), (req, res) => {
+app.post("/api/upload-audio", uploadRoute(upload.array("audio", 50), (req, res) => {
   try {
     const { jobId } = req.body;
     if (!req.files || !Array.isArray(req.files) || !jobId) {
@@ -353,25 +412,196 @@ app.post("/api/upload-audio", upload.array("audio", 50), (req, res) => {
     }
     const jobDir = path.join(UPLOAD_DIR, jobId);
     
-    // Make sure we keep multiple audio files in sequence
-    // First, find what max audio index currently exists to allow appending if needed
-    const existingAudio = fs.existsSync(jobDir) 
-      ? fs.readdirSync(jobDir).filter(f => f.startsWith("audio_"))
+    // Append after the HIGHEST existing index (not the file count) so a
+    // re-upload never overwrites an earlier track.
+    const existing = fs.existsSync(jobDir)
+      ? fs.readdirSync(jobDir)
+          .map((f) => /^audio_(\d+)\./.exec(f))
+          .filter((m): m is RegExpExecArray => !!m)
+          .map((m) => Number(m[1]))
       : [];
-    let startIndex = existingAudio.length;
+    let startIndex = existing.length ? Math.max(...existing) + 1 : 0;
 
     const files = req.files as Express.Multer.File[];
+    const failed: string[] = [];
     files.forEach((file) => {
-      const ext = path.extname(file.originalname);
-      const newPath = path.join(jobDir, `audio_${startIndex}${ext}`);
-      fs.renameSync(file.path, newPath);
-      startIndex++;
+      try {
+        fs.renameSync(file.path, path.join(jobDir, `audio_${startIndex}${fileExt(file)}`));
+        startIndex++;
+      } catch (e: any) {
+        failed.push(`${file.originalname}: ${e.message}`);
+      }
     });
 
-    res.json({ success: true, count: files.length });
+    res.json({ success: failed.length === 0 && files.length > 0, count: files.length - failed.length, failed });
   } catch (error: any) {
     res.status(500).json({ error: error.message || "Failed to upload audio" });
   }
+}));
+
+// ---------- Transition SFX library (stored in the project, once) ----------
+// Sounds live in <root>/sfx/ with an index.json manifest, so a user imports
+// a sound ONCE and it stays available for every future job — no re-uploads.
+// type SfxEntry = { id: string; name: string; file: string; dur: number };
+const SFX_DIR = path.join(process.cwd(), "sfx");
+const SFX_MANIFEST = path.join(SFX_DIR, "index.json");
+type SfxEntry = { id: string; name: string; file: string; dur: number };
+
+const readSfxManifest = (): SfxEntry[] => {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SFX_MANIFEST, "utf8"));
+    if (Array.isArray(parsed)) return parsed.filter((e: any) => e && typeof e.id === "string" && typeof e.file === "string");
+  } catch { /* fresh install or corrupted file: start over */ }
+  return [];
+};
+const writeSfxManifest = (entries: SfxEntry[]): void => {
+  if (!fs.existsSync(SFX_DIR)) fs.mkdirSync(SFX_DIR, { recursive: true });
+  const tmp = SFX_MANIFEST + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(entries, null, 2));
+  fs.renameSync(tmp, SFX_MANIFEST);
+};
+const sfxPublicList = (entries: SfxEntry[]) => entries
+  .filter((e) => fs.existsSync(path.join(SFX_DIR, e.file)))
+  .map((e) => ({ id: e.id, name: e.name, dur: e.dur, url: `/api/sfx/${e.id}/file` }));
+
+// True when ffmpeg sniffs an actual audio stream (rejects video-only/none).
+const probeHasAudio = (filePath: string): Promise<boolean> =>
+  new Promise((resolve) => {
+    exec(`"${ffmpegPath}" -i "${filePath}"`, (err, _o, stderr) => {
+      resolve(/Stream #\d+:\d+.*Audio:/.test(stderr || ""));
+    });
+  });
+
+const sfxStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    if (!fs.existsSync(SFX_DIR)) fs.mkdirSync(SFX_DIR, { recursive: true });
+    cb(null, SFX_DIR);
+  },
+  // Unique on-disk id per import (same-name files never collide); the
+  // friendly display name rides in the manifest.
+  filename: (req, file, cb) => {
+    const id = `sfx_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+    cb(null, `${id}${fileExt(file) || ".m4a"}`);
+  },
+});
+const sfxUpload = multer({ storage: sfxStorage, limits: { files: 24 } });
+
+app.get("/api/sfx/list", (_req, res) => {
+  // Auto-heal: entries whose file vanished are pruned from the manifest.
+  const entries = readSfxManifest().filter((e) => fs.existsSync(path.join(SFX_DIR, e.file)));
+  if (entries.length !== readSfxManifest().length) writeSfxManifest(entries);
+  res.json({ sounds: sfxPublicList(entries) });
+});
+
+app.post("/api/sfx/upload", uploadRoute(sfxUpload.array("sfx"), async (req, res) => {
+  const files = req.files as Express.Multer.File[] | undefined;
+  if (!files || files.length === 0) {
+    return res.status(400).json({ error: "No audio files received" });
+  }
+  const entries = readSfxManifest();
+  const failed: string[] = [];
+  let count = 0;
+  for (const file of files) {
+    try {
+      const dur = await getMediaDuration(file.path);
+      if (!(dur >= 0.03 && dur <= 20)) throw new Error("Audio must be 0.03–20s");
+      if (!(await probeHasAudio(file.path))) throw new Error("No audio stream found");
+      const base = path.basename(file.originalname || "Sound", path.extname(file.originalname || ""));
+      const friendly = base.replace(/[_\-.]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 42) || "Sound";
+      entries.push({
+        id: path.basename(file.filename, path.extname(file.filename)),
+        name: friendly,
+        file: file.filename,
+        dur: Number(dur.toFixed(3)),
+      });
+      count++;
+    } catch (e: any) {
+      failed.push(`${path.basename(file.originalname || "file")}: ${e.message}`);
+      try { fs.unlinkSync(file.path); } catch { /* already gone */ }
+    }
+  }
+  writeSfxManifest(entries);
+  res.json({ success: count > 0, count, failed, sounds: sfxPublicList(entries) });
+}));
+
+// Starter pack: synthesizes a palette of transition sounds with ffmpeg lavfi
+// so the rack is playable immediately. Skipped by id on re-runs (stable ids).
+const SFX_STARTERS: { name: string; input: string; filters: string; dur: number }[] = [
+  {
+    name: "Swoosh Soft", dur: 1.1, input: "anoisesrc=color=pink:r=48000:a=0.65:d=1.1",
+    filters: "highpass=f=240,lowpass=f=2600,volume='pow(sin(PI*t/1.1),2.6)':eval=frame",
+  },
+  {
+    name: "Swoosh Deep", dur: 1.5, input: "anoisesrc=color=brown:r=48000:a=0.85:d=1.5",
+    filters: "lowpass=f=750,volume='pow(sin(PI*t/1.5),3)':eval=frame,asetrate=40000,aresample=48000",
+  },
+  {
+    name: "Riser", dur: 1.7,
+    input: "aevalsrc=exprs='0.5*sin(2*PI*(280+2400*pow(t/1.7,2.2))*t)*pow(t/1.7,1.4)+0.2*sin(2*PI*80*t)*pow(t/1.7,2)':s=48000:d=1.7",
+    filters: "volume='min(1,1.6)':eval=frame,lowpass=f=5200",
+  },
+  {
+    name: "Pop", dur: 0.16, input: "sine=f=620:r=48000:d=0.16",
+    filters: "volume='exp(-20*t)':eval=frame",
+  },
+  {
+    name: "Punch", dur: 0.5, input: "sine=f=115:r=48000:d=0.5",
+    filters: "volume='exp(-8.5*t)':eval=frame,lowpass=f=1100",
+  },
+  {
+    name: "Sparkle", dur: 0.9, input: "sine=f=2350:r=48000:d=0.9",
+    filters: "tremolo=f=8.5:d=0.85,volume='0.7*exp(-3.2*t)':eval=frame",
+  },
+  {
+    name: "Tick", dur: 0.07, input: "anoisesrc=color=white:r=48000:a=0.85:d=0.07",
+    filters: "highpass=f=3200,volume='exp(-55*t)':eval=frame",
+  },
+];
+const slugify = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+
+app.post("/api/sfx/seed", async (_req, res) => {
+  if (!fs.existsSync(SFX_DIR)) fs.mkdirSync(SFX_DIR, { recursive: true });
+  const entries = readSfxManifest();
+  let added = 0;
+  try {
+    for (const def of SFX_STARTERS) {
+      const id = `sfx_st_${slugify(def.name)}`;
+      if (entries.some((e) => e.id === id)) continue;
+      const file = `${id}.m4a`;
+      await runFfmpeg(
+        ["-y", "-nostdin", "-f", "lavfi", "-i", def.input, "-af", def.filters,
+         "-ar", "48000", "-ac", "2", "-c:a", "aac", "-b:a", "160k", path.join(SFX_DIR, file)],
+        { jobDir: UPLOAD_DIR, label: `sfx_seed_${def.name}`, timeoutMs: 60000 });
+      entries.push({ id, name: def.name, file, dur: def.dur });
+      added++;
+    }
+    writeSfxManifest(entries);
+    res.json({ success: true, added, sounds: sfxPublicList(entries) });
+  } catch (e: any) {
+    writeSfxManifest(entries);
+    res.status(500).json({ error: e?.message || "Starter pack failed", sounds: sfxPublicList(entries) });
+  }
+});
+
+app.delete("/api/sfx/:id", (req, res) => {
+  const id = String(req.params.id || "");
+  const entries = readSfxManifest();
+  const entry = entries.find((e) => e.id === id);
+  if (!entry) return res.status(404).json({ error: "Sound not found" });
+  try { fs.unlinkSync(path.join(SFX_DIR, entry.file)); } catch { /* already gone */ }
+  const next = entries.filter((e) => e.id !== id);
+  writeSfxManifest(next);
+  res.json({ success: true, sounds: sfxPublicList(next) });
+});
+
+app.get("/api/sfx/:id/file", (req, res) => {
+  const id = String(req.params.id || "");
+  const entry = readSfxManifest().find((e) => e.id === id);
+  if (!entry || !fs.existsSync(path.join(SFX_DIR, entry.file))) {
+    return res.status(404).json({ error: "Sound not found" });
+  }
+  res.set("Cache-Control", "public, max-age=31536000, immutable");
+  res.sendFile(path.join(SFX_DIR, entry.file));
 });
 
 // Cancel a running job (checked between segments/batches)
@@ -385,7 +615,7 @@ app.post("/api/cancel/:jobId", (req, res) => {
 });
 
 app.post("/api/generate", async (req, res) => {
-  const { jobId, durations, transitions, transitionDurations, transitionDuration, outputMode, motion, slides } = req.body;
+  const { jobId, durations, transitions, transitionDurations, transitionDuration, outputMode, motion, slides, sfx } = req.body;
   if (!jobId || !durations || !Array.isArray(durations)) {
     return res.status(400).json({ error: "Invalid payload" });
   }
@@ -734,6 +964,55 @@ app.post("/api/generate", async (req, res) => {
     }
   };
 
+  // ---- Transition SFX mixing: ONE pass over the FULL-LENGTH track ----
+  // Each cut sound is TRIMMED to its user-selected slice (atrim within the
+  // sound file), delayed to be CENTERED on its cut (cut - sliceDur/2) and
+  // summed into the music bed with amix(normalize=0) + a limiter guard
+  // (summed peaks stay under 1.0; music level is never re-scaled).
+  // Mixing the full-length track (not per chunk) means a sound centered near
+  // a chunk boundary spills naturally across the slice boundary — no clicks,
+  // no per-chunk bookkeeping. Without music, a silent bed carries the SFX.
+  // Per-cut volume + window offset are baked before the delay.
+  const mixSfxLayer = async (
+    basePath: string | null,
+    totalDur: number,
+    cuts: { at: number; file: string; vol: number; sliceStart: number; sliceDur: number }[],
+    outPath: string
+  ): Promise<void> => {
+    let base = basePath;
+    if (!base) {
+      base = path.join(jobDir, "sfx_bed.m4a");
+      await runFfmpeg(["-y", "-nostdin", "-f", "lavfi", "-i",
+        `anullsrc=r=48000:cl=stereo:d=${Math.max(0.2, totalDur).toFixed(3)}`,
+        "-c:a", "aac", "-b:a", "128k", base],
+        { jobDir, label: "sfx_bed", timeoutMs: 60000 });
+    }
+    const args: string[] = ["-y", "-nostdin", "-i", base];
+    for (const c of cuts) args.push("-i", c.file);
+    const vars: string[] = [
+      `[0:a]aformat=sample_rates=48000:channel_layouts=stereo[bed]`,
+    ];
+    cuts.forEach((c, k) => {
+      const dMs = Math.max(0, Math.round((c.at - c.sliceDur / 2) * 1000));
+      // Trim first (carve the drag-selected window), then volume, then delay.
+      const trim = c.sliceDur > 0 || c.sliceStart > 0
+        ? `atrim=start=${c.sliceStart.toFixed(3)}:end=${(c.sliceStart + c.sliceDur).toFixed(3)},asetpts=PTS-STARTPTS,`
+        : "";
+      vars.push(
+        `[${k + 1}:a]aformat=sample_rates=48000:channel_layouts=stereo,` +
+        trim +
+        `volume=${c.vol.toFixed(3)},adelay=${dMs}|${dMs}[s${k}]`);
+    });
+    const mixInputs = `[bed]` + cuts.map((_c, k) => `[s${k}]`).join("");
+    const filter =
+      vars.join(";") + ";" +
+      `${mixInputs}amix=inputs=${cuts.length + 1}:normalize=0,alimiter=limit=0.96[aout]`;
+    await runFfmpeg([
+      ...args, "-filter_complex", filter, "-map", "[aout]",
+      "-c:a", "aac", "-b:a", "192k", outPath,
+    ], { jobDir, label: "mix_sfx", timeoutMs: 300000 });
+  };
+
   try {
     const files = fs.readdirSync(jobDir);
     const rawImages = files
@@ -820,16 +1099,18 @@ app.post("/api/generate", async (req, res) => {
     parsedTransitions = parsedTransitions.map((t, i) => (t !== "none" && safeTransDurations[i] <= 0 ? "none" : t));
     safeTransDurations = safeTransDurations.map((d, i) => (parsedTransitions[i] === "none" ? 0 : d));
 
-    // ---- Camera motion (Ken Burns) plan: INTRO-ONLY ----
-    // Shots starting in the first MOTION_INTRO_SECONDS move; the tail renders
-    // as straight cuts on the fast static path (no supersample/zoompan cost,
-    // no xfade re-encodes). Purely additive when disabled:
-    // normalizeMotionConfig off yields [] and every render path below produces
-    // byte-identical ffmpeg args to the static pipeline.
+    // ---- Camera motion (Ken Burns) plan: TWO PHASES ----
+    // Phase 1 (opening, cfg.introSeconds default 60s): randomized Ken Burns
+    // across every shot (push/pull/pan/drift pool). Phase 2 (the rest):
+    // subtle alternating pan-l/pan-r glide (cfg.tail="pan") or static cuts
+    // (cfg.tail="none"). Purely additive when disabled: normalizeMotionConfig
+    // off yields [] and every render path below produces byte-identical
+    // ffmpeg args to the static pipeline.
     const motionCfg = normalizeMotionConfig(motion);
-    // Intro-only: shots starting in the first MOTION_INTRO_SECONDS move;
-    // the tail renders as straight cuts on the fast static path.
-    const introEnd = introCutoff(finalDurations);
+    // The tail moves but its JOINS still render as hard cuts (speed: no
+    // xfade re-encodes across the tail). Gate tail transitions BEFORE the
+    // motion plan so curve extensions match the rendered graph.
+    const introEnd = introCutoff(finalDurations, { introSeconds: motionCfg.introSeconds });
     if (motionCfg.enabled) {
       // Gate tail transitions BEFORE the motion plan so curve extensions
       // match the rendered graph (tail joins are hard cuts => zero ext).
@@ -837,9 +1118,60 @@ app.post("/api/generate", async (req, res) => {
       for (let i = introEnd; i < parsedTransitions.length; i++) parsedTransitions[i] = "none";
       safeTransDurations = safeTransDurations.map((d, i) => (parsedTransitions[i] === "none" ? 0 : d));
     }
+    // ---- Transition SFX schedule (per-cut, centered on the cut point) ----
+    // Client sends resolved per-cut entries { i, sfx, vol, start }. The cut
+    // for join i sits at the end of unit i on the frame-quantized timeline —
+    // the SAME anchor transitions use. The slice that plays inside the cut is
+    // the TRANSITION'S effective duration (safeTransDurations after every
+    // clamp + motion gating), carved from the sound at the user's chosen
+    // `start` offset — drag-selected in the UI. "none" joins (hard cuts,
+    // motion-tail) play the whole sound.
+    const sfxSchedule: { at: number; file: string; vol: number; sliceStart: number; sliceDur: number }[] = [];
+    if (sfx && typeof sfx === "object" && Array.isArray((sfx as any).cuts)) {
+      const cutStartAt: number[] = [];
+      {
+        let a = 0;
+        for (const d of finalDurations) { cutStartAt.push(a); a += d; }
+      }
+      const byId = new Map(readSfxManifest().map((e) => [e.id, e]));
+      const EPS = 0.01;
+      for (const c of (sfx as any).cuts) {
+        const entry = byId.get(String(c?.sfx || ""));
+        if (!entry) continue;
+        const file = path.join(SFX_DIR, entry.file);
+        if (!fs.existsSync(file)) continue;
+        const joinIdx = Math.floor(Number(c?.i ?? -1));
+        const at = cutStartAt[joinIdx + 1];
+        if (!Number.isFinite(at)) continue;
+        const volRaw = Number(c?.vol ?? 1);
+        const vol = Number.isFinite(volRaw) ? Math.min(3, Math.max(0.01, volRaw)) : 1;
+        const natural = Math.max(0.05, entry.dur || 0.6);
+        // Window width = the transition's rendered duration, capped by the
+        // sound itself; start clamps inside [0, natural - window].
+        const window = safeTransDurations[joinIdx] > 0
+          ? Math.min(safeTransDurations[joinIdx], natural)
+          : natural;
+        const startRaw = Number(c?.start ?? 0);
+        const start = Number.isFinite(startRaw)
+          ? Math.min(Math.max(0, startRaw), Math.max(0, natural - window))
+          : 0;
+        sfxSchedule.push({
+          at, file, vol,
+          sliceStart: start < EPS ? 0 : start,
+          sliceDur: window < natural - EPS ? window : natural,
+        });
+      }
+      if (sfxSchedule.length) {
+        console.log(`[job ${jobId}] sfx schedule: ${sfxSchedule.length} cut sound(s)`);
+        perfMark(jobDir, perfT0, `sfx schedule (${sfxSchedule.length} sounds)`);
+      }
+    }
+
+    // planMotion owns both phases: intro shots full-pool, tail shots subtle
+    // alternating pans (or null when tail="none"). No server-side clamping —
+    // the planner is the single source of truth so badges == output.
     const motionPlan: (ShotMotion | null)[] = motionCfg.enabled
-      ? planMotion(finalDurations, parsedTransitions, safeTransDurations, motionCfg).map((s, i) =>
-          i < introEnd ? s : null)
+      ? planMotion(finalDurations, parsedTransitions, safeTransDurations, motionCfg)
       : [];
     if (motionPlan.length) {
       const moving = motionPlan.filter(Boolean).length;
@@ -1036,6 +1368,15 @@ app.post("/api/generate", async (req, res) => {
         await buildFullAudio(combinedPath, combinedDur, totalVideoDur, fullPath);
         fullAudio = fullPath;
       }
+      if (sfxSchedule.length > 0) {
+        // SFX rides on the full-length bed (music already looped/trimmed) —
+        // one mix pass, chunk slicing and muxing below stay untouched.
+        setJobProgress(jobId, 78, "mixing audio", "Mixing transition sound effects...");
+        const sfxPath = path.join(jobDir, "full_audio_sfx.m4a");
+        await mixSfxLayer(fullAudio, totalVideoDur, sfxSchedule, sfxPath);
+        fullAudio = sfxPath;
+        perfMark(jobDir, perfT0, `sfx mixed (mode A)`);
+      }
       perfMark(jobDir, perfT0, `modeA audio prep done`);
       // Mux each chunk with its exact audio slice (independent files -> parallel).
       {
@@ -1223,6 +1564,13 @@ app.post("/api/generate", async (req, res) => {
         setJobProgress(jobId, 64, "preparing audio", combinedDur < totalVideoDur ? "Looping audio to cover full video..." : "Trimming audio to video length...");
         await buildFullAudio(combinedPath, combinedDur, totalVideoDur, fullPath);
         fullAudio = fullPath;
+      }
+      if (sfxSchedule.length > 0) {
+        setJobProgress(jobId, 65, "mixing audio", "Mixing transition sound effects...");
+        const sfxPath = path.join(jobDir, "full_audio_sfx.m4a");
+        await mixSfxLayer(fullAudio, totalVideoDur, sfxSchedule, sfxPath);
+        fullAudio = sfxPath;
+        perfMark(jobDir, perfT0, `sfx mixed (mode B)`);
       }
       perfMark(jobDir, perfT0, `modeB audio prep done`);
 

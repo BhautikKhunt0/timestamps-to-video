@@ -24,7 +24,8 @@
 // push<->pull) with 50% seeded probability so blends alternate between
 // invisible handoffs and fresh moves; forcing the mirror every time collapsed
 // whole timelines into one alternating pair (push,pull,push,pull…).
-// Only the first ~60s moves (see MOTION_INTRO_SECONDS); the tail is static.
+// Only the first intro segment moves in full random mix, and the tail runs
+// subtle alternating pans (configurable; see MOTION_INTRO_SECONDS + cfg.tail).
 //
 // Transition half-extensions are WHOLE-FRAME quantized (odd-frame transitions
 // split floor/ceil) so planner curve domains and server xfade offsets share
@@ -43,14 +44,18 @@ export const MOTION_CH = 1440;
 export const MOTION_FW = 1920; // output frame
 export const MOTION_FH = 1080;
 export const MOTION_SEGMENT_SIZE = 20; // must mirror server SEGMENT_SIZE
-// Intro-only motion: the first ~60s of visible timeline moves (randomized
-// moves across every shot in that span). Everything after renders as straight
-// cuts on the fast static path — no zoompan/supersample cost, no xfade
-// re-encodes. The planner is the single source of truth, so server output
-// and client badges agree.
+// MOTION PHASES: two director sections on one timeline.
+//   Phase 1 — OPENING (first `cfg.introSeconds`, default 60s): randomized
+//   Ken Burns across every shot (push/pull/pan/drift pool).
+//   Phase 2 — THE REST: subtle ALTERNATING pan-l / pan-r glide on every
+//   shot >= 1.2s (cfg.tail = "pan"), or static hard cuts (cfg.tail = "none").
+// The planner is the single source of truth, so server output and client
+// badges agree.
 export const MOTION_INTRO_SECONDS = 60;
-/** Index of the first static (tail) shot: shots starting at/after 60s. */
+/** Index of the first tail shot: shots starting at/after the intro span. */
 export function introCutoff(rawDurs: number[], opts: PlanOptions = {}): number {
+  const introSec = opts.introSeconds && Number.isFinite(opts.introSeconds) && opts.introSeconds > 0
+    ? opts.introSeconds : MOTION_INTRO_SECONDS;
   let durs = rawDurs.map((d) => (Number.isFinite(d) && d > 0 ? d : 5));
   if (opts.imageCount && opts.imageCount > 0) {
     while (durs.length < opts.imageCount) durs.push(durs[durs.length - 1] || 5);
@@ -59,7 +64,7 @@ export function introCutoff(rawDurs: number[], opts: PlanOptions = {}): number {
   const q = quantizeTimelineToFrames(durs);
   let t = 0;
   for (let i = 0; i < q.length; i++) {
-    if (t >= MOTION_INTRO_SECONDS) return i;
+    if (t >= introSec) return i;
     t += q[i];
   }
   return q.length;
@@ -67,7 +72,15 @@ export function introCutoff(rawDurs: number[], opts: PlanOptions = {}): number {
 export const MOTION_ASPECT = MOTION_FH / MOTION_FW; // 0.5625
 
 export type MotionStyle = "subtle" | "mixed" | "dynamic";
-export interface MotionConfig { enabled: boolean; style: MotionStyle; seed: number }
+/** Rest-of-timeline policy: static hard cuts, or subtle alternating pans. */
+export type TailMove = "none" | "pan";
+export interface MotionConfig {
+  enabled: boolean; style: MotionStyle; seed: number;
+  /** Length of the full-random opening phase in seconds (default 60). */
+  introSeconds: number;
+  /** Rest-of-timeline motion: "none" = static cuts, "pan" = subtle alternating glide. */
+  tail: TailMove;
+}
 export type ShotMove = "none" | "push" | "pull" | "pan-l" | "pan-r" | "tilt-u" | "tilt-d" | "drift";
 
 export interface PunchMove {
@@ -85,6 +98,12 @@ export interface ShotMotion {
   cx0: number; cy0: number;       // window CENTER start (px)
   cx1: number; cy1: number;       // window CENTER end (px)
   punch?: PunchMove;
+  /**
+   * PAN supersample factor (1/2/4/6, planner default 4). Tail pans render at
+   * 2x: half the pixels of 4x for ~0.14px rms against the ~0.16px resampling
+   * floor — imperceptible on a subtle glide, ~2x faster on long timelines.
+   */
+  ss?: number;
 }
 
 export type MotionPlan = (ShotMotion | null)[];
@@ -92,6 +111,8 @@ export type MotionPlan = (ShotMotion | null)[];
 export interface PlanOptions {
   segmentSize?: number;
   imageCount?: number; // pad durs to this length (client badge parity)
+  /** Override the intro-phase length (default MOTION_INTRO_SECONDS). */
+  introSeconds?: number;
 }
 
 // ---- shared helpers ---------------------------------------------------------
@@ -135,7 +156,10 @@ export function normalizeMotionConfig(raw: any): MotionConfig {
   const style: MotionStyle = raw?.style === "subtle" || raw?.style === "dynamic" ? raw.style : "mixed";
   const seedNum = Number(raw?.seed);
   const seed = Number.isFinite(seedNum) ? Math.abs(Math.floor(seedNum)) % 2147483646 : 1;
-  return { enabled: raw?.enabled === true, style, seed };
+  const introRaw = Number(raw?.introSeconds);
+  const introSeconds = Number.isFinite(introRaw) && introRaw > 0 ? introRaw : MOTION_INTRO_SECONDS;
+  const tail: TailMove = raw?.tail === "pan" ? "pan" : "none";
+  return { enabled: raw?.enabled === true, style, seed, introSeconds, tail };
 }
 
 function mulberry32(a: number) {
@@ -167,10 +191,11 @@ const familyOf = (m: ShotMove): string =>
  * half-transition extensions so a move spans the WHOLE branch (motion flows
  * continuously through crossfades).
  *
- * INTRO-ONLY: shots starting at/after MOTION_INTRO_SECONDS stay null
- * (static). The gate sits before any rng() draw, so the head plan is
- * bit-identical with or without the tail — preview badges and server output
- * always agree.
+ * INTRO SECONDS + TAIL: shots starting at/after `cfg.introSeconds` belong to
+ * the tail phase — static cuts (cfg.tail="none") or subtle alternating
+ * pans (cfg.tail="pan", RNG-free so the head plan is bit-identical with or
+ * without it). The intro gate sits before any rng() draw, so preview badges
+ * and server output always agree.
  */
 export function planMotion(
   rawDurs: number[],
@@ -266,9 +291,43 @@ export function planMotion(
   // stay randomized instead of collapsing into one alternating pair.
   const MIRROR: Record<string, ShotMove> = { push: "pull", pull: "push", "pan-l": "pan-r", "pan-r": "pan-l" };
 
+  const zoomW = (m: number) => CW / (1 + m);
+
+  const introSec = cfg.introSeconds > 0 ? cfg.introSeconds : MOTION_INTRO_SECONDS;
+
+  // ---- PHASE 2 (rest of timeline) — subtle alternating pans ----
+  // Strictly alternating pan-l / pan-r (virtual-shot parity), constant-window
+  // crop glide. Deliberately RNG-FREE: the head plan stays bit-identical
+  // with or without the tail, previews always match the server, and the
+  // alternation is deterministic across seeds and remixes.
+  const TAIL_ZOOM = 0.08;      // constant slight zoom -> sideways headroom
+  let tailCount = 0;
+
   for (let i = 0; i < n; i++) {
     const vis = durs[i];
-    if (startAt[i] >= MOTION_INTRO_SECONDS) continue; // intro-only tail: static cuts
+    if (startAt[i] >= introSec) {
+      // Rest of timeline: cfg.tail === "none" keeps the static fast path;
+      // "pan" gives every 1.2s+ shot a subtle glide. Micro shots (<1.2s)
+      // stay static everywhere — the cut rhythm carries them.
+      if (cfg.tail === "pan" && vis >= 1.2) {
+        const [extL, extR] = extFor(i);
+        const D = vis + extL + extR;
+        const sign = tailCount % 2 === 0 ? -1 : 1;   // strict alternation
+        const w = zoomW(TAIL_ZOOM);
+        const room = (CW * MOTION_FW) / w - MOTION_FW;      // travel room in frame px
+        const want = Math.max(20, vis * RENDER_FPS * 0.55); // ~0.55px/frame
+        const travel = Math.min(want, Math.max(16, room * 0.7)) * w / CW; // -> canvas px
+        plan[i] = {
+          move: sign < 0 ? "pan-l" : "pan-r",
+          D, extL, w0: w, w1: w,
+          cx0: clampCX(cX - (sign * travel) / 2, w), cy0: cY,
+          cx1: clampCX(cX + (sign * travel) / 2, w), cy1: cY,
+          ss: 2,
+        };
+        tailCount++;
+      }
+      continue;
+    }
     if (vis < 1.2) continue; // fast shot: static — the cut rhythm carries it
 
     const [extL, extR] = extFor(i);
@@ -307,7 +366,6 @@ export function planMotion(
     // shot readable as glide. Subtle ~6-9%, dynamic ~11-18%.
     const mag = clamp((0.08 + 0.07 * clamp((vis - 1.2) / 5.8, 0, 1)) * scale, 0.06, 0.18);
     const fullW = CW; // entire canvas visible
-    const zoomW = (m: number) => fullW / (1 + m);
     let w0: number, w1: number;
     let cx0: number, cy0: number, cx1: number, cy1: number;
 
@@ -387,7 +445,7 @@ const f = (x: number) => (Math.round(x * 10000) / 10000).toString();
 export const MOTION_COVER =
   `format=yuv444p,scale=w=${MOTION_CW}:h=${MOTION_CH}:force_original_aspect_ratio=increase,crop=w=${MOTION_CW}:h=${MOTION_CH}`;
 
-type WindowCurve = { w0: number; w1: number; cx0: number; cy0: number; cx1: number; cy1: number };
+type WindowCurve = { w0: number; w1: number; cx0: number; cy0: number; cx1: number; cy1: number; ss?: number };
 
 /**
  * Animated Ken Burns for one curve segment. Two paths, each measured smooth
@@ -445,7 +503,10 @@ const motionOps = (s: WindowCurve, D: number, tb: number): string => {
     // fixed downscale) makes 1 crop step = 0.25 out-px blended by the
     // downscaler, so every mid-curve frame advances (posJitter ~0.07px rms).
     // All three sizes are CONSTANT per shot — no per-frame scaler reinit.
-    const SS = 4;
+    // Supersample: planner-provided (1/2/4/6), default 4. Tail pans run at 2x —
+    // half the pixels of 4x for ~0.14px rms (below the ~0.16px resampling
+    // floor), which keeps long timelines cheap while the glide stays clean.
+    const SS = s.ss === 1 || s.ss === 2 || s.ss === 6 ? s.ss : 4;
     const sw = Math.round((MOTION_CW * MOTION_FW * SS) / s.w0);
     const sh = Math.round((MOTION_CH * MOTION_FW * SS) / s.w0);
     const cw = MOTION_FW * SS, ch = MOTION_FH * SS;

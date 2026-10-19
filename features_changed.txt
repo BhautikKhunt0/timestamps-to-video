@@ -1,7 +1,16 @@
-Added Features: 
+Added Features:
 
 1. Transitions More
 2. Redesigned Again
+3. Transition SFX: project-stored sound library (import once, reuse forever)
+   with per-transition assignment, per-cut volume/mute, preview, starter
+   pack, and real mixing into rendered audio (centered on every cut)
+4. SFX segment editor: drag a window on the sound's real waveform to pick
+   exactly WHICH part plays inside each transition's seconds (0.3–2.0s),
+   sliced from the file at render time (atrim)
+5. Real transition preview: your first two uploaded images animate through
+   the actual transition (fade/wipe/push/cut) with the chosen sound slice
+   at its chosen volume, looping
 
 Fixed Issues:
 1. No Audio Cuts

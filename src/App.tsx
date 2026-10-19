@@ -8,6 +8,7 @@ import {
 import { parseTimestamps } from "./utils/parser";
 import { planMotion, motionBadge, introCutoff, MOTION_INTRO_SECONDS } from "./utils/motion";
 import type { SlideEnter } from "./utils/slides";
+import { appendInUploadOrder } from "./utils/imorder";
 
 const TRANSITIONS_CONFIG = [
   { id: "none", name: "Hard Cut", icon: Scissors, color: "text-neutral-400", border: "border-neutral-700/60", bg: "bg-neutral-800" },
@@ -64,6 +65,20 @@ const pvLabelFor = (id: string) =>
   : id === "fade" ? "DISSOLVE"
   : id === "smoothleft" || id === "smoothright" ? "WIPE"
   : "PUSH";
+
+// Deterministic pseudo-waveform for SFX rack chips (pure visual fingerprint —
+// stable per sound id, never re-shuffles between renders).
+const waveBarsFor = (id: string): number[] => {
+  let h = 2166136261;
+  for (let i = 0; i < id.length; i++) { h ^= id.charCodeAt(i); h = Math.imul(h, 16777619); }
+  const rnd = () => {
+    h = Math.imul(h ^ (h >>> 15), 2246822519);
+    h ^= h >>> 13;
+    return ((h >>> 0) % 1000) / 1000;
+  };
+  return Array.from({ length: 18 }, (_, i) =>
+    0.2 + 0.8 * (0.55 * Math.abs(Math.sin(i * 1.7 + rnd() * 2.4)) + 0.45 * rnd()));
+};
 
 const markerModFor = (t?: string) =>
   t === "none" ? "none"
@@ -210,6 +225,134 @@ export default function App() {
   const [motionOn, setMotionOn] = useState(true);
   const [motionStyle, setMotionStyle] = useState<"subtle" | "mixed" | "dynamic">("mixed");
   const [motionSeed, setMotionSeed] = useState(() => Math.floor(Math.random() * 1_000_000_000));
+  // Two-phase motion director: phase 1 = full-random Ken Burns on the first
+  // `motionIntroSec` seconds; phase 2 = the rest of the timeline — "pan" runs
+  // a subtle strictly-alternating pan-l/pan-r glide, "none" keeps static cuts.
+  const [motionIntroSec, setMotionIntroSec] = useState(MOTION_INTRO_SECONDS);
+  const [motionTail, setMotionTail] = useState<"none" | "pan">("pan");
+
+  // ---- Transition SFX: project-stored library + per-type assignment ----
+  // Files live server-side under <project>/sfx/ (upload once, forever).
+  // Assignment (transition type -> sound + volume + window offset) persists
+  // in localStorage; per-CUT tweaks (volume/mute) are session state,
+  // resettable in one click. `start` = seconds into the sound where the
+  // slice that plays inside the transition window begins.
+  type SfxItem = { id: string; name: string; dur: number; url: string };
+  type SfxAssign = { id: string; vol: number; start: number };
+  const [sfxLib, setSfxLib] = useState<SfxItem[]>([]);
+  const [sfxAssign, setSfxAssign] = useState<Record<string, SfxAssign | null>>(() => {
+    // v2 adds `start`; old v1 rows migrate with start=0.
+    try {
+      const raw = JSON.parse(localStorage.getItem("sfxAssignV2") || localStorage.getItem("sfxAssignV1") || "{}");
+      for (const k of Object.keys(raw)) {
+        if (raw[k] && typeof raw[k].start !== "number") raw[k].start = 0;
+      }
+      return raw;
+    } catch { return {}; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("sfxAssignV2", JSON.stringify(sfxAssign)); } catch { /* private mode */ }
+  }, [sfxAssign]);
+  const [cutSfxOv, setCutSfxOv] = useState<Record<number, { vol?: number; off?: boolean; id?: string }>>({});
+  const [sfxPlaying, setSfxPlaying] = useState<string | null>(null);
+  const [sfxMsg, setSfxMsg] = useState("");
+  const sfxInputRef = useRef<HTMLInputElement>(null);
+
+  // WebAudio preview engine: decode each library sound ONCE, then play exact
+  // slices [start, start+dur) through a GainNode so preview == render (same
+  // window, same volume even above 100%) and there is no latency drift.
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const sfxBufRef = useRef<Map<string, AudioBuffer>>(new Map());
+  const sfxSrcRef = useRef<AudioBufferSourceNode | null>(null);
+  const getAudioCtx = () => {
+    if (!audioCtxRef.current) audioCtxRef.current = new AudioContext();
+    return audioCtxRef.current;
+  };
+  const stopSlice = () => {
+    try { sfxSrcRef.current?.stop(); } catch { /* already stopped */ }
+    sfxSrcRef.current = null;
+    setSfxPlaying(null);
+  };
+  const playSlice = async (item: SfxItem, opts?: { start?: number; dur?: number; vol?: number; key?: string }) => {
+    // Exactly one preview at a time — re-click stops.
+    const key = opts?.key ?? item.id;
+    const was = sfxPlaying;
+    try {
+      let buf = sfxBufRef.current.get(item.id);
+      if (!buf) {
+        const res = await fetch(item.url);
+        const ab = await res.arrayBuffer();
+        buf = await getAudioCtx().decodeAudioData(ab);
+        sfxBufRef.current.set(item.id, buf);
+      }
+      stopSlice();
+      if (was === key) return; // stop requested
+      const ctx = getAudioCtx();
+      if (ctx.state === "suspended") { try { await ctx.resume(); } catch { /* stays muted until a gesture */ } }
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      const gain = ctx.createGain();
+      gain.gain.value = Math.max(0, Math.min(2, (opts?.vol ?? 100) / 100));
+      src.connect(gain).connect(ctx.destination);
+      sfxSrcRef.current = src;
+      setSfxPlaying(key);
+      src.onended = () => {
+        if (sfxSrcRef.current === src) {
+          sfxSrcRef.current = null;
+          setSfxPlaying(null);
+        }
+      };
+      // Slice [start, start+dur) — the exact window rendered into the video.
+      const start = Math.max(0, Math.min(opts?.start ?? 0, Math.max(0, buf.duration - 0.01)));
+      const dur = opts?.dur != null ? Math.min(opts.dur, buf.duration - start) : undefined;
+      src.start(undefined, start, dur);
+    } catch {
+      setSfxPlaying(null);
+      setSfxMsg("Sound decode failed — re-import this sound");
+      window.setTimeout(() => setSfxMsg((m) => (m === "Sound decode failed — re-import this sound" ? "" : m)), 4000);
+    }
+  };
+
+  useEffect(() => {
+    let dead = false;
+    fetch("/api/sfx/list").then((r) => r.json()).then((j: any) => {
+      if (!dead && Array.isArray(j.sounds)) {
+        const lib: SfxItem[] = j.sounds;
+        setSfxLib(lib);
+        // Self-heal: assignments pointing at sounds that no longer exist
+        // would silently no-op in the render — clear them instead.
+        const ids = new Set(lib.map((s) => s.id));
+        setSfxAssign((prev) => {
+          const next: Record<string, SfxAssign | null> = {};
+          let changed = false;
+          for (const k of Object.keys(prev)) {
+            const v = prev[k];
+            const fixed = v && !ids.has(v.id) ? null : v;
+            next[k] = fixed;
+            if (fixed !== v) changed = true;
+          }
+          return changed ? next : prev;
+        });
+        setCutSfxOv((prev) => {
+          const next: Record<number, { vol?: number; off?: boolean; id?: string }> = {};
+          let changed = false;
+          for (const k of Object.keys(prev)) {
+            const v = prev[Number(k)];
+            const fixed = v?.id && !ids.has(v.id) ? { vol: v.vol, off: v.off } : v;
+            next[Number(k)] = fixed;
+            if (fixed !== v) changed = true;
+          }
+          return changed ? next : prev;
+        });
+      }
+    }).catch(() => { /* rack stays empty until a server lists sounds */ });
+    return () => {
+      dead = true;
+      try { sfxSrcRef.current?.stop(); } catch { /* already idle */ }
+      sfxSrcRef.current = null;
+      audioCtxRef.current?.close().catch(() => { /* already closed */ });
+    };
+  }, []);
 
   // Slide structure: groups of 1-3 images rendered as ONE composited unit
   // (staggered card entrances + headline). null = legacy auto (1/slide).
@@ -312,12 +455,18 @@ export default function App() {
   // intact (turning motion off restores it); everything below — badges,
   // payload, markers — reads the effective timeline so preview == output.
   const introEnd = useMemo(
-    () => introCutoff(unitDurs, { imageCount: unitCount }),
-    [unitDurs, unitCount]
+    () => introCutoff(unitDurs, { imageCount: unitCount, introSeconds: motionIntroSec }),
+    [unitDurs, unitCount, motionIntroSec]
   );
   const effTransitions = useMemo(
     () => (motionOn ? unitTransBase.map((t, i) => (i < introEnd ? t : "none")) : unitTransBase),
     [unitTransBase, motionOn, introEnd]
+  );
+  // Visible start time of the first tail shot — the phase-2 boundary the
+  // motion UI shows on the coverage bar and phase labels.
+  const motionTailStart = useMemo(
+    () => unitDurs.slice(0, Math.min(introEnd, unitDurs.length)).reduce((a, d) => a + d, 0),
+    [unitDurs, introEnd]
   );
   const effTransDurs = useMemo(
     () => effTransitions.map(t => (t === "none" ? 0 : (categoryDurations[t] || 0.5))),
@@ -326,9 +475,9 @@ export default function App() {
 
   const badgePlan = useMemo(
     () => planMotion(unitDurs, effTransitions, effTransDurs,
-      { enabled: motionOn, style: motionStyle, seed: motionSeed },
+      { enabled: motionOn, style: motionStyle, seed: motionSeed, introSeconds: motionIntroSec, tail: motionTail },
       { imageCount: unitCount }),
-    [unitDurs, effTransitions, effTransDurs, motionOn, motionStyle, motionSeed, unitCount]
+    [unitDurs, effTransitions, effTransDurs, motionOn, motionStyle, motionSeed, motionIntroSec, motionTail, unitCount]
   );
 
   // ── Design-only view state (no business logic) ──────────────────
@@ -410,13 +559,10 @@ export default function App() {
 
   const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
-      const filesArray = Array.from(e.target.files);
-      setImages(prev => {
-        const newImages = [...prev, ...filesArray].sort((a, b) => {
-          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-        });
-        return newImages;
-      });
+      const filesArray = Array.from(e.target.files ?? []) as File[];
+      // Pick order = timeline order. Never re-sort by filename: same-named
+      // files from different folders would otherwise swap places.
+      setImages(prev => appendInUploadOrder(prev, filesArray));
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
@@ -433,13 +579,10 @@ export default function App() {
     e.preventDefault();
     e.currentTarget.classList.remove('drag-over');
     if (e.dataTransfer.files) {
-      const filesArray = Array.from(e.dataTransfer.files).filter((file: File) => file.type.startsWith('image/'));
-      setImages(prev => {
-        const newImages = [...prev, ...filesArray].sort((a, b) => {
-          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-        });
-        return newImages;
-      });
+      const filesArray = (Array.from(e.dataTransfer.files ?? []) as File[])
+        .filter((file: File) => file.type.startsWith('image/'));
+      // Drop order is pick order (see handleImageChange).
+      setImages(prev => appendInUploadOrder(prev, filesArray));
     }
   };
 
@@ -475,6 +618,17 @@ export default function App() {
 
     const categoryName = TRANSITIONS_CONFIG.find(c => c.id === category)?.name || category;
     setSuccessMessage(`Updated all ${categoryName} transitions duration to ${newDuration}s.`);
+    // The segment editor window width follows this duration — keep every
+    // assigned window inside its sound.
+    setSfxAssign(prev => {
+      const asg = prev[category] ?? null;
+      if (!asg) return prev;
+      const snd = sfxLib.find(s => s.id === asg.id);
+      if (!snd) return prev;
+      const maxStart = Math.max(0, snd.dur - newDuration);
+      const clamped = Math.min(Math.max(0, asg.start), maxStart);
+      return clamped === asg.start ? prev : { ...prev, [category]: { ...asg, start: clamped } };
+    });
   };
 
   const handleApplyToAll = (transType: string) => {
@@ -503,6 +657,355 @@ export default function App() {
     setTransitions(new Array(needed).fill("none"));
     setGlobalTransition("none");
     setSuccessMessage("Reset all cuts to standard Cuts (None).");
+  };
+
+  // ---- SFX handlers: preview / import / starter pack / delete / assign ----
+  // Chart of the three slice-preview call sites:
+  //  · rack chip        → whole sound, 90% volume
+  //  · card strip / cut → [start, start+window) at the chosen volume,
+  //                       exactly what the render will produce.
+  const previewSfx = (sfxId: string, opts?: { start?: number; dur?: number; vol?: number }) => {
+    const item = sfxLib.find((s) => s.id === sfxId);
+    if (!item) return;
+    playSlice(item, { key: sfxId, ...opts });
+  };
+
+  const flashSfxMsg = (msg: string) => {
+    setSfxMsg(msg);
+    window.setTimeout(() => setSfxMsg((m) => (m === msg ? "" : m)), 4500);
+  };
+
+  const handleSfxFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const list: File[] = e.target.files ? Array.from(e.target.files) : [];
+    if (!list.length) return;
+    const fd = new FormData();
+    for (const f of list) fd.append("sfx", f);
+    flashSfxMsg(`Importing ${list.length} sound${list.length === 1 ? "" : "s"}…`);
+    try {
+      const r = await fetch("/api/sfx/upload", { method: "POST", body: fd });
+      const j = await r.json();
+      if (Array.isArray(j.sounds)) setSfxLib(j.sounds);
+      if (j.failed?.length) flashSfxMsg(`${j.count} imported · ${j.failed.length} failed: ${j.failed[0]}`);
+      else if (j.count > 0) flashSfxMsg(`${j.count} sound${j.count === 1 ? "" : "s"} added to the project`);
+      else flashSfxMsg("Import failed — no readable audio found");
+    } catch {
+      flashSfxMsg("Import failed — server unreachable");
+    }
+    if (sfxInputRef.current) sfxInputRef.current.value = "";
+  };
+
+  const handleSeedSfx = async () => {
+    flashSfxMsg("Synthesizing starter pack…");
+    try {
+      const r = await fetch("/api/sfx/seed", { method: "POST" });
+      const j = await r.json();
+      if (Array.isArray(j.sounds)) setSfxLib(j.sounds);
+      flashSfxMsg(j.added > 0 ? `Starter pack: ${j.added} sounds synthesized` : "Starter pack already installed");
+    } catch {
+      flashSfxMsg("Starter pack failed — server unreachable");
+    }
+  };
+
+  const deleteSfx = async (id: string) => {
+    // Deleting a sound that is previewing or assigned must leave no ghosts.
+    const r = await fetch(`/api/sfx/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const j = await r.json().catch(() => null);
+    if (j?.sounds) {
+      setSfxLib(j.sounds);
+      if (sfxPlaying === id) { stopSlice(); }
+      sfxBufRef.current.delete(id); // stale decoded waveform would mislead
+      setSfxAssign((prev) => {
+        const next: Record<string, SfxAssign | null> = {};
+        for (const k of Object.keys(prev)) next[k] = prev[k]?.id === id ? null : prev[k];
+        return next;
+      });
+      setCutSfxOv((prev) => {
+        const next: Record<number, { vol?: number; off?: boolean; id?: string }> = {};
+        for (const k of Object.keys(prev)) {
+          const v = prev[Number(k)];
+          next[Number(k)] = v?.id === id ? { vol: v.vol, off: v.off } : v;
+        }
+        return next;
+      });
+    }
+  };
+
+  const setSfxForType = (type: string, assign: SfxAssign | null) =>
+    setSfxAssign((prev) => ({ ...prev, [type]: assign }));
+
+  const patchCutSfx = (idx: number, patch: { vol?: number; off?: boolean; id?: string }) =>
+    setCutSfxOv((prev) => ({ ...prev, [idx]: { ...prev[idx], ...patch } }));
+
+  // What a cut plays (id + window offset + volume) — the single source for
+  // both the per-cut preview button and the generate payload, so what you
+  // hear is exactly what the render bakes in.
+  const cutSfxEff = (idx: number, trans: string): { id: string; start: number; win: number; vol: number } | null => {
+    const ov = cutSfxOv[idx];
+    if (ov?.off) return null;
+    const base = sfxAssign[trans] ?? null;
+    const id = ov?.id ?? base?.id ?? null;
+    if (!id) return null;
+    const snd = sfxLib.find((s) => s.id === id);
+    if (!snd) return null;
+    if (ov?.id && ov.id !== (base?.id ?? null)) {
+      // Per-cut different sound: full sound, default offset (UI keeps the
+      // per-cut strip to volume/mute only).
+      return { id, start: 0, win: snd.dur, vol: ov.vol ?? base?.vol ?? 100 };
+    }
+    const win = sfxWindowFor(trans, snd.dur);
+    const maxi = Math.max(0, snd.dur - win);
+    return {
+      id,
+      start: Math.min(Math.max(0, base?.start ?? 0), maxi),
+      win,
+      vol: ov?.vol ?? base?.vol ?? 100,
+    };
+  };
+
+  // Effective window of a type's sound slice: full sound for hard cuts
+  // ("none" has zero transition length), else the transition's seconds.
+  const sfxWindowFor = (type: string, sndDur: number): number => {
+    const wd = categoryDurations[type] || 0.5;
+    return type === "none" ? sndDur : Math.min(wd, sndDur);
+  };
+
+  // ---- Segment editors: real waveform of each assigned sound ----
+  const sfxWaveRefs = useRef<Record<string, HTMLCanvasElement | null>>({});
+  const drawWaveResolveRef = useRef<Map<string, (() => void)>>(new Map());
+  const ensureBuf = async (id: string): Promise<AudioBuffer | null> => {
+    const item = sfxLib.find((s) => s.id === id);
+    if (!item) return null;
+    let buf = sfxBufRef.current.get(id);
+    if (buf) return buf;
+    try {
+      const res = await fetch(item.url);
+      const ab = await res.arrayBuffer();
+      buf = await getAudioCtx().decodeAudioData(ab);
+      sfxBufRef.current.set(id, buf);
+      return buf;
+    } catch { return null; }
+  };
+  const drawSfxWave = (typeId: string) => {
+    const cv = sfxWaveRefs.current[typeId];
+    if (!cv) return;
+    // Decode + draw asynchronously; a re-render while pending redraws again.
+    const token = typeId + (sfxAssign[typeId]?.id ?? "");
+    if (drawWaveResolveRef.current.has(token)) return;
+    drawWaveResolveRef.current.set(token, () => {});
+    (async () => {
+      const buf = await ensureBuf(sfxAssign[typeId]?.id ?? "");
+      drawWaveResolveRef.current.delete(token);
+      if (!buf || !cv.isConnected) return;
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const W = Math.max(80, cv.clientWidth), H = Math.max(26, cv.clientHeight);
+      cv.width = Math.round(W * dpr);
+      cv.height = Math.round(H * dpr);
+      const g = cv.getContext("2d");
+      if (!g) return;
+      g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      const asg = sfxAssign[typeId] ?? null;
+      if (!asg) return;
+      const sndDur = buf.duration;
+      const win = sfxWindowFor(typeId, sndDur);
+      const maxi = Math.max(0, sndDur - win);
+      const st = Math.min(Math.max(0, asg.start), maxi);
+      // Background
+      g.clearRect(0, 0, W, H);
+      g.fillStyle = "#0a0a0d";
+      g.fillRect(0, 0, W, H);
+      // Center rail
+      g.strokeStyle = "rgba(255,255,255,0.05)";
+      g.beginPath();
+      g.moveTo(0, H / 2); g.lineTo(W, H / 2);
+      g.stroke();
+      // Real peaks: one bar per 2px, min/max of the channel range.
+      const ch = buf.getChannelData(0);
+      const step = Math.max(1, Math.floor(ch.length / W));
+      const barW = 2;
+      for (let x = 0; x + barW < W; x += barW + 1) {
+        let lo = 0, hi = 0;
+        const i0 = Math.floor((x / W) * ch.length);
+        for (let k = 0; k < step; k++) {
+          const v = ch[Math.min(ch.length - 1, i0 + k)] || 0;
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+        }
+        const h = Math.max(1.5, (hi - lo) * (H - 6) * 0.5);
+        g.fillStyle = "rgba(255,255,255,0.16)";
+        g.fillRect(x, H / 2 - h / 2, barW, h);
+      }
+      // Used window: green tint + edge ticks; outside dimmed.
+      const x0 = (st / sndDur) * W, x1 = ((st + win) / sndDur) * W;
+      g.fillStyle = "rgba(0,0,0,0.55)";
+      if (x0 > 0) g.fillRect(0, 0, x0, H);
+      if (x1 < W) g.fillRect(x1, 0, W - x1, H);
+      g.fillStyle = "rgba(52,211,153,0.10)";
+      g.fillRect(x0, 0, x1 - x0, H);
+      g.fillStyle = "rgba(52,211,153,0.35)";
+      g.fillRect(x0, 0, 2, H);
+      g.fillRect(x1 - 2, 0, 2, H);
+      g.strokeStyle = "rgba(52,211,153,0.8)";
+      g.strokeRect(x0 + 0.5, 0.5, Math.max(2, x1 - x0 - 1), H - 1);
+    })();
+  };
+  // Redraw all visible editors after every render (cheap; pending decodes
+  // re-run once resolved because the resolve-token is freed).
+  useEffect(() => {
+    for (const typeId of Object.keys(sfxWaveRefs.current)) {
+      if (sfxWaveRefs.current[typeId] && sfxAssign[typeId]) drawSfxWave(typeId);
+      else delete sfxWaveRefs.current[typeId];
+    }
+  });
+  const handleWaveDrag = (e: React.PointerEvent<HTMLCanvasElement>, typeId: string) => {
+    const cv = e.currentTarget;
+    const asg = sfxAssign[typeId];
+    if (!asg) return;
+    const snd = sfxLib.find((s) => s.id === asg.id);
+    if (!snd) return;
+    e.preventDefault();
+    cv.setPointerCapture(e.pointerId);
+    cv.style.cursor = "grabbing";
+    const move = (ev: PointerEvent) => {
+      const rect = cv.getBoundingClientRect();
+      const frac = Math.min(1, Math.max(0, (ev.clientX - rect.left) / Math.max(1, rect.width)));
+      const win = sfxWindowFor(typeId, snd.dur);
+      const maxi = Math.max(0, snd.dur - win);
+      const st = Math.min(maxi, Math.max(0, frac * maxi));
+      setSfxForType(typeId, { id: asg.id, vol: asg.vol, start: st });
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      cv.style.cursor = "";
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
+  // ---- REAL transition preview: your first two images, the actual
+  // transition animating between them, with the selected sound slice
+  // playing exactly when the render would play it. Loops until stopped.
+  const [pvPlaying, setPvPlaying] = useState<string | null>(null);
+  const pvRunRef = useRef<{ id: string | null }>({ id: null });
+  const pvCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const loadImageEl = (u: string) =>
+    new Promise<HTMLImageElement>((res, rej) => {
+      const im = new Image();
+      im.onload = () => res(im);
+      im.onerror = () => rej(new Error("image"));
+      im.src = u;
+    });
+  const stopTransitionPreview = () => {
+    pvRunRef.current.id = null;
+    setPvPlaying(null);
+    stopSlice();
+  };
+  const startTransitionPreview = async ( typeId: string ) => {
+    if (imageUrls.length < 2) return;
+    stopSlice();
+    pvRunRef.current.id = typeId;
+    setPvPlaying(typeId);
+    let imgA: HTMLImageElement, imgB: HTMLImageElement;
+    try {
+      [imgA, imgB] = await Promise.all([loadImageEl(imageUrls[0]), loadImageEl(imageUrls[1])]);
+    } catch {
+      stopTransitionPreview();
+      return;
+    }
+    if (pvRunRef.current.id !== typeId) return;
+    const cv = pvCanvasRef.current;
+    if (!cv) { setPvPlaying(null); return; }
+    const stage = cv.parentElement!;
+    const r = stage.getBoundingClientRect();
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    cv.width = Math.max(2, Math.round(r.width * dpr));
+    cv.height = Math.max(2, Math.round(r.height * dpr));
+    const g = cv.getContext("2d");
+    if (!g) { setPvPlaying(null); return; }
+    const drawCover = (im: HTMLImageElement, dx: number, dy: number, alpha = 1) => {
+      const s = Math.max(cv.width / (im.naturalWidth || 1), cv.height / (im.naturalHeight || 1));
+      const w = (im.naturalWidth || 1) * s, h = (im.naturalHeight || 1) * s;
+      g.globalAlpha = alpha;
+      g.drawImage(im, dx + (cv.width - w) / 2, dy + (cv.height - h) / 2, w, h);
+      g.globalAlpha = 1;
+    };
+    // Frame painters matching the ffmpeg filters' visual families.
+    const paint = (p: number) => {
+      g.fillStyle = "#07070a";
+      g.fillRect(0, 0, cv.width, cv.height);
+      const W = cv.width, H = cv.height;
+      if (typeId === "none") {
+        drawCover(imgA, 0, 0);
+        if (p >= 0.5) drawCover(imgB, 0, 0);
+      } else if (typeId === "fade") {
+        drawCover(imgA, 0, 0);
+        drawCover(imgB, 0, 0, p);
+      } else if (typeId === "smoothleft" || typeId === "smoothright") {
+        drawCover(imgA, 0, 0);
+        // Soft-edge wipe: the incoming frame emerges behind the edge band
+        // (L→R for wipe-left, mirrored for wipe-right).
+        const edge = (0.104 + p * 1.09) - 0.104; // 0 → ~1.09 across the sweep
+        const f = 0.06 * W;
+        g.save();
+        g.beginPath();
+        if (typeId === "smoothleft") {
+          g.rect(0, 0, edge * W + f / 2, H);
+        } else {
+          g.rect((1 - edge) * W - f / 2, 0, W, H);
+        }
+        g.clip();
+        drawCover(imgB, 0, 0);
+        g.restore();
+        // Feathered edge highlight
+        const ex = typeId === "smoothleft" ? edge * W : (1 - edge) * W;
+        const grad = g.createLinearGradient(ex - f, 0, ex + f, 0);
+        grad.addColorStop(0, "rgba(255,255,255,0)");
+        grad.addColorStop(0.5, "rgba(255,255,255,0.22)");
+        grad.addColorStop(1, "rgba(255,255,255,0)");
+        g.fillStyle = grad;
+        g.fillRect(ex - f, 0, f * 2, H);
+      } else {
+        // slideright / slideleft / slideup / slidedown — true pushes
+        const dir =
+          typeId === "slideright" ? { x: 1, y: 0 } :
+          typeId === "slideup" ? { x: 0, y: -1 } :
+          typeId === "slidedown" ? { x: 0, y: 1 } :
+          { x: -1, y: 0 };
+        drawCover(imgB, dir.x * (1 - p) * W, dir.y * (1 - p) * H);
+        drawCover(imgA, dir.x * (-p) * W, dir.y * (-p) * H);
+      }
+    };
+    const secs = categoryDurations[typeId] || 0.5;
+    const T = typeId === "none" ? 0.4 : Math.max(0.3, Math.min(2, secs));
+    const HOLD = 0.5;
+    const cycle = HOLD + T + HOLD;
+    let t0: number | null = null;
+    let lastCycle = -1;
+    const asg = sfxAssign[typeId] ?? null;
+    const snd = asg ? sfxLib.find((s) => s.id === asg.id) ?? null : null;
+    const frame = (now: number) => {
+      if (pvRunRef.current.id !== typeId) return; // stopped
+      if (t0 === null) t0 = now;
+      const t = (now - t0) / 1000;
+      const cyc = Math.floor(t / cycle);
+      const tc = t % cycle;
+      // Sound fires exactly when the transition starts, each cycle —
+      // the slice + volume the render will bake in.
+      if (tc >= HOLD && tc < HOLD + T && cyc !== lastCycle && snd) {
+        lastCycle = cyc;
+        const win = sfxWindowFor(typeId, snd.dur);
+        const maxi = Math.max(0, snd.dur - win);
+        const st = Math.min(Math.max(0, asg?.start ?? 0), maxi);
+        playSlice(snd, { key: snd.id, start: st, dur: win, vol: asg?.vol ?? 100 });
+      }
+      paint(Math.min(1, Math.max(0, (tc - HOLD) / T)));
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+  };
+  const toggleTransitionPreview = (typeId: string) => {
+    if (pvRunRef.current.id === typeId) stopTransitionPreview();
+    else startTransitionPreview(typeId);
   };
 
   const removeImage = (index: number) => {
@@ -548,6 +1051,16 @@ export default function App() {
           const parsed = await safeParseResponse(res);
           if (!parsed.ok) {
             throw new Error(parsed.error || `Batch upload failed with status ${res.status}`);
+          }
+          // Trust nothing: a 200 only means the request completed. Confirm the
+          // server actually stored EVERY file in this chunk (it reports
+          // per-file failures instead of failing the whole batch).
+          const saved = parsed.data?.count;
+          if (typeof saved === "number" && saved !== chunk.length) {
+            const why = Array.isArray(parsed.data?.failed) && parsed.data.failed.length
+              ? parsed.data.failed.join("; ")
+              : "server reported no detail";
+            throw new Error(`Only ${saved}/${chunk.length} images were saved — ${why}`);
           }
           break;
         } catch (err: any) {
@@ -614,6 +1127,10 @@ export default function App() {
               const audioParsed = await safeParseResponse(audioRes);
               if (!audioParsed.ok) {
                 throw new Error(audioParsed.error || `Failed to upload audio file ${i + 1}`);
+              }
+              const savedAudio = audioParsed.data?.count;
+              if (typeof savedAudio === "number" && savedAudio < 1) {
+                throw new Error(`Audio track ${i + 1} was not saved on the server`);
               }
               break;
             } catch (err: any) {
@@ -721,7 +1238,16 @@ export default function App() {
           transitions: effTransitions,
           transitionDurations: effTransDurs,
           transitionDuration: categoryDurations["fade"] || 0.5,
-          motion: { enabled: motionOn, style: motionStyle, seed: motionSeed },
+          motion: { enabled: motionOn, style: motionStyle, seed: motionSeed, introSeconds: motionIntroSec, tail: motionTail },
+          // Per-cut SFX: resolved here (inherit type assignment -> cut override)
+          // so the server only sees final { join, sound, volume, window } entries.
+          sfx: {
+            cuts: effTransitions.flatMap((t, i) => {
+              const eff = cutSfxEff(i, t);
+              if (!eff) return [];
+              return [{ i, sfx: eff.id, vol: Math.max(0.01, eff.vol / 100), start: eff.start }];
+            }),
+          },
           // Slide structure (omitted when legacy: server then runs the
           // byte-identical per-image timeline).
           slides: structActive && structSlides
@@ -844,10 +1370,41 @@ export default function App() {
 
   /* ── derived display values (design only) ─────────────────────── */
   const totalSeconds = displayDurations.reduce((a, b) => a + b, 0);
+  // Motion phase-1 span as a share of the runtime (coverage bar width).
+  const motionCoversAll = introEnd >= unitCount && unitCount > 0;
+  const motionIntroPct = totalSeconds > 0
+    ? Math.max(0, Math.min(100, (motionTailStart / totalSeconds) * 100))
+    : 100;
   const totalLabel = `${pad2(totalSeconds / 60)}:${(totalSeconds % 60).toFixed(1).padStart(4, "0")}`;
+  const fmtSec = (v: number) => (v >= 100 ? String(Math.round(v)) : v.toFixed(1));
+  const motionPresetLine = !motionOn ? "Off"
+    : motionCoversAll ? "Full mix — whole timeline"
+    : motionTail === "pan"
+      ? `0–${fmtSec(motionTailStart)}s mix · ${fmtSec(motionTailStart)}s → pans`
+      : `0–${fmtSec(motionTailStart)}s mix · static tail`;
+  // Phase ribbon: one marker per join, positioned by cumulative unit time.
+  // Director stat chips: how many shots move in each phase.
+  const introMoves = badgePlan.slice(0, Math.min(introEnd, badgePlan.length)).filter(Boolean).length;
+  const tailMoves = badgePlan.slice(Math.min(introEnd, badgePlan.length)).filter(Boolean).length;
   const liveTransitions = effTransitions.filter(t => t !== "none").length;
   const cutIndices = effTransitions.length > 0 ? effTransitions.map((_, i) => i) : [];
   const visibleCuts = showAllCuts ? cutIndices : cutIndices.slice(0, 6);
+  // Phase ribbon: one marker per join, positioned by cumulative unit time.
+  // Color: accent = a live transition rides the cut; dashed-tail = tail cut.
+  const ribbonTicks = useMemo(() => {
+    const durs = unitDurs.length ? unitDurs : displayDurations;
+    let acc = 0;
+    return cutIndices.map((idx) => {
+      acc += Number(durs[idx]) || 0;
+      const trans = effTransitions[idx] || "none";
+      return {
+        pct: totalSeconds > 0 ? Math.max(0, Math.min(100, (acc / totalSeconds) * 100)) : 0,
+        live: trans !== "none",
+        tail: motionOn && idx >= introEnd,
+        label: `Cut #${idx + 1} · ${trans !== "none" ? `${trans} ${categoryDurations[trans] || 0.5}s` : "hard cut"}`,
+      };
+    });
+  }, [unitDurs, displayDurations, cutIndices, effTransitions, totalSeconds, motionOn, introEnd, categoryDurations]);
   const currentVideoUrl =
     videoUrls.length > 0 ? videoUrls[Math.min(activeVideo, videoUrls.length - 1)] : "";
   const hasVideo = !!currentVideoUrl;
@@ -1154,7 +1711,7 @@ export default function App() {
                     </button>
                   </div>
                   <div className="strip-foot">
-                    <span>RENAME FILES TO REORDER · DURATIONS COME FROM YOUR SCRIPT</span>
+                    <span>PICK ORDER = TIMELINE ORDER · FILENAMES NEVER REORDER · DURATIONS COME FROM YOUR SCRIPT</span>
                     <span>Σ {totalSeconds.toFixed(1)}S · {transitions.length} CUTS</span>
                   </div>
                 </>
@@ -1269,14 +1826,282 @@ export default function App() {
           <span className="eyebrow">Step 03 — Motion</span>
           <h1 className="h-display">Direct every <em>cut</em></h1>
           <p className="lede">
-            Pick a transition once and push it across the whole sequence, or tune a single cut.
-            Every transition lands exactly on its cut — half from the outgoing frame, half from
-            the incoming — and your runtime never changes.
+            Open strong, hold steady. The first stretch carries a full random Ken Burns mix;
+            the rest of the timeline glides on subtle alternating pans — or stays static.
+            Every transition lands exactly on its cut, and your runtime never changes.
           </p>
+          {unitCount > 0 && (
+            <div className="hero-meta mono">
+              <span className="hm-dot" />
+              <span>{unitCount} SHOT{unitCount === 1 ? "" : "S"}</span>
+              <span className="hm-sep">/</span>
+              <span>{fmtSec(totalSeconds)}S</span>
+              <span className="hm-sep">/</span>
+              <span>OPENING {motionCoversAll ? "FULL" : `${fmtSec(motionTailStart)}S`}</span>
+              <span className="hm-sep">/</span>
+              <span>TAIL {motionOn ? (motionTail === "pan" ? "PANS" : "STATIC") : "OFF"}</span>
+            </div>
+          )}
         </div>
 
         <div className="motion-grid">
           <div className="motion-main">
+
+            {/* ═══ MOTION DIRECTOR — the two phases, live ═══ */}
+            <section className="panel director">
+              <div className="dir-head">
+                <div className="dir-head-l">
+                  <span className="eyebrow">Pro camera · Ken Burns</span>
+                  <h2 className="dir-title">Direct the motion</h2>
+                </div>
+                <div className="mode-grid dir-switch">
+                  <button type="button" className={`mode ${motionOn ? "on" : ""}`} disabled={loading} onClick={() => setMotionOn(true)}><b>On</b></button>
+                  <button type="button" className={`mode ${!motionOn ? "on" : ""}`} disabled={loading} onClick={() => setMotionOn(false)}><b>Off</b></button>
+                </div>
+              </div>
+
+              <div className="dir-grid">
+                {/* ── PHASE 1 · OPENING ── */}
+                <div className={`ph-card ${motionOn ? "on" : "off"}`}>
+                  <div className="ph-head">
+                    <span className="ph-tag">PHASE 1 · OPENING</span>
+                    <span className="ph-range">
+                      {motionOn ? (motionCoversAll ? "0s → END" : `0s → ${fmtSec(motionTailStart)}s`) : "—"}
+                    </span>
+                  </div>
+
+                  <div
+                    className="ph-stage ph-anim-zoom"
+                    style={{ "--ph-z1": motionStyle === "subtle" ? 1.07 : motionStyle === "dynamic" ? 1.2 : 1.14 } as React.CSSProperties}
+                  >
+                    {imageUrls[0] && <img src={imageUrls[0]} alt="" />}
+                    {motionOn && <span className="ph-live"><span className="pulse" />LIVE</span>}
+                    <span className="ph-stage-cap mono">
+                      {motionStyle === "subtle" ? "6–9% BREATH" : motionStyle === "dynamic" ? "11–18% BREATH" : "8–15% BREATH"}
+                    </span>
+                  </div>
+
+                  <div className="ph-title">
+                    <b>Opening mix</b>
+                    <i>a seeded move on every shot</i>
+                  </div>
+
+                  <div className="ph-ctrls">
+                    <div className="tr-dur">
+                      <span>Style</span>
+                      <CustomSelect
+                        value={motionStyle}
+                        onChange={(val: any) => setMotionStyle(val)}
+                        options={[
+                          { value: "subtle", label: "Subtle" },
+                          { value: "mixed", label: "Mixed" },
+                          { value: "dynamic", label: "Dynamic" },
+                        ]}
+                        className="w-32"
+                      />
+                    </div>
+                    <div className="tr-dur">
+                      <span>Runs for</span>
+                      <CustomSelect
+                        value={motionIntroSec}
+                        onChange={(val: any) => setMotionIntroSec(Number(val))}
+                        options={[
+                          { value: 15, label: "15 seconds" },
+                          { value: 30, label: "30 seconds" },
+                          { value: 60, label: "60 seconds" },
+                          { value: 90, label: "90 seconds" },
+                          { value: 120, label: "2 minutes" },
+                          { value: 180, label: "3 minutes" },
+                          { value: 999999, label: "Whole video" },
+                        ]}
+                        className="w-32"
+                        dropdownUp
+                      />
+                    </div>
+                    <div className="tr-foot">
+                      <span className="ph-seed">SEED #{motionSeed}</span>
+                      <button
+                        type="button"
+                        className="mini-btn"
+                        disabled={loading}
+                        onClick={() => setMotionSeed(Math.floor(Math.random() * 1_000_000_000))}
+                      >
+                        ⟳ Remix
+                      </button>
+                    </div>
+                    <div className="ph-pool">
+                      <span>PUSH</span><span>PULL</span><span>PAN ←</span><span>PAN →</span><span>DRIFT</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* ── PHASE 2 · THE REST ── */}
+                <div className={`ph-card ${motionOn ? "on" : "off"}`}>
+                  <div className="ph-head">
+                    <span className="ph-tag">PHASE 2 · THE REST</span>
+                    <span className="ph-range">
+                      {motionOn ? (motionCoversAll ? "COVERED BY PHASE 1" : `${fmtSec(motionTailStart)}s → END`) : "—"}
+                    </span>
+                  </div>
+
+                  <div className={`ph-stage ${motionTail === "pan" ? "ph-anim-pan" : "ph-anim-none"}`}>
+                    {imageUrls[0] && <img src={imageUrls[0]} alt="" />}
+                    {motionOn && <span className="ph-live"><span className="pulse" />LIVE</span>}
+                    <span className="ph-stage-cap mono">
+                      {motionTail === "pan" ? "ALT PANS · ~0.55PX/FRAME" : "STATIC FRAMES"}
+                    </span>
+                  </div>
+
+                  <div className="ph-title">
+                    <b>The rest</b>
+                    <i>{motionTail === "pan" ? "left / right glide, alternating" : "straight cuts, full speed"}</i>
+                  </div>
+
+                  <div className="ph-ctrls">
+                    <div className="ph-modes">
+                      <button
+                        type="button"
+                        className={`mode ${motionOn && motionTail === "pan" ? "on" : ""}`}
+                        disabled={loading || !motionOn}
+                        onClick={() => { if (!loading) setMotionTail("pan"); }}
+                      >
+                        <MoveLeft className="ic ic-14" /><b>Subtle pans</b><MoveRight className="ic ic-14" />
+                      </button>
+                      <button
+                        type="button"
+                        className={`mode ${motionOn && motionTail === "none" ? "on" : ""}`}
+                        disabled={loading || !motionOn}
+                        onClick={() => { if (!loading) setMotionTail("none"); }}
+                      >
+                        <Scissors className="ic ic-14" /><b>Static cuts</b>
+                      </button>
+                    </div>
+                    <p className="panel-note">
+                      {motionTail === "pan"
+                        ? "A calm glide keeps the tail alive — pans alternate shot by shot; joins still cut hard for speed."
+                        : "Everything after the opening renders as straight cuts on the fastest path."}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="dir-stats">
+                {unitCount > 0 ? (
+                  <>
+                    <span className="stat-chip"><b>{unitCount}</b> SHOTS</span>
+                    <span className="stat-chip"><b>{fmtSec(totalSeconds)}s</b> RUNTIME</span>
+                    <span className="stat-chip acc"><b>{introMoves}</b> OPENING MOVES</span>
+                    <span className="stat-chip acc">
+                      {motionOn
+                        ? motionCoversAll
+                          ? "MIX COVERS ALL"
+                          : motionTail === "pan" ? <><b>{tailMoves}</b> TAIL PANS</> : "STATIC TAIL"
+                        : "MOTION OFF"}
+                    </span>
+                  </>
+                ) : (
+                  <span className="stat-chip">UPLOAD IMAGES TO DIRECT THE CAMERA</span>
+                )}
+              </div>
+            </section>
+
+            {/* ═══ PHASE RIBBON — the whole timeline's rhythm map ═══ */}
+            {unitCount > 0 && (
+              <section className="panel ribbon-panel">
+                <div className="panel-head">
+                  <span className="panel-title">Phase ribbon</span>
+                  <span className="count mono">
+                    {cutIndices.length} CUTS · {ribbonTicks.filter(t => t.live).length} TRANSITIONS
+                  </span>
+                </div>
+                <div className="ribbon">
+                  <div className="ribbon-ticks">
+                    {ribbonTicks.map((t, i) => (
+                      <span
+                        key={i}
+                        className={`ribbon-tick ${t.live ? "live" : ""} ${t.tail ? "tail" : ""}`}
+                        style={{ left: `${t.pct}%` }}
+                        title={t.label}
+                      />
+                    ))}
+                    {motionOn && !motionCoversAll && (
+                      <span
+                        className="ribbon-cursor"
+                        style={{ left: `${motionIntroPct}%` }}
+                        title={`Phase 1 hands over at ${fmtSec(motionTailStart)}s`}
+                      />
+                    )}
+                  </div>
+                  <div className="ribbon-track">
+                    {motionOn ? (
+                      <>
+                        <span className="seg-open" style={{ width: `${motionIntroPct}%` }} />
+                        <span className={`seg-tail ${motionTail === "pan" ? "pans" : "flat"}`} style={{ width: `${100 - motionIntroPct}%` }} />
+                      </>
+                    ) : (
+                      <span className="seg-open muted" style={{ width: "100%" }} />
+                    )}
+                  </div>
+                  <div className="ribbon-lab mono">
+                    <span>0s</span>
+                    <span>
+                      {motionOn
+                        ? motionCoversAll
+                          ? "FULL MIX — WHOLE TIMELINE"
+                          : motionTail === "pan"
+                            ? `PANS GLIDE ${fmtSec(motionTailStart)}s ONWARD`
+                            : `STRAIGHT CUTS ${fmtSec(motionTailStart)}s ONWARD`
+                        : "CAMERA STATIC — HARD CUTS ONLY"}
+                    </span>
+                    <span>{fmtSec(totalSeconds)}s</span>
+                  </div>
+                </div>
+              </section>
+            )}
+
+            <div className="lib-head">
+              <span className="eyebrow">Transition library</span>
+              <span className="lib-note mono">APPLIES PER JOIN · CENTERED ON EVERY CUT</span>
+            </div>
+
+            <section className="panel sfx-rack">
+              <div className="panel-head">
+                <span className="panel-title">Sound rack · transition sfx</span>
+                <span className="count mono">{sfxLib.length} SOUND{sfxLib.length === 1 ? "" : "S"} · STORED IN PROJECT</span>
+                <span className="head-actions">
+                  <button type="button" className="mini-btn" onClick={() => sfxInputRef.current?.click()} title="Import sounds once — they stay in the project for every future video">+ Import sounds</button>
+                  <button type="button" className="mini-btn" onClick={handleSeedSfx} title="Synthesize a palette of 7 starter sounds">⚡ Starter pack</button>
+                </span>
+              </div>
+              {sfxMsg && <div className="sfx-msg mono">{sfxMsg}</div>}
+              {sfxLib.length > 0 ? (
+                <div className="rack-row">
+                  {sfxLib.map((s) => (
+                    <div key={s.id} className={`rack-chip ${sfxPlaying === s.id ? "playing" : ""}`}>
+                      <button type="button" className="rack-play" onClick={() => previewSfx(s.id)} title={sfxPlaying === s.id ? "Stop" : "Preview"}>
+                        {sfxPlaying === s.id ? "■" : "▶"}
+                      </button>
+                      <div className="rack-meta">
+                        <b>{s.name}</b>
+                        <span className="rack-wave" aria-hidden>
+                          {waveBarsFor(s.id).map((h, i) => (
+                            <i key={i} style={{ height: `${Math.round(h * 100)}%` }} />
+                          ))}
+                        </span>
+                      </div>
+                      <span className="rack-dur mono">{s.dur.toFixed(2)}s</span>
+                      <button type="button" className="rack-x" onClick={() => deleteSfx(s.id)} title="Remove from library">✕</button>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="rack-empty">
+                  <span>No sounds yet — import your whooshes once and they stay in the project forever, ready for every render.</span>
+                </div>
+              )}
+              <input ref={sfxInputRef} type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac" multiple hidden onChange={handleSfxFiles} />
+            </section>
+
             <div
               className={`tr-cards ${loading ? "veil" : ""}`}
               ref={trCardsRef}
@@ -1290,8 +2115,10 @@ export default function App() {
 
                 return (
                   <div key={item.id} className={`tr-card ${isTop ? "on" : ""}`}>
-                    <div className={`tr-preview ${pvClassFor(item.id)}`}>
-                      {imageUrls.length >= 2 ? (
+                    <div className={`tr-preview ${pvClassFor(item.id)} ${pvPlaying === item.id ? "live" : ""}`}>
+                      {pvPlaying === item.id ? (
+                        <canvas className="pv-live" ref={pvCanvasRef} />
+                      ) : imageUrls.length >= 2 ? (
                         <div
                           className="pv-stage"
                           style={{ "--pv-dur": `${item.id === "none" ? 1.8 : Math.max(0.3, dur) / 0.35}s` } as React.CSSProperties}
@@ -1309,6 +2136,27 @@ export default function App() {
                           {item.id === "slidedown" && <span className="pv-arrow">↓</span>}
                           <span className="pv-lab">{pvLabelFor(item.id)}</span>
                         </>
+                      )}
+                      <button
+                        type="button"
+                        className={`pv-run ${pvPlaying === item.id ? "stop" : ""}`}
+                        disabled={pvPlaying !== null && pvPlaying !== item.id}
+                        onClick={() => toggleTransitionPreview(item.id)}
+                        title={
+                          pvPlaying === item.id
+                            ? "Stop preview"
+                            : imageUrls.length >= 2
+                              ? `Real preview: your first two images, the ${item.name} transition + your SFX`
+                              : "Upload at least 2 images to preview with your footage"
+                        }
+                      >
+                        {pvPlaying === item.id ? "■ STOP" : "▶ PREVIEW"}
+                      </button>
+                      {pvPlaying === item.id && (
+                        <span className="pv-run-cap mono">
+                          REAL PREVIEW · {item.name.toUpperCase()}{item.id !== "none" ? ` ${dur}s` : ""}
+                          {sfxAssign[item.id] ? ` · SFX ${sfxAssign[item.id]!.vol}%` : " · NO SFX"}
+                        </span>
                       )}
                     </div>
                     <div className="tr-head">
@@ -1351,6 +2199,84 @@ export default function App() {
                         {loading ? "Rendering…" : "Apply to all"}
                       </button>
                     </div>
+                    <div className="card-sfx">
+                      <span className="cs-label mono">SFX</span>
+                      <CustomSelect
+                        value={sfxAssign[item.id]?.id ?? ""}
+                        onChange={(val: any) => setSfxForType(item.id, val ? { id: String(val), vol: sfxAssign[item.id]?.vol ?? 100, start: sfxAssign[item.id]?.start ?? 0 } : null)}
+                        options={[
+                          { value: "", label: "None" },
+                          ...sfxLib.map((s) => ({ value: s.id, label: `${s.name} · ${s.dur.toFixed(1)}s` })),
+                        ]}
+                        className="cs-select"
+                        dropdownUp
+                      />
+                      {(() => {
+                        const asg = sfxAssign[item.id] ?? null;
+                        if (!asg) return null;
+                        const snd = sfxLib.find((s) => s.id === asg.id);
+                        if (!snd) return null;
+                        const win = sfxWindowFor(item.id, snd.dur);
+                        const maxi = Math.max(0, snd.dur - win);
+                        const st = Math.min(Math.max(0, asg.start), maxi);
+                        return (
+                          <>
+                            <button
+                              type="button"
+                              className={`mini-play ${sfxPlaying === asg.id ? "on" : ""}`}
+                              onClick={() => previewSfx(asg.id, { start: st, dur: win, vol: asg.vol })}
+                              title={sfxPlaying === asg.id ? "Stop" : `Preview slice ${st.toFixed(2)}s–${(st + win).toFixed(2)}s at ${asg.vol}%`}
+                            >
+                              {sfxPlaying === asg.id ? "■" : "▶"}
+                            </button>
+                            <input
+                              type="range"
+                              className="cs-vol"
+                              min={0}
+                              max={200}
+                              step={5}
+                              value={asg.vol}
+                              onChange={(e) => setSfxForType(item.id, { id: asg.id, vol: Number(e.target.value), start: asg.start })}
+                              title={`Sound volume: ${asg.vol}% — preview plays exactly this`}
+                            />
+                            <span className="cs-pct mono">{asg.vol}%</span>
+                          </>
+                        );
+                      })()}
+                    </div>
+                    {(() => {
+                      // Segment editor: drag WHICH part of the sound plays
+                      // inside this transition's window. The drawn canvas is
+                      // the sound's real waveform (decoded once per sound);
+                      // the window's WIDTH is the transition's seconds.
+                      const asg = sfxAssign[item.id] ?? null;
+                      if (!asg) return null;
+                      const snd = sfxLib.find((s) => s.id === asg.id);
+                      if (!snd) return null;
+                      const win = sfxWindowFor(item.id, snd.dur);
+                      const maxi = Math.max(0, snd.dur - win);
+                      const st = Math.min(Math.max(0, asg.start), maxi);
+                      const isFull = maxi <= 0.01;
+                      return (
+                        <div className="sfx-ed">
+                          <div className="sfx-ed-head mono">
+                            <span>{item.id === "none" ? "FULL SOUND ON EVERY CUT" : "SLIDE THE WINDOW TO PICK THE PART"}</span>
+                            <span className={isFull ? "" : "acc-t"}>{st.toFixed(2)}s → {(st + win).toFixed(2)}s</span>
+                          </div>
+                          <canvas
+                            className={`sfx-wave ${isFull ? "" : "draggable"}`}
+                            ref={(el) => { sfxWaveRefs.current[item.id] = el; }}
+                            onPointerDown={isFull ? undefined : (e) => handleWaveDrag(e, item.id)}
+                            title={isFull ? "The whole sound is used" : "Drag to move the used window inside the sound"}
+                          />
+                          {!isFull && (
+                            <div className="sfx-ed-note">
+                              Window = {win.toFixed(2)}s ({item.id === "none" ? "transition" : `${categoryDurations[item.id] || 0.5}s transition`} · sound {snd.dur.toFixed(2)}s) — the render trims exactly this part, centered on the cut.
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
                   </div>
                 );
               })}
@@ -1462,6 +2388,9 @@ export default function App() {
                 <span className="panel-title">Cut map</span>
                 <span className="count mono">{cutIndices.length} CUTS · {liveTransitions} LIVE</span>
                 <span className="head-actions">
+                  {Object.keys(cutSfxOv).length > 0 && (
+                    <button type="button" className="mini-btn" onClick={() => setCutSfxOv({})} title="Restore every cut to its transition's default sound + volume">Reset sfx tweaks</button>
+                  )}
                   {liveTransitions > 0 && (
                     <button type="button" className="mini-btn danger" onClick={handleResetTransitions}>Reset all</button>
                   )}
@@ -1477,6 +2406,7 @@ export default function App() {
                       const thisDur = categoryDurations[trans] || 0.5;
                       const moveBadge = motionBadge(badgePlan[idx]);
                       const tailCut = motionOn && idx >= introEnd;
+                      const tailChip = motionTail === "pan" ? "PAN TAIL · CUTS" : "CUT-ONLY TAIL";
                       // Slide joins read the boundary images; legacy reads raw names.
                       const fromSlide = structActive && structSlides ? structSlides[idx] : null;
                       const toSlide = structActive && structSlides ? structSlides[idx + 1] : null;
@@ -1513,9 +2443,15 @@ export default function App() {
                           {tailCut ? (
                             <span
                               className="cut-locked"
-                              title={transitions[idx] && transitions[idx] !== "none" ? `Stored: ${transitions[idx]} (restored when motion is off)` : "Intro-only motion: this join always renders as a hard cut"}
+                              title={
+                                transitions[idx] && transitions[idx] !== "none"
+                                  ? `Stored: ${transitions[idx]} (restored when motion is off)`
+                                  : motionTail === "pan"
+                                    ? "Rest of timeline: subtle pans glide in, joins stay hard cuts (fast path)"
+                                    : "Intro-only motion: this join always renders as a hard cut"
+                              }
                             >
-                              CUT-ONLY TAIL
+                              {tailChip}
                             </span>
                           ) : (
                           <CustomSelect
@@ -1535,6 +2471,50 @@ export default function App() {
                             dropdownUp={idx > cutIndices.length - 3}
                           />
                           )}
+                          {(() => {
+                            const ov = cutSfxOv[idx];
+                            if (ov?.off) {
+                              return (sfxAssign[trans]?.id || ov.id) ? (
+                                <button
+                                  type="button"
+                                  className="cut-sfx-muted"
+                                  title="Sound silenced for this cut — click to restore"
+                                  onClick={() => patchCutSfx(idx, { off: false })}
+                                >♪ muted</button>
+                              ) : null;
+                            }
+                            const eff = cutSfxEff(idx, trans);
+                            if (!eff) return null;
+                            const cid = eff.id;
+                            return (
+                              <span className="cut-sfx" title="Sound effect bound to this cut — plays the window chosen on its transition card, centered on the cut point">
+                                <button
+                                  type="button"
+                                  className={`mini-play sm ${sfxPlaying === cid ? "on" : ""}`}
+                                  onClick={() => previewSfx(cid, { start: eff.start, dur: eff.win, vol: eff.vol })}
+                                  title={`Preview what this cut plays: ${eff.start.toFixed(2)}s–${(eff.start + eff.win).toFixed(2)}s at ${eff.vol}%`}
+                                >
+                                  {sfxPlaying === cid ? "■" : "▶"}
+                                </button>
+                                <input
+                                  type="range"
+                                  className="cs-vol xs"
+                                  min={0}
+                                  max={200}
+                                  step={5}
+                                  value={eff.vol}
+                                  onChange={(e) => patchCutSfx(idx, { vol: Number(e.target.value) })}
+                                />
+                                <span className="cs-pct xs mono">{eff.vol}%</span>
+                                <button
+                                  type="button"
+                                  className="mini-play sm mute"
+                                  title="Silence this cut only"
+                                  onClick={() => patchCutSfx(idx, { off: true })}
+                                >✕</button>
+                              </span>
+                            );
+                          })()}
                         </div>
                       );
                     })}
@@ -1561,69 +2541,13 @@ export default function App() {
           </div>
 
           <aside className="motion-aside">
-            <div className={`panel cam-card ${motionOn ? "" : "off"}`}>
-              <div className="panel-head">
-                <span className="panel-title">Camera motion</span>
-                <span className={`chip ${motionOn ? "acc" : ""}`}>{motionOn ? "ON" : "OFF"}</span>
-              </div>
-
-              <div className="mode-grid cam-switch">
-                <button
-                  type="button"
-                  className={`mode ${motionOn ? "on" : ""}`}
-                  disabled={loading}
-                  onClick={() => setMotionOn(true)}
-                >
-                  <b>On</b>
-                </button>
-                <button
-                  type="button"
-                  className={`mode ${!motionOn ? "on" : ""}`}
-                  disabled={loading}
-                  onClick={() => setMotionOn(false)}
-                >
-                  <b>Off</b>
-                </button>
-              </div>
-
-              <div className="tr-dur">
-                <span>Style</span>
-                <CustomSelect
-                  value={motionStyle}
-                  onChange={(val: any) => setMotionStyle(val)}
-                  options={[
-                    { value: "subtle", label: "Subtle" },
-                    { value: "mixed", label: "Mixed" },
-                    { value: "dynamic", label: "Dynamic" },
-                  ]}
-                  className="w-32"
-                />
-              </div>
-
-              <div className="tr-foot">
-                <span className="cam-seed">SEED #{motionSeed}</span>
-                <button
-                  type="button"
-                  className="mini-btn"
-                  disabled={loading}
-                  onClick={() => setMotionSeed(Math.floor(Math.random() * 1_000_000_000))}
-                >
-                  ⟳ Remix
-                </button>
-              </div>
-
-              <p className="panel-note">
-                Intro-only motion: shots starting in the first {MOTION_INTRO_SECONDS}s move in randomized mix — push, pull, drift on every shot. The rest render as straight cuts on the fast path.
-              </p>
-            </div>
-
             <div className="panel">
-              <div className="panel-head"><span className="panel-title">Active preset</span></div>
+              <div className="panel-head"><span className="panel-title">Render plan</span></div>
               <div className="kv-list">
+                <div className="kv"><i>Motion</i><b className="acc-t">{motionPresetLine}</b></div>
                 <div className="kv"><i>Global</i><b className="acc-t">{transitionName(globalTransition)}</b></div>
                 <div className="kv"><i>Cuts configured</i><b>{transitions.length}</b></div>
                 <div className="kv"><i>Live transitions</i><b>{liveTransitions}</b></div>
-                <div className="kv"><i>Runtime impact</i><b className="ok-t">0.0s</b></div>
               </div>
               <p className="panel-note">
                 Motion eats into the slides, never past them — totals always match your timestamps.
@@ -1650,7 +2574,7 @@ export default function App() {
 
             <div className="panel tip-panel">
               <span className="eyebrow">Signature move</span>
-              <p><b>Fade</b> carries the story, <b>slides</b> mark the beat changes. One directional slide per chapter keeps motion from feeling random.</p>
+              <p><b>Open on full mix, land on glide.</b> The ribbon shows exactly where the camera hands over — <b>fades</b> carry the story, <b>slides</b> mark the beat changes.</p>
             </div>
           </aside>
         </div>
