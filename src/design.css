@@ -1883,3 +1883,559 @@ button.audio-row:hover { transform: translateY(-2px); }
   pointer-events: none;
 }
 .tr-preview.live { border-color: var(--ok-line); }
+
+/* ---- Motion page: two-page switcher (camera plan ↔ cuts & sound) ---- */
+.m-tabbar {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin: 18px 0 22px;
+  animation: rise 0.5s 0.02s cubic-bezier(0.22, 0.8, 0.3, 1) both;
+}
+.m-tab {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  text-align: left;
+  padding: 13px 16px;
+  border: 1px solid var(--line-2);
+  border-radius: 12px;
+  background: var(--panel);
+  cursor: pointer;
+  overflow: hidden;
+  transition: border-color 0.16s, background 0.16s, transform 0.16s;
+}
+.m-tab:hover { border-color: var(--ok-line); transform: translateY(-1px); }
+.m-tab.on {
+  border-color: var(--ok-line);
+  background: linear-gradient(120deg, var(--ok-soft), var(--panel) 55%);
+  box-shadow: inset 0 0 0 1px var(--ok-line);
+}
+.m-tab-ic { width: 19px; height: 19px; color: var(--ink-3); flex: none; }
+.m-tab.on .m-tab-ic { color: var(--ok); }
+.mt-txt { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.mt-txt b { font-size: 14.5px; letter-spacing: 0.01em; color: var(--ink-1); }
+.mt-txt i { font-style: normal; font-size: 10.5px; letter-spacing: 0.06em; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mt-count {
+  flex: none;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  color: var(--ink-3);
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  padding: 5px 8px;
+  white-space: nowrap;
+}
+.m-tab.on .mt-count { color: var(--ok); border-color: var(--ok-line); }
+
+/* Cuts page runs full width — no aside. */
+.motion-grid.mode-cuts { grid-template-columns: minmax(0, 1fr); }
+
+@media (max-width: 720px) {
+  .m-tabbar { grid-template-columns: 1fr; }
+}
+
+/* ---- Cut console: creative header for the cuts & sound page ---- */
+.cut-console {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+  border-left: 3px solid var(--ok-line);
+}
+.console-l { flex: 1 1 260px; min-width: 0; }
+.console-title { margin: 2px 0 6px; font-size: 19px; letter-spacing: 0.01em; color: var(--ink-1); }
+.console-note { margin: 0; font-size: 11.5px; line-height: 1.6; color: var(--ink-3); }
+.console-note b { color: var(--ink-2); }
+.console-meta { display: flex; gap: 8px; flex-wrap: wrap; }
+.cm-chip {
+  font-size: 9px;
+  letter-spacing: 0.11em;
+  color: var(--ink-3);
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  padding: 5px 10px;
+  white-space: nowrap;
+}
+.cm-chip.accent { color: var(--ok); border-color: var(--ok-line); }
+
+/* 🎲 The randomize button — the one big gamble control */
+.rnd-btn {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  text-align: left;
+  padding: 12px 18px;
+  border-radius: 13px;
+  border: 1px solid var(--ok-line);
+  background:
+    linear-gradient(135deg, rgba(52, 211, 153, 0.13), rgba(52, 211, 153, 0.02) 55%),
+    var(--panel);
+  cursor: pointer;
+  overflow: hidden;
+  transition: transform 0.18s cubic-bezier(0.22, 0.8, 0.3, 1), border-color 0.18s, background 0.18s;
+}
+.rnd-btn:hover:not(:disabled) { transform: translateY(-2px) rotate(-0.4deg); border-color: var(--ok); }
+.rnd-btn:active:not(:disabled) { transform: translateY(0) scale(0.985); }
+.rnd-btn:disabled { opacity: 0.4; cursor: default; }
+.rnd-face { font-size: 22px; line-height: 1; filter: drop-shadow(0 2px 6px rgba(52, 211, 153, 0.35)); transition: transform 0.35s cubic-bezier(0.22, 0.8, 0.3, 1); }
+.rnd-btn:hover:not(:disabled) .rnd-face { transform: rotate(-14deg) scale(1.14); }
+.rnd-txt { display: flex; flex-direction: column; gap: 2px; }
+.rnd-txt b { font-size: 13.5px; letter-spacing: 0.02em; color: var(--ok); font-weight: 700; }
+.rnd-txt i { font-style: normal; font-size: 10px; letter-spacing: 0.05em; color: var(--ink-3); }
+/* One-shot celebratory pulse when clicked (class added by :active — pure CSS) */
+.rnd-btn:active .rnd-face { animation: rndShake 0.4s cubic-bezier(0.22, 0.8, 0.3, 1); }
+@keyframes rndShake {
+  0% { transform: rotate(0) scale(1); }
+  30% { transform: rotate(-18deg) scale(1.25); }
+  60% { transform: rotate(14deg) scale(1.1); }
+  100% { transform: rotate(0) scale(1); }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   MOTION PAGE — TOTAL REDESIGN · scoped to .motion-shell
+   A "control deck" language: ruled section heads with a numbered
+   ladder (01…04), one power switch + an A/B/C/D control deck,
+   numbered phase cards, family-colored transition cards, stateful
+   cut rows. Everything else in the app keeps its original styles.
+   ═════════════════════════════════════════════════════════════════ */
+
+/* ── Hero: tighter, punchier ── */
+.motion-shell .page-hero { margin-bottom: 14px; }
+.motion-shell .h-display { font-size: clamp(30px, 4.4vw, 44px); }
+.motion-shell .h-display em {
+  font-style: italic;
+  background: linear-gradient(120deg, var(--acc-2), var(--acc));
+  -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent; color: transparent;
+}
+.motion-shell .lede { max-width: 800px; }
+.motion-shell .lede b { color: var(--ink); }
+
+/* ── Numbered ladder chips + ruled panel heads ── */
+.sec-no {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 22px; height: 17px; padding: 0 5px;
+  font-size: 8.5px; font-weight: 700; letter-spacing: 0.1em;
+  color: var(--acc); background: var(--acc-soft);
+  border: 1px solid var(--acc-line); border-radius: 5px;
+  vertical-align: middle; margin-right: 7px; line-height: 1;
+}
+.motion-shell .panel {
+  background: linear-gradient(180deg, #101015, #0c0c10);
+  border-color: var(--line);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 18px 40px -34px rgba(0, 0, 0, 0.9);
+}
+.motion-shell .panel-head {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 9px; margin-bottom: 13px;
+}
+.motion-shell .panel-title { font-size: 13.5px; }
+
+/* ── Two-page dock: segmented, sunken, glass-lit ── */
+.motion-shell .m-tabbar {
+  display: flex; gap: 6px; margin: 6px 0 20px;
+  background: #0a0a0e; border: 1px solid var(--line);
+  border-radius: 15px; padding: 6px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  grid-template-columns: none;
+}
+.motion-shell .m-tab {
+  flex: 1 1 0; gap: 12px;
+  border: 1px solid transparent; border-radius: 11px;
+  background: transparent; padding: 11px 14px;
+  transform: none;
+}
+.motion-shell .m-tab:hover { border-color: var(--line-2); background: rgba(255, 255, 255, 0.02); transform: none; }
+.motion-shell .m-tab.on {
+  border-color: var(--ok-line);
+  background: linear-gradient(135deg, rgba(52, 211, 153, 0.12), rgba(52, 211, 153, 0.02) 60%), var(--panel-2);
+  box-shadow: 0 8px 20px -12px rgba(52, 211, 153, 0.55);
+  transform: none;
+}
+.motion-shell .m-tab-ic {
+  width: 34px; height: 34px; padding: 8px;
+  border-radius: 10px; border: 1px solid var(--line-2);
+  background: var(--panel-3); color: var(--ink-3); flex: none;
+  transition: color 0.16s, border-color 0.16s, background 0.16s, box-shadow 0.16s;
+}
+.motion-shell .m-tab.on .m-tab-ic {
+  color: var(--ok); border-color: var(--ok-line);
+  background: rgba(52, 211, 153, 0.1);
+  box-shadow: 0 0 16px -5px rgba(52, 211, 153, 0.7);
+}
+.motion-shell .mt-txt b { font-size: 15px; }
+
+/* ── Power switch ── */
+.power {
+  display: flex; align-items: center; gap: 11px;
+  padding: 7px 14px 7px 9px;
+  border: 1px solid var(--line-2); border-radius: 999px;
+  background: var(--panel-2); cursor: pointer;
+  transition: border-color 0.18s, background 0.18s, box-shadow 0.18s;
+}
+.power:hover:not(:disabled) { border-color: var(--line-3); }
+.power:disabled { opacity: 0.5; cursor: default; }
+.power-track {
+  position: relative; width: 42px; height: 22px; flex: none;
+  border-radius: 999px; background: #1b1b23;
+  border: 1px solid var(--line-3);
+  transition: background 0.2s, border-color 0.2s;
+}
+.power-knob {
+  position: absolute; top: 2px; left: 2px;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: var(--ink-3);
+  transition: left 0.24s cubic-bezier(0.22, 0.8, 0.3, 1), background 0.2s, box-shadow 0.2s;
+}
+.power.on .power-track { background: rgba(52, 211, 153, 0.16); border-color: var(--ok-line); }
+.power.on .power-knob { left: 22px; background: var(--ok); box-shadow: 0 0 12px rgba(52, 211, 153, 0.8); }
+.power-label { font-size: 9.5px; font-weight: 700; letter-spacing: 0.16em; color: var(--ink-3); }
+.power.on .power-label { color: var(--ok); }
+
+/* ── Control deck: A/B/C/D cells, every director setting in one strip ── */
+.dir-deck {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px; margin-bottom: 16px;
+}
+.deck-cell {
+  position: relative; min-width: 0;
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 12px 13px 11px;
+  background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 12px;
+  transition: border-color 0.16s, transform 0.16s;
+}
+.deck-cell:hover { border-color: var(--line-3); transform: translateY(-1px); }
+.deck-no {
+  position: absolute; top: 9px; right: 10px;
+  font-size: 8.5px; font-weight: 700; letter-spacing: 0.1em;
+  color: var(--ink-3); border: 1px solid var(--line-2);
+  border-radius: 5px; padding: 2px 5px; line-height: 1;
+  transition: color 0.16s, border-color 0.16s;
+}
+.deck-cell:hover .deck-no { color: var(--acc); border-color: var(--acc-line); }
+.deck-label {
+  font-family: var(--font-mono); font-size: 8.5px; font-weight: 700;
+  letter-spacing: 0.18em; text-transform: uppercase; color: var(--ink-3);
+}
+.deck-hint { font-size: 9.5px; line-height: 1.45; color: var(--ink-3); margin-top: auto; }
+.deck-cell .w-32 { width: 100%; }
+.deck-seed { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.deck-seed-n { font-size: 14px; font-weight: 700; letter-spacing: 0.02em; color: var(--ink); }
+.deck-modes { gap: 6px; }
+.deck-modes .mode { padding: 8px 6px; }
+.deck-modes .mode b { font-size: 10.5px; }
+
+/* ── Numbered phase cards (controls live in the deck now) ── */
+.motion-shell .ph-card { padding: 14px; }
+.motion-shell .ph-card.on { box-shadow: 0 0 0 1px rgba(255, 90, 31, 0.2), 0 20px 44px -34px var(--acc-glow); }
+.ph-num {
+  font-size: 17px; font-weight: 800; letter-spacing: 0.04em;
+  line-height: 1; color: var(--ink-3);
+  transition: color 0.2s, text-shadow 0.2s;
+}
+.motion-shell .ph-card.on .ph-num { color: var(--acc); text-shadow: 0 0 18px var(--acc-glow); }
+.motion-shell .ph-head { justify-content: flex-start; gap: 9px; }
+.motion-shell .ph-head .ph-range { margin-left: auto; }
+.motion-shell .ph-title { margin-top: 12px; }
+.motion-shell .ph-pool { margin-top: 11px; }
+.motion-shell .ph-pool span { background: rgba(255, 255, 255, 0.02); transition: color 0.15s, border-color 0.15s; }
+.motion-shell .ph-pool span:hover { color: var(--acc); border-color: var(--acc-line); }
+.motion-shell .dir-stats { margin-top: 15px; }
+.motion-shell .stat-chip { border-radius: 999px; padding: 6px 12px; }
+
+/* ── Ribbon + aside ── */
+.motion-shell .ribbon-panel { border-left: 3px solid var(--acc-line); }
+.motion-shell .ribbon-track { height: 14px; border-radius: 7px; }
+.motion-shell .motion-aside .panel-title { font-size: 12.5px; }
+.motion-shell .tip-panel {
+  background: linear-gradient(150deg, rgba(255, 90, 31, 0.12), var(--panel) 70%);
+  border-color: var(--acc-line);
+}
+.motion-shell .tip-panel p { font-size: 12px; line-height: 1.6; color: var(--ink-2); }
+.motion-shell .tip-panel p b { color: var(--ink); }
+
+/* ── Beat console: green command banner ── */
+.motion-shell .cut-console {
+  gap: 22px;
+  background:
+    radial-gradient(640px 140px at 10% 0%, rgba(52, 211, 153, 0.10), transparent 70%),
+    linear-gradient(180deg, #101015, #0c0c10);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ok);
+}
+.console-title { font-size: 21px; font-weight: 800; letter-spacing: -0.01em; }
+.motion-shell .console-meta { margin-left: auto; }
+
+/* ── Sound rack: stronger green rail ── */
+.motion-shell .sfx-rack { border-left: 3px solid var(--ok); }
+.motion-shell .rack-chip { background: var(--panel-2); border-radius: 12px; padding: 9px 11px; }
+.motion-shell .rack-chip.playing {
+  border-color: var(--ok-line);
+  box-shadow: 0 0 0 1px var(--ok-line), 0 12px 32px -22px rgba(52, 211, 153, 0.7);
+}
+
+/* ── Library ladder head ── */
+.motion-shell .lib-head { align-items: center; gap: 11px; padding: 4px 2px 0; }
+.lib-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.lib-title b { font-size: 15.5px; font-weight: 800; letter-spacing: -0.01em; color: var(--ink); }
+.lib-title i { font-style: normal; font-size: 10.5px; color: var(--ink-3); }
+.motion-shell .lib-note { margin-left: auto; font-size: 9px; }
+
+/* ── Family-colored transition cards ── */
+.motion-shell .tr-cards { gap: 14px; }
+.motion-shell .tr-card {
+  background: linear-gradient(180deg, var(--panel-3), var(--panel-2) 60%);
+  border-color: var(--line);
+}
+.motion-shell .tr-card::before {
+  content: ""; display: block;
+  height: 3px; margin: -13px -13px -11px;
+  border-radius: 15px 15px 0 0;
+  background: linear-gradient(90deg, var(--fam, var(--acc)) 0%, transparent 78%);
+  opacity: 0.8;
+}
+.motion-shell .tr-card:hover {
+  border-color: var(--fam, var(--line-3));
+  box-shadow: 0 18px 36px -28px rgba(0, 0, 0, 0.95), 0 0 0 1px var(--fam-soft, transparent);
+}
+.motion-shell .tr-card.on::before {
+  background: linear-gradient(90deg, var(--acc) 0%, var(--acc-2) 45%, transparent 88%);
+  opacity: 1;
+}
+.motion-shell .tr-card.fam-fade { --fam: #60a5fa; --fam-soft: rgba(96, 165, 250, 0.30); }
+.motion-shell .tr-card.fam-wipe { --fam: #a78bfa; --fam-soft: rgba(167, 139, 250, 0.30); }
+.motion-shell .tr-card.fam-push { --fam: #fbbf24; --fam-soft: rgba(251, 191, 36, 0.30); }
+.motion-shell .tr-card.fam-cut  { --fam: var(--ink-3); --fam-soft: rgba(255, 255, 255, 0.16); }
+.motion-shell .tr-preview { height: 88px; border-color: var(--line-2); }
+.motion-shell .tr-head { gap: 9px; }
+.tr-ic {
+  width: 32px; height: 32px; flex: none;
+  display: grid; place-items: center;
+  border-radius: 9px;
+  background: var(--fam-soft, var(--acc-soft));
+  border: 1px solid var(--fam-soft, var(--acc-soft));
+  color: var(--fam, var(--acc));
+  transition: transform 0.18s cubic-bezier(0.22, 0.8, 0.3, 1);
+}
+.motion-shell .tr-card:hover .tr-ic { transform: scale(1.06) rotate(-3deg); }
+.motion-shell .tr-card.on .tr-ic { background: var(--acc-soft); border-color: var(--acc-line); color: var(--acc); }
+.tr-name {
+  display: flex; align-items: center; gap: 7px;
+  min-width: 0; flex: 1 1 auto; flex-wrap: wrap;
+}
+.tr-name b {
+  font-size: 13px; font-weight: 700;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.motion-shell .tr-fam {
+  font-style: normal; font-family: var(--font-mono);
+  font-size: 7.5px; font-weight: 700; letter-spacing: 0.16em;
+  color: var(--fam, var(--ink-3));
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--fam-soft, var(--line-2));
+  border-radius: 4px; padding: 2px 5px; line-height: 1;
+}
+.tr-sec {
+  font-family: var(--font-mono); font-size: 10.5px; font-weight: 700;
+  color: var(--acc); margin-left: auto; flex: none;
+}
+.motion-shell .tr-desc { font-size: 10.5px; line-height: 1.5; }
+.motion-shell .tr-foot { border-top: 1px dashed var(--line-2); }
+.motion-shell .card-sfx {
+  background: rgba(52, 211, 153, 0.045);
+  border: 1px solid rgba(52, 211, 153, 0.16);
+  border-radius: 10px;
+  padding: 7px 9px;
+}
+.motion-shell .card-sfx::before { display: none; }
+
+/* ── Stateful cut rows: orange rail = live transition, tail dimmed ── */
+.motion-shell .cut-row {
+  position: relative;
+  background: var(--panel-2); border-color: var(--line);
+  padding: 10px 13px;
+  transition: border-color 0.15s, background 0.15s, transform 0.15s;
+}
+.motion-shell .cut-row::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0;
+  width: 3px; border-radius: 12px 0 0 12px;
+  background: transparent;
+  transition: background 0.15s, box-shadow 0.15s;
+}
+.motion-shell .cut-row:hover { border-color: var(--line-3); background: var(--panel-3); transform: translateX(2px); }
+.motion-shell .cut-row.live { padding-left: 17px; border-color: rgba(255, 90, 31, 0.22); }
+.motion-shell .cut-row.live::before { background: var(--acc); box-shadow: 0 0 9px var(--acc-glow); }
+.motion-shell .cut-row.live:hover { border-color: var(--acc-line); }
+.motion-shell .cut-row.live .cut-num { color: var(--acc); }
+.motion-shell .cut-row.tail { opacity: 0.78; }
+
+/* ── Responsive ── */
+@media (max-width: 1340px) {
+  .dir-deck { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .motion-shell .tr-cards { grid-template-columns: repeat(3, 1fr); }
+}
+@media (max-width: 1140px) {
+  /* Aside drops below — the workspace is full width again. */
+  .motion-shell .tr-cards { grid-template-columns: repeat(4, 1fr); }
+}
+@media (max-width: 940px) {
+  .motion-shell .tr-cards { grid-template-columns: repeat(3, 1fr); }
+}
+@media (max-width: 760px) {
+  .motion-shell .m-tabbar { flex-direction: column; }
+  .dir-deck { grid-template-columns: 1fr; }
+  .motion-shell .cut-console { flex-direction: column; align-items: stretch; }
+  .motion-shell .console-meta { margin-left: 0; }
+  .motion-shell .tr-cards { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 560px) {
+  .motion-shell .tr-cards { grid-template-columns: 1fr; }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   MOTION · CUTS & SOUND — split library: type rail + single inspector
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* Generic family tokens — any element tagged fam-* can paint with them. */
+.motion-shell .fam-fade { --fam: #60a5fa; --fam-soft: rgba(96, 165, 250, 0.30); }
+.motion-shell .fam-wipe { --fam: #a78bfa; --fam-soft: rgba(167, 139, 250, 0.30); }
+.motion-shell .fam-push { --fam: #fbbf24; --fam-soft: rgba(251, 191, 36, 0.30); }
+.motion-shell .fam-cut  { --fam: var(--ink-3); --fam-soft: rgba(255, 255, 255, 0.16); }
+
+.motion-shell .lib-split .split {
+  display: grid;
+  grid-template-columns: 262px minmax(0, 1fr);
+  gap: 16px;
+  align-items: stretch;
+}
+
+/* ── left rail: every transition type at a glance ── */
+.motion-shell .type-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.motion-shell .type-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-left: 3px solid transparent;
+  border-radius: 10px;
+  cursor: pointer;
+  text-align: left;
+  color: var(--ink);
+  transition: border-color .14s, background .14s, transform .14s, box-shadow .14s;
+}
+.motion-shell .type-row:hover {
+  border-color: var(--line-3);
+  background: var(--panel-3);
+  transform: translateX(2px);
+}
+.motion-shell .type-row.sel {
+  background: linear-gradient(90deg, var(--fam-soft), transparent 80%);
+  border-color: var(--line-2);
+  border-left-color: var(--fam);
+  box-shadow: 0 0 0 1px var(--fam-soft);
+}
+.motion-shell .ty-ic {
+  flex: none;
+  width: 26px; height: 26px;
+  display: grid; place-items: center;
+  border-radius: 7px;
+  background: var(--fam-soft);
+  color: var(--fam);
+}
+.motion-shell .ty-n { flex: 1; min-width: 0; }
+.motion-shell .ty-n b {
+  display: block;
+  font-size: 11.5px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.motion-shell .ty-d { flex: none; font-size: 9px; color: var(--ink-3); }
+.motion-shell .ty-c {
+  flex: none; min-width: 16px; text-align: center;
+  font-size: 9px; padding: 2px 4px; border-radius: 5px;
+  background: rgba(255, 255, 255, 0.05); color: var(--ink-3);
+}
+.motion-shell .ty-c.on { background: var(--acc-soft); color: var(--acc); }
+.motion-shell .ty-sfx { flex: none; font-size: 10px; color: var(--ok); }
+
+/* ── inspector: the ONE card that edits the selected type ── */
+.motion-shell .inspector { min-width: 0; display: flex; flex-direction: column; }
+.motion-shell .insp-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  background: linear-gradient(180deg, var(--panel-3), var(--panel-2) 60%);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  overflow: hidden;
+  min-width: 0;
+}
+.motion-shell .insp-card::before {
+  content: ""; position: absolute; inset: 0 0 auto; height: 2px;
+  background: linear-gradient(90deg, var(--fam), transparent 72%);
+  opacity: .85;
+}
+.motion-shell .insp-card.on { border-color: var(--acc-line); box-shadow: 0 0 0 1px var(--acc-soft); }
+.motion-shell .insp-top {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+.motion-shell .tr-preview.insp-stage { height: 208px; }
+.motion-shell .insp-stage .pv-run { padding: 8px 16px; font-size: 10.5px; }
+.motion-shell .insp-meta { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.motion-shell .insp-head { align-items: baseline; justify-content: flex-start; gap: 9px; }
+.motion-shell .insp-head b {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 16.5px; font-weight: 800; letter-spacing: -0.015em; color: var(--ink);
+}
+.motion-shell .insp-head b .ic-16 { color: var(--fam); }
+.motion-shell .insp-fam {
+  font-style: normal; font-family: var(--font-mono);
+  font-size: 9px; letter-spacing: 0.12em;
+  padding: 3px 8px; border-radius: 999px;
+  background: var(--fam-soft); color: var(--fam); white-space: nowrap;
+}
+.motion-shell .insp-card .tr-desc { min-height: 0; }
+.motion-shell .tr-dur.hard b { font-size: 10px; color: var(--ink-2); letter-spacing: 0.1em; }
+.motion-shell .ic-16 { width: 16px; height: 16px; }
+
+/* Inspector stage replays the same hover family animations the old cards had. */
+.motion-shell .insp-card:hover .pv-fade .pv-b { animation: pvFade var(--pv-dur, 1.4s) linear infinite both; }
+.motion-shell .insp-card:hover .pv-cut .pv-b { animation: pvCut var(--pv-dur, 1.8s) linear infinite both; }
+.motion-shell .insp-card:hover .pv-left .pv-b,
+.motion-shell .insp-card:hover .pv-right .pv-b { animation: pvWipe var(--pv-dur, 1.4s) linear infinite both; }
+.motion-shell .insp-card:hover .pv-slide-l .pv-a { animation: pvPushOutL var(--pv-dur, 1.4s) linear infinite both; }
+.motion-shell .insp-card:hover .pv-slide-l .pv-b { animation: pvPushInR var(--pv-dur, 1.4s) linear infinite both; }
+.motion-shell .insp-card:hover .pv-slide-r .pv-a { animation: pvPushOutR var(--pv-dur, 1.4s) linear infinite both; }
+.motion-shell .insp-card:hover .pv-slide-r .pv-b { animation: pvPushInL var(--pv-dur, 1.4s) linear infinite both; }
+.motion-shell .insp-card:hover .pv-slide-u .pv-a { animation: pvPushOutU var(--pv-dur, 1.4s) linear infinite both; }
+.motion-shell .insp-card:hover .pv-slide-u .pv-b { animation: pvPushInB var(--pv-dur, 1.4s) linear infinite both; }
+.motion-shell .insp-card:hover .pv-slide-d .pv-a { animation: pvPushOutD var(--pv-dur, 1.4s) linear infinite both; }
+.motion-shell .insp-card:hover .pv-slide-d .pv-b { animation: pvPushInT var(--pv-dur, 1.4s) linear infinite both; }
+
+/* ── responsive: rail stacks above the inspector, then full stack ── */
+@media (max-width: 1180px) {
+  .motion-shell .lib-split .split { grid-template-columns: minmax(0, 1fr); }
+  .motion-shell .type-rail { flex-direction: row; flex-wrap: wrap; }
+  .motion-shell .type-row { flex: 1 1 200px; min-width: 0; }
+  .motion-shell .insp-top { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 640px) {
+  .motion-shell .type-row { flex: 1 1 100%; }
+  .motion-shell .tr-preview.insp-stage { height: 168px; }
+}

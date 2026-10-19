@@ -80,6 +80,15 @@ const waveBarsFor = (id: string): number[] => {
     0.2 + 0.8 * (0.55 * Math.abs(Math.sin(i * 1.7 + rnd() * 2.4)) + 0.45 * rnd()));
 };
 
+// Randomize-cut pool — weighted so fades stay the cinematic default, slides
+// add motion variety, and hard cuts still punctuate. One pick per join.
+const RANDOM_TRANS_POOL = [
+  "fade", "fade", "fade",
+  "smoothleft", "smoothright",
+  "slideleft", "slideright", "slideup", "slidedown",
+  "none",
+];
+
 const markerModFor = (t?: string) =>
   t === "none" ? "none"
   : t === "smoothleft" ? "left"
@@ -257,6 +266,13 @@ export default function App() {
   const [sfxPlaying, setSfxPlaying] = useState<string | null>(null);
   const [sfxMsg, setSfxMsg] = useState("");
   const sfxInputRef = useRef<HTMLInputElement>(null);
+
+  // Motion page split into TWO focused pages: "plan" (camera rhythm) and
+  // "cuts" (transitions + SFX + per-join map). Pure UI organization —
+  // settings live in one state each, nothing is duplicated.
+  const [motionTab, setMotionTab] = useState<"plan" | "cuts">("plan");
+  // Selected transition type in the library rail (the inspector edits it).
+  const [trSel, setTrSel] = useState<string>("fade");
 
   // WebAudio preview engine: decode each library sound ONCE, then play exact
   // slices [start, start+dur) through a GainNode so preview == render (same
@@ -487,8 +503,6 @@ export default function App() {
   const [isMuted, setIsMuted] = useState(false);
   // Scrollable viewport height for the imported-media grid (≈15 tiles visible).
   const [mediaGridVh, setMediaGridVh] = useState(0);
-  const trCardsRef = useRef<HTMLDivElement>(null);
-  const [trCardsVh, setTrCardsVh] = useState(0);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
@@ -523,27 +537,6 @@ export default function App() {
     ro.observe(el);
     return () => ro.disconnect();
   }, [images.length, view]);
-
-  // Cap the motion picker to 4 visible transition cards; the rest scrolls
-  // (one row on desktop, two on the 2-col small-screen layout).
-  useEffect(() => {
-    const el = trCardsRef.current;
-    if (!el) return;
-    const measure = () => {
-      const card = el.querySelector<HTMLElement>(".tr-card");
-      if (!card) { setTrCardsVh(0); return; }
-      const gap = 13; // .tr-cards gap
-      const cols = Math.max(1, getComputedStyle(el).gridTemplateColumns.split(" ").filter(Boolean).length);
-      const rows = Math.ceil(4 / cols); // exactly 4 cards visible at once
-      setTrCardsVh(rows * (card.offsetHeight + gap) - gap);
-    };
-    measure();
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
-    const firstCard = el.querySelector<HTMLElement>(".tr-card");
-    if (firstCard) ro.observe(firstCard);
-    return () => ro.disconnect();
-  }, [view]);
 
   useEffect(() => {
     return () => {
@@ -657,6 +650,19 @@ export default function App() {
     setTransitions(new Array(needed).fill("none"));
     setGlobalTransition("none");
     setSuccessMessage("Reset all cuts to standard Cuts (None).");
+  };
+
+  // 🎲 Randomize cuts: one click gives EVERY join a fresh transition from a
+  // weighted pool (fades lead, slides add motion, occasional hard cut).
+  // Structured-slide mode only reads boundary joins, so rerolling all of
+  // them keeps grouped interiors untouched while regrouping changes which
+  // boundary is live — always a coherent shuffle.
+  const randomizeTransitions = () => {
+    if (loading) return;
+    if (transitions.length === 0) return;
+    setTransitions(transitions.map(() => RANDOM_TRANS_POOL[Math.floor(Math.random() * RANDOM_TRANS_POOL.length)]));
+    stopSlice();
+    setSuccessMessage("🎲 Randomized a fresh transition on every cut — fine-tune any single one in the map below.");
   };
 
   // ---- SFX handlers: preview / import / starter pack / delete / assign ----
@@ -1821,14 +1827,14 @@ export default function App() {
   /* ═══════════════ VIEW 03 · MOTION ═══════════════ */
   const motionView = (
     <main className="page-body">
-      <div className="page-shell">
+      <div className="page-shell motion-shell">
         <div className="page-hero">
           <span className="eyebrow">Step 03 — Motion</span>
           <h1 className="h-display">Direct every <em>cut</em></h1>
           <p className="lede">
-            Open strong, hold steady. The first stretch carries a full random Ken Burns mix;
-            the rest of the timeline glides on subtle alternating pans — or stays static.
-            Every transition lands exactly on its cut, and your runtime never changes.
+            Two focused pages, one timeline. The <b>camera plan</b> drives the opening mix and the
+            tail glide; <b>cuts &amp; sound</b> assigns a transition + sound to every join — by hand
+            or with one lucky reroll. Your runtime never changes.
           </p>
           {unitCount > 0 && (
             <div className="hero-meta mono">
@@ -1844,144 +1850,138 @@ export default function App() {
           )}
         </div>
 
-        <div className="motion-grid">
+        {/* ─── Two-page switcher: camera plan ↔ cuts & sound ─── */}
+        <div className="m-tabbar">
+          <button
+            type="button"
+            className={`m-tab ${motionTab === "plan" ? "on" : ""}`}
+            onClick={() => { if (motionTab !== "plan") { stopTransitionPreview(); setMotionTab("plan"); } }}
+          >
+            <Sparkles className="m-tab-ic" />
+            <span className="mt-txt">
+              <b>Camera plan</b>
+              <i>motion director · phases · ribbon</i>
+            </span>
+            <span className="mt-count mono">{motionOn ? (motionCoversAll ? "FULL MIX" : `OPEN ${fmtSec(motionTailStart)}S`) : "CAMERA OFF"}</span>
+          </button>
+          <button
+            type="button"
+            className={`m-tab ${motionTab === "cuts" ? "on" : ""}`}
+            onClick={() => { if (motionTab !== "cuts") { stopTransitionPreview(); setMotionTab("cuts"); } }}
+          >
+            <Music className="m-tab-ic" />
+            <span className="mt-txt">
+              <b>Cuts &amp; sound</b>
+              <i>transitions · sfx · per-join map</i>
+            </span>
+            <span className="mt-count mono">{liveTransitions}/{Math.max(0, unitCount - 1)} LIVE · {sfxLib.length} SFX</span>
+          </button>
+        </div>
+
+        <div className={`motion-grid mode-${motionTab}`}>
           <div className="motion-main">
 
+            {motionTab === "plan" ? (<>
             {/* ═══ MOTION DIRECTOR — the two phases, live ═══ */}
             <section className="panel director">
               <div className="dir-head">
                 <div className="dir-head-l">
                   <span className="eyebrow">Pro camera · Ken Burns</span>
-                  <h2 className="dir-title">Direct the motion</h2>
+                  <h2 className="dir-title"><span className="sec-no mono">01</span>Direct the motion</h2>
                 </div>
-                <div className="mode-grid dir-switch">
-                  <button type="button" className={`mode ${motionOn ? "on" : ""}`} disabled={loading} onClick={() => setMotionOn(true)}><b>On</b></button>
-                  <button type="button" className={`mode ${!motionOn ? "on" : ""}`} disabled={loading} onClick={() => setMotionOn(false)}><b>Off</b></button>
-                </div>
+                <button
+                  type="button"
+                  className={`power ${motionOn ? "on" : ""}`}
+                  disabled={loading}
+                  onClick={() => setMotionOn(v => !v)}
+                  aria-pressed={motionOn}
+                  title={motionOn ? "Turn the camera off — static frames, fastest render" : "Turn the camera on — Ken Burns mix"}
+                >
+                  <span className="power-track"><span className="power-knob" /></span>
+                  <span className="power-label mono">{motionOn ? "CAMERA ON" : "CAMERA OFF"}</span>
+                </button>
               </div>
 
-              <div className="dir-grid">
-                {/* ── PHASE 1 · OPENING ── */}
-                <div className={`ph-card ${motionOn ? "on" : "off"}`}>
-                  <div className="ph-head">
-                    <span className="ph-tag">PHASE 1 · OPENING</span>
-                    <span className="ph-range">
-                      {motionOn ? (motionCoversAll ? "0s → END" : `0s → ${fmtSec(motionTailStart)}s`) : "—"}
-                    </span>
-                  </div>
-
-                  <div
-                    className="ph-stage ph-anim-zoom"
-                    style={{ "--ph-z1": motionStyle === "subtle" ? 1.07 : motionStyle === "dynamic" ? 1.2 : 1.14 } as React.CSSProperties}
-                  >
-                    {imageUrls[0] && <img src={imageUrls[0]} alt="" />}
-                    {motionOn && <span className="ph-live"><span className="pulse" />LIVE</span>}
-                    <span className="ph-stage-cap mono">
-                      {motionStyle === "subtle" ? "6–9% BREATH" : motionStyle === "dynamic" ? "11–18% BREATH" : "8–15% BREATH"}
-                    </span>
-                  </div>
-
-                  <div className="ph-title">
-                    <b>Opening mix</b>
-                    <i>a seeded move on every shot</i>
-                  </div>
-
-                  <div className="ph-ctrls">
-                    <div className="tr-dur">
-                      <span>Style</span>
-                      <CustomSelect
-                        value={motionStyle}
-                        onChange={(val: any) => setMotionStyle(val)}
-                        options={[
-                          { value: "subtle", label: "Subtle" },
-                          { value: "mixed", label: "Mixed" },
-                          { value: "dynamic", label: "Dynamic" },
-                        ]}
-                        className="w-32"
-                      />
-                    </div>
-                    <div className="tr-dur">
-                      <span>Runs for</span>
-                      <CustomSelect
-                        value={motionIntroSec}
-                        onChange={(val: any) => setMotionIntroSec(Number(val))}
-                        options={[
-                          { value: 15, label: "15 seconds" },
-                          { value: 30, label: "30 seconds" },
-                          { value: 60, label: "60 seconds" },
-                          { value: 90, label: "90 seconds" },
-                          { value: 120, label: "2 minutes" },
-                          { value: 180, label: "3 minutes" },
-                          { value: 999999, label: "Whole video" },
-                        ]}
-                        className="w-32"
-                        dropdownUp
-                      />
-                    </div>
-                    <div className="tr-foot">
-                      <span className="ph-seed">SEED #{motionSeed}</span>
-                      <button
-                        type="button"
-                        className="mini-btn"
-                        disabled={loading}
-                        onClick={() => setMotionSeed(Math.floor(Math.random() * 1_000_000_000))}
-                      >
-                        ⟳ Remix
-                      </button>
-                    </div>
-                    <div className="ph-pool">
-                      <span>PUSH</span><span>PULL</span><span>PAN ←</span><span>PAN →</span><span>DRIFT</span>
-                    </div>
-                  </div>
+              {/* ── CONTROL DECK: every director setting in one strip ── */}
+              <div className="dir-deck">
+                <div className="deck-cell">
+                  <span className="deck-no mono">A</span>
+                  <span className="deck-label">Style</span>
+                  <CustomSelect
+                    value={motionStyle}
+                    onChange={(val: any) => setMotionStyle(val)}
+                    options={[
+                      { value: "subtle", label: "Subtle" },
+                      { value: "mixed", label: "Mixed" },
+                      { value: "dynamic", label: "Dynamic" },
+                    ]}
+                    className="w-32"
+                  />
+                  <span className="deck-hint">
+                    {motionStyle === "subtle" ? "6–9% breath per shot" : motionStyle === "dynamic" ? "11–18% breath per shot" : "8–15% breath per shot"}
+                  </span>
                 </div>
-
-                {/* ── PHASE 2 · THE REST ── */}
-                <div className={`ph-card ${motionOn ? "on" : "off"}`}>
-                  <div className="ph-head">
-                    <span className="ph-tag">PHASE 2 · THE REST</span>
-                    <span className="ph-range">
-                      {motionOn ? (motionCoversAll ? "COVERED BY PHASE 1" : `${fmtSec(motionTailStart)}s → END`) : "—"}
-                    </span>
+                <div className="deck-cell">
+                  <span className="deck-no mono">B</span>
+                  <span className="deck-label">Opening runs for</span>
+                  <CustomSelect
+                    value={motionIntroSec}
+                    onChange={(val: any) => setMotionIntroSec(Number(val))}
+                    options={[
+                      { value: 15, label: "15 seconds" },
+                      { value: 30, label: "30 seconds" },
+                      { value: 60, label: "60 seconds" },
+                      { value: 90, label: "90 seconds" },
+                      { value: 120, label: "2 minutes" },
+                      { value: 180, label: "3 minutes" },
+                      { value: 999999, label: "Whole video" },
+                    ]}
+                    className="w-32"
+                    dropdownUp
+                  />
+                  <span className="deck-hint">
+                    {motionCoversAll ? "the mix covers the whole timeline" : `hands over to the tail at ${fmtSec(motionTailStart)}s`}
+                  </span>
+                </div>
+                <div className="deck-cell">
+                  <span className="deck-no mono">C</span>
+                  <span className="deck-label">Move seed</span>
+                  <div className="deck-seed">
+                    <span className="deck-seed-n mono">#{motionSeed}</span>
+                    <button
+                      type="button"
+                      className="mini-btn"
+                      disabled={loading}
+                      onClick={() => setMotionSeed(Math.floor(Math.random() * 1_000_000_000))}
+                      title="Roll a new seed — a fresh set of moves"
+                    >⟳ Remix</button>
                   </div>
-
-                  <div className={`ph-stage ${motionTail === "pan" ? "ph-anim-pan" : "ph-anim-none"}`}>
-                    {imageUrls[0] && <img src={imageUrls[0]} alt="" />}
-                    {motionOn && <span className="ph-live"><span className="pulse" />LIVE</span>}
-                    <span className="ph-stage-cap mono">
-                      {motionTail === "pan" ? "ALT PANS · ~0.55PX/FRAME" : "STATIC FRAMES"}
-                    </span>
+                  <span className="deck-hint">same seed = the same exact moves</span>
+                </div>
+                <div className="deck-cell">
+                  <span className="deck-no mono">D</span>
+                  <span className="deck-label">After the opening</span>
+                  <div className="ph-modes deck-modes">
+                    <button
+                      type="button"
+                      className={`mode ${motionOn && motionTail === "pan" ? "on" : ""}`}
+                      disabled={loading || !motionOn}
+                      onClick={() => { if (!loading) setMotionTail("pan"); }}
+                    >
+                      <MoveLeft className="ic ic-14" /><b>Subtle pans</b><MoveRight className="ic ic-14" />
+                    </button>
+                    <button
+                      type="button"
+                      className={`mode ${motionOn && motionTail === "none" ? "on" : ""}`}
+                      disabled={loading || !motionOn}
+                      onClick={() => { if (!loading) setMotionTail("none"); }}
+                    >
+                      <Scissors className="ic ic-14" /><b>Static cuts</b>
+                    </button>
                   </div>
-
-                  <div className="ph-title">
-                    <b>The rest</b>
-                    <i>{motionTail === "pan" ? "left / right glide, alternating" : "straight cuts, full speed"}</i>
-                  </div>
-
-                  <div className="ph-ctrls">
-                    <div className="ph-modes">
-                      <button
-                        type="button"
-                        className={`mode ${motionOn && motionTail === "pan" ? "on" : ""}`}
-                        disabled={loading || !motionOn}
-                        onClick={() => { if (!loading) setMotionTail("pan"); }}
-                      >
-                        <MoveLeft className="ic ic-14" /><b>Subtle pans</b><MoveRight className="ic ic-14" />
-                      </button>
-                      <button
-                        type="button"
-                        className={`mode ${motionOn && motionTail === "none" ? "on" : ""}`}
-                        disabled={loading || !motionOn}
-                        onClick={() => { if (!loading) setMotionTail("none"); }}
-                      >
-                        <Scissors className="ic ic-14" /><b>Static cuts</b>
-                      </button>
-                    </div>
-                    <p className="panel-note">
-                      {motionTail === "pan"
-                        ? "A calm glide keeps the tail alive — pans alternate shot by shot; joins still cut hard for speed."
-                        : "Everything after the opening renders as straight cuts on the fastest path."}
-                    </p>
-                  </div>
+                  <span className="deck-hint">
+                    {motionTail === "pan" ? "calm alternating glides · joins cut hard" : "straight cuts · fastest path"}
+                  </span>
                 </div>
               </div>
 
@@ -2005,11 +2005,88 @@ export default function App() {
               </div>
             </section>
 
+            {/* ═══ LIVE PHASES — real previews of the opening & rest camera ═══ */}
+            <section className="panel phases">
+              <div className="panel-head">
+                <span className="panel-title"><span className="sec-no mono">02</span>Live phases</span>
+                <span className="count mono">OPENING → REST · PLAYING ON IMAGE 1</span>
+              </div>
+
+              <div className="dir-grid">
+                {/* ── PHASE 1 · OPENING ── */}
+                <div className={`ph-card ${motionOn ? "on" : "off"}`}>
+                  <div className="ph-head">
+                    <span className="ph-num mono">01</span>
+                    <span className="ph-tag">OPENING</span>
+                    <span className="ph-range">
+                      {motionOn ? (motionCoversAll ? "0s → END" : `0s → ${fmtSec(motionTailStart)}s`) : "—"}
+                    </span>
+                  </div>
+
+                  <div
+                    className="ph-stage ph-anim-zoom"
+                    style={{ "--ph-z1": motionStyle === "subtle" ? 1.07 : motionStyle === "dynamic" ? 1.2 : 1.14 } as React.CSSProperties}
+                  >
+                    {imageUrls[0] && <img src={imageUrls[0]} alt="" />}
+                    {motionOn && <span className="ph-live"><span className="pulse" />LIVE</span>}
+                    <span className="ph-stage-cap mono">
+                      {motionStyle === "subtle" ? "6–9% BREATH" : motionStyle === "dynamic" ? "11–18% BREATH" : "8–15% BREATH"}
+                    </span>
+                  </div>
+
+                  <div className="ph-title">
+                    <b>Opening mix</b>
+                    <i>a seeded move on every shot</i>
+                  </div>
+
+                  <div className="ph-pool">
+                    <span>PUSH</span><span>PULL</span><span>PAN ←</span><span>PAN →</span><span>DRIFT</span>
+                  </div>
+                </div>
+
+                {/* ── PHASE 2 · THE REST ── */}
+                <div className={`ph-card ${motionOn ? "on" : "off"}`}>
+                  <div className="ph-head">
+                    <span className="ph-num mono">02</span>
+                    <span className="ph-tag">THE REST</span>
+                    <span className="ph-range">
+                      {motionOn ? (motionCoversAll ? "COVERED BY 01" : `${fmtSec(motionTailStart)}s → END`) : "—"}
+                    </span>
+                  </div>
+
+                  <div className={`ph-stage ${motionTail === "pan" ? "ph-anim-pan" : "ph-anim-none"}`}>
+                    {imageUrls[0] && <img src={imageUrls[0]} alt="" />}
+                    {motionOn && <span className="ph-live"><span className="pulse" />LIVE</span>}
+                    <span className="ph-stage-cap mono">
+                      {motionTail === "pan" ? "ALT PANS · ~0.55PX/FRAME" : "STATIC FRAMES"}
+                    </span>
+                  </div>
+
+                  <div className="ph-title">
+                    <b>The rest</b>
+                    <i>{motionTail === "pan" ? "left / right glide, alternating" : "straight cuts, full speed"}</i>
+                  </div>
+
+                  <div className="ph-pool">
+                    {motionTail === "pan" ? (
+                      <>
+                        <span>GLIDE ←</span><span>GLIDE →</span><span>ALT SHOT</span><span>HARD JOINS</span>
+                      </>
+                    ) : (
+                      <>
+                        <span>STATIC</span><span>FULL SPEED</span><span>HARD JOINS</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </section>
+
             {/* ═══ PHASE RIBBON — the whole timeline's rhythm map ═══ */}
             {unitCount > 0 && (
               <section className="panel ribbon-panel">
                 <div className="panel-head">
-                  <span className="panel-title">Phase ribbon</span>
+                  <span className="panel-title"><span className="sec-no mono">03</span>Phase ribbon</span>
                   <span className="count mono">
                     {cutIndices.length} CUTS · {ribbonTicks.filter(t => t.live).length} TRANSITIONS
                   </span>
@@ -2058,15 +2135,42 @@ export default function App() {
                 </div>
               </section>
             )}
+            </>) : null}
 
-            <div className="lib-head">
-              <span className="eyebrow">Transition library</span>
-              <span className="lib-note mono">APPLIES PER JOIN · CENTERED ON EVERY CUT</span>
-            </div>
+            {motionTab === "cuts" ? (<>
+            {/* ═══ CUTS & SOUND · beat console: randomize + counts ═══ */}
+            <section className="panel cut-console">
+              <div className="console-l">
+                <span className="eyebrow">Beat console</span>
+                <h3 className="console-title">Cut every join your way</h3>
+                <p className="console-note">
+                  Per-cut transitions land centered on each boundary. Assign by hand below,
+                  or roll the dice and refine whatever chance gives you.
+                </p>
+              </div>
+              <button
+                type="button"
+                className="rnd-btn"
+                disabled={loading || transitions.length === 0}
+                onClick={randomizeTransitions}
+                title="Give every cut a random transition — fades lead, slides spice, occasional hard cut keeps the pace"
+              >
+                <span className="rnd-face" aria-hidden>🎲</span>
+                <span className="rnd-txt">
+                  <b>Randomize all cuts</b>
+                  <i>a fresh rhythm on every join · refine after</i>
+                </span>
+              </button>
+              <div className="console-meta mono">
+                <span className="cm-chip">{transitions.length} JOINS</span>
+                <span className="cm-chip accent">{liveTransitions} LIVE</span>
+                <span className="cm-chip">{sfxLib.length} SFX IN RACK</span>
+              </div>
+            </section>
 
             <section className="panel sfx-rack">
               <div className="panel-head">
-                <span className="panel-title">Sound rack · transition sfx</span>
+                <span className="panel-title"><span className="sec-no mono">01</span>Sound rack · sfx</span>
                 <span className="count mono">{sfxLib.length} SOUND{sfxLib.length === 1 ? "" : "S"} · STORED IN PROJECT</span>
                 <span className="head-actions">
                   <button type="button" className="mini-btn" onClick={() => sfxInputRef.current?.click()} title="Import sounds once — they stay in the project for every future video">+ Import sounds</button>
@@ -2102,19 +2206,52 @@ export default function App() {
               <input ref={sfxInputRef} type="file" accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac" multiple hidden onChange={handleSfxFiles} />
             </section>
 
-            <div
-              className={`tr-cards ${loading ? "veil" : ""}`}
-              ref={trCardsRef}
-              style={trCardsVh ? { maxHeight: trCardsVh } : undefined}
-            >
-              {TRANSITIONS_CONFIG.map((item) => {
-                const Icon = item.icon;
-                const dur = categoryDurations[item.id] || 0.5;
-                const count = transitions.filter(t => t === item.id).length;
-                const isTop = item.id === topTransitionId;
+            <section className={`panel lib-split ${loading ? "veil" : ""}`}>
+              <div className="panel-head">
+                <span className="panel-title"><span className="sec-no mono">02</span>Transition library</span>
+                <span className="count mono">PICK A TYPE TO EDIT · {liveTransitions} LIVE</span>
+              </div>
+              <div className="split">
+                {/* ── left rail: every type at a glance — click to inspect ── */}
+                <div className="type-rail" role="listbox" aria-label="Transition types">
+                  {TRANSITIONS_CONFIG.map((railItem) => {
+                    const Icon = railItem.icon;
+                    const dur = categoryDurations[railItem.id] || 0.5;
+                    const count = transitions.filter((t) => t === railItem.id).length;
+                    const fam = railItem.id === "none" ? "cut" : railItem.id === "fade" ? "fade" : railItem.id.startsWith("smooth") ? "wipe" : "push";
+                    return (
+                      <button
+                        key={railItem.id}
+                        type="button"
+                        role="option"
+                        aria-selected={trSel === railItem.id}
+                        className={`type-row fam-${fam} ${trSel === railItem.id ? "sel" : ""}`}
+                        onClick={() => { stopTransitionPreview(); setTrSel(railItem.id); }}
+                        title={`Edit ${railItem.name} — seconds, sound, slice`}
+                      >
+                        <span className="ty-ic"><Icon className="ic ic-14" /></span>
+                        <span className="ty-n"><b>{railItem.name}</b></span>
+                        <span className="ty-d mono">{railItem.id === "none" ? "0.0" : dur.toFixed(1)}s</span>
+                        <span className={`ty-c mono ${count > 0 ? "on" : ""}`}>{count > 0 ? count : "·"}</span>
+                        {sfxAssign[railItem.id]?.id && <span className="ty-sfx mono" title="Sound assigned">♪</span>}
+                      </button>
+                    );
+                  })}
+                </div>
 
-                return (
-                  <div key={item.id} className={`tr-card ${isTop ? "on" : ""}`}>
+                {/* ── inspector: seconds, sound & slice for the SELECTED type ── */}
+                <div className="inspector">
+                  {(() => {
+                    const item = TRANSITIONS_CONFIG.find((t) => t.id === trSel) ?? TRANSITIONS_CONFIG[0];
+                    const Icon = item.icon;
+                    const dur = categoryDurations[item.id] || 0.5;
+                    const count = transitions.filter(t => t === item.id).length;
+                    const isTop = item.id === topTransitionId;
+                    // Visual family: blend / wipe / push / cut — colors the whole card.
+                    const fam = item.id === "none" ? "cut" : item.id === "fade" ? "fade" : item.id.startsWith("smooth") ? "wipe" : "push";
+                    const famLabel = fam === "cut" ? "HARD CUT" : fam === "fade" ? "BLEND" : fam === "wipe" ? "WIPE" : "PUSH";
+                    return (
+                      <div className={`insp-card fam-${fam} ${isTop ? "on" : ""}`}>
                     <div className={`tr-preview ${pvClassFor(item.id)} ${pvPlaying === item.id ? "live" : ""}`}>
                       {pvPlaying === item.id ? (
                         <canvas className="pv-live" ref={pvCanvasRef} />
@@ -2159,45 +2296,52 @@ export default function App() {
                         </span>
                       )}
                     </div>
-                    <div className="tr-head">
-                      <b style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        <Icon className="ic ic-14" style={{ color: isTop ? "var(--acc)" : "var(--ink-3)" }} />
-                        {item.name}
-                      </b>
-                      <i>{item.id === "none" ? "0.0s" : `${dur}s`}</i>
-                    </div>
-                    <p className="tr-desc">{TRANSITION_DESC[item.id]}</p>
-
-                    {item.id !== "none" && (
-                      <div className="tr-dur">
-                        <span>Seconds</span>
-                        <CustomSelect
-                          value={dur}
-                          onChange={(val: any) => handleCategoryDurationChange(item.id, Number(val))}
-                          options={[
-                            { value: 0.3, label: '0.3s' },
-                            { value: 0.5, label: '0.5s' },
-                            { value: 0.8, label: '0.8s' },
-                            { value: 1.0, label: '1.0s' },
-                            { value: 1.5, label: '1.5s' },
-                            { value: 2.0, label: '2.0s' },
-                          ]}
-                          className="w-20"
-                          dropdownUp
-                        />
+                    <div className="insp-meta">
+                      <div className="tr-head insp-head">
+                        <b>
+                          <Icon className="ic ic-16" />
+                          {item.name}
+                        </b>
+                        <i className="insp-fam">{famLabel}</i>
                       </div>
-                    )}
+                      <p className="tr-desc">{TRANSITION_DESC[item.id]}</p>
 
-                    <div className="tr-foot">
-                      <span className={`chip ${count > 0 ? "acc" : ""}`}>{count} CUTS</span>
-                      <button
-                        type="button"
-                        className={`mini-btn ${isTop ? "accent" : ""}`}
-                        disabled={loading || images.length <= 1}
-                        onClick={() => handleApplyToAll(item.id)}
-                      >
-                        {loading ? "Rendering…" : "Apply to all"}
-                      </button>
+                      {item.id !== "none" ? (
+                        <div className="tr-dur">
+                          <span>Seconds</span>
+                          <CustomSelect
+                            value={dur}
+                            onChange={(val: any) => handleCategoryDurationChange(item.id, Number(val))}
+                            options={[
+                              { value: 0.3, label: '0.3s' },
+                              { value: 0.5, label: '0.5s' },
+                              { value: 0.8, label: '0.8s' },
+                              { value: 1.0, label: '1.0s' },
+                              { value: 1.5, label: '1.5s' },
+                              { value: 2.0, label: '2.0s' },
+                            ]}
+                            className="w-20"
+                            dropdownUp
+                          />
+                        </div>
+                      ) : (
+                        <div className="tr-dur hard">
+                          <span>Render</span>
+                          <b className="mono">0 FRAMES · ON THE CUT</b>
+                        </div>
+                      )}
+
+                      <div className="tr-foot">
+                        <span className={`chip ${count > 0 ? "acc" : ""}`}>{count} CUTS</span>
+                        <button
+                          type="button"
+                          className={`mini-btn ${isTop ? "accent" : ""}`}
+                          disabled={loading || images.length <= 1}
+                          onClick={() => handleApplyToAll(item.id)}
+                        >
+                          {loading ? "Rendering…" : "Apply to all"}
+                        </button>
+                      </div>
                     </div>
                     <div className="card-sfx">
                       <span className="cs-label mono">SFX</span>
@@ -2277,14 +2421,19 @@ export default function App() {
                         </div>
                       );
                     })()}
-                  </div>
-                );
-              })}
-            </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+            </section>
+
+            </>) : null}
+            {motionTab === "plan" ? (<>
 
             <section className="panel">
               <div className="panel-head">
-                <span className="panel-title">Slide structure</span>
+                <span className="panel-title"><span className="sec-no mono">04</span>Shot structure</span>
                 <span className="count mono">
                   {unitSlides.length} SLIDE{unitSlides.length === 1 ? "" : "S"}
                   {structActive ? " · COMPOSED" : " · 1/SLIDE"}
@@ -2383,9 +2532,12 @@ export default function App() {
               )}
             </section>
 
+            </>) : null}
+            {motionTab === "cuts" ? (<>
+
             <section className="panel">
               <div className="panel-head">
-                <span className="panel-title">Cut map</span>
+                <span className="panel-title"><span className="sec-no mono">03</span>Cut map</span>
                 <span className="count mono">{cutIndices.length} CUTS · {liveTransitions} LIVE</span>
                 <span className="head-actions">
                   {Object.keys(cutSfxOv).length > 0 && (
@@ -2424,7 +2576,7 @@ export default function App() {
                         structActive ? slideBoundaryOf(idx) : idx, String(val));
 
                       return (
-                        <div key={idx} className="cut-row">
+                        <div key={idx} className={`cut-row ${isActive ? "live" : ""} ${tailCut ? "tail" : ""}`}>
                           <span className="cut-num">CUT #{idx + 1}</span>
                           <span className="cut-thumbs">
                             <span className={`th t${(thumbA % 7) + 1}`}>
@@ -2538,8 +2690,10 @@ export default function App() {
                 </div>
               )}
             </section>
+            </>) : null}
           </div>
 
+          {motionTab === "plan" && (
           <aside className="motion-aside">
             <div className="panel">
               <div className="panel-head"><span className="panel-title">Render plan</span></div>
@@ -2577,6 +2731,7 @@ export default function App() {
               <p><b>Open on full mix, land on glide.</b> The ribbon shows exactly where the camera hands over — <b>fades</b> carry the story, <b>slides</b> mark the beat changes.</p>
             </div>
           </aside>
+          )}
         </div>
       </div>
     </main>

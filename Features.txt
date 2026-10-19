@@ -198,8 +198,56 @@ TRANSITION SFX · PROJECT-STORED SOUND LIBRARY
   ghost references in assignments/cut overrides are cleaned client-side)
   · GET /api/sfx/:id/file (preview streaming, immutable cache header).
 
-  Motion page (Editor): a SOUND RACK panel above the transition cards —
-  horizontally scrolling chips with play/stop, a deterministic pseudo-
+  Motion page (Editor) — pages: the whole Motion experience is split into
+  TWO focused pages via a segmented dock switcher under the hero; each
+  page is a strict numbered vertical story:
+    · CAMERA PLAN —
+        01 Director (sliding power switch + CONTROL DECK: Style /
+          Opening length / Seed+remix / Tail mode as A–D cells, each
+          with a live hint + plan stat chips),
+        02 Live phases (01 Opening / 02 The rest — live CSS preview of
+          the actual move on your first image, time range, move-pool
+          chips; controls live in the deck, the cards only show),
+        03 Phase ribbon (the whole timeline's rhythm map),
+        04 Shot structure (slide grouping — moved here because it
+          defines the SHOTS the phases and ribbon operate on),
+        then the render plan/rules aside.
+    · CUTS & SOUND — full-width workspace, also a numbered ladder:
+      BEAT CONSOLE banner (counts + the 🎲 RANDOMIZE ALL CUTS button),
+      01 Sound rack · 02 Transition library as a SPLIT LIBRARY: a left
+      rail listing every transition type (icon, name, seconds, cut
+      count, ♪ when a sound is assigned, family color, selected state)
+      feeding ONE INSPECTOR on the right — big real preview (canvas
+      play on your first two images), name + family chip, description,
+      seconds select, cut count + Apply-to-all, SFX picker + volume +
+      segment editor (waveform window drag) — · 03 Cut map.
+    Switching pages stops any running transition preview; the counts on
+    the tabs update live (FULL MIX / OPEN Xs on the left, LIVE cuts +
+    SFX count on the right).
+
+  Motion page — visual identity (scoped to .motion-shell, nothing else
+  in the app changes): ruled panel heads with orange numbered ladder
+  chips (01…04 restarting per page), a sliding power switch with
+  CAMERA ON/OFF label, sunken segmented page dock with icon tiles,
+  gradient hero word, family tokens (BLEND blue / WIPE violet / PUSH
+  amber / HARD CUT grey) painting rail rows and the inspector (colored
+  top rail, icon tile, family chip, selected ring), a click-to-select
+  type rail (hover nudge, active count chip, ♪ marker) beside the
+  inspector, stateful cut rows (orange left rail + orange cut number
+  for live transitions, dimmed tail rows), green command banner for
+  the console, tinted sound rack with glowing playing chip, pill stat
+  chips. The inspector stage is a large 16:9-ish preview that hover-
+  plays the exact family animation and hosts the real canvas preview.
+
+  🎲 RANDOMIZE ALL CUTS (beat console, cuts page): one click gives EVERY
+  join a fresh transition from a weighted pool — fades lead (cinematic
+  default), slides add motion variety, occasional hard cuts keep pace
+  (3×fade, smoothleft/right, 4×slides, none). Re-click rerolls again;
+  per-cut SFX tweaks stay intact; structured-slide mode keeps group
+  interiors intact (boundary joins re-read after regrouping).
+
+  Sound rack: horizontally
+  scrolling chips with play/stop, a deterministic pseudo-
   waveform fingerprint per sound, duration, delete; + Import sounds and
   ⚡ Starter pack buttons; import progress/summary inline. Every
   transition card gained an SFX strip: sound picker (None + all library
