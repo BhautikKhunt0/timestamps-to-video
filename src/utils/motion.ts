@@ -483,7 +483,7 @@ type WindowCurve = { w0: number; w1: number; cx0: number; cy0: number; cx1: numb
  * the canvas (cx/w are linear in e, so endpoints bound all t).
  * zoompan has no `t` (it counts `on`); crop uses `t`.
  */
-const motionOps = (s: WindowCurve, D: number, tb: number): string => {
+const motionOps = (s: WindowCurve, D: number, tb: number): { pre: string; anim: string } => {
   const Dq = Math.max(0.1, D);
   const A = EASE_PEDESTAL;
   const ease = (timeVar: string) => {
@@ -515,7 +515,13 @@ const motionOps = (s: WindowCurve, D: number, tb: number): string => {
     const ys = `${cyE(E)}*${sh}/${MOTION_CH}-${ch / 2}`;
     // yuv444p so crop's x/y may land on any integer (yuv420 would round to
     // even => 2px steps in 2x = 1px out). Sizes never change, only x/y.
-    return `scale=w=${sw}:h=${sh},format=yuv444p,crop=w='${cw}':h='${ch}':x='${xs}':y='${ys}',scale=w=${MOTION_FW}:h=${MOTION_FH}`;
+    // The up-scale + yuv444p conversion are CONSTANT per shot, so they go in
+    // `pre` (hoisted above the still `loop` — see buildMotionBranch): only the
+    // animated crop + fixed downscale run per frame.
+    return {
+      pre: `scale=w=${sw}:h=${sh},format=yuv444p`,
+      anim: `crop=w='${cw}':h='${ch}':x='${xs}':y='${ys}',scale=w=${MOTION_FW}:h=${MOTION_FH}`,
+    };
   }
 
   // ---- ZOOM (push/pull): 4x-supersampled zoompan — crash-free + subpixel ----
@@ -529,14 +535,19 @@ const motionOps = (s: WindowCurve, D: number, tb: number): string => {
   // ticks in 4x and blends to subpixel out (posJitter 0.44->0.11px rms).
   // `on` counts output frames 0..F-1, so `on/30` samples the same curve times
   // as the pan path's `t` (last frame at D-1/30 — the next shot's boundary).
-  const SS2 = 4;
+  const SS2 = s.ss === 1 || s.ss === 2 ? s.ss : 4;
   const CW2 = MOTION_CW * SS2, CH2 = MOTION_CH * SS2;
   const E = ease("on/30");
   const w2 = `(${f(s.w0 * SS2)}+${f((s.w1 - s.w0) * SS2)}*${E})`;
   const cx2 = `(${f(s.cx0 * SS2)}+${f((s.cx1 - s.cx0) * SS2)}*${E})`;
   const cy2 = `(${f(s.cy0 * SS2)}+${f((s.cy1 - s.cy0) * SS2)}*${E})`;
   // h = w * 9/16 (output aspect); y = cy - h/2 = cy - w*0.28125 (in 2x px).
-  return `scale=w=${CW2}:h=${CH2},zoompan=z='(${CW2}/(${w2}))':x='(${cx2}-(${w2})/2)':y='(${cy2}-(${w2})*0.28125)':d=1:s=${MOTION_FW}x${MOTION_FH}:fps=${RENDER_FPS}`;
+  // The 4x pre-scale is CONSTANT per shot -> `pre` (hoisted above the still
+  // `loop`); only zoompan runs per frame.
+  return {
+    pre: `scale=w=${CW2}:h=${CH2}`,
+    anim: `zoompan=z='(${CW2}/(${w2}))':x='(${cx2}-(${w2})/2)':y='(${cy2}-(${w2})*0.28125)':d=1:s=${MOTION_FW}x${MOTION_FH}:fps=${RENDER_FPS}`,
+  };
 };
 
 const outTail = `setsar=1,format=yuv420p`;
@@ -583,16 +594,25 @@ export function buildMotionBranch(shot: ShotMotion, opts: BranchOpts): string {
   const trim = video
     ? `trim=start_frame=${start}:end_frame=${start + F}`
     : `trim=end_frame=1`;
-  const head = `${fc ? `[${opts.inputIdx ?? 0}:v]` : ""}${trim},setpts=PTS-STARTPTS,settb=1/30,${MOTION_COVER}`;
+  // Video inputs (slide clips) are already exact 1920x1080 16:9 canvas frames:
+  // skip MOTION_COVER (2560x1440 intermediate rescale) so we scale directly
+  // to the target supersample domain without an extra software scaling pass.
+  const head = `${fc ? `[${opts.inputIdx ?? 0}:v]` : ""}${trim},setpts=PTS-STARTPTS,settb=1/30${video ? "" : `,${MOTION_COVER}`}`;
 
   // One sub-shot chain: stills loop the frame FIRST (advancing pts), then the
   // animated scale+crop reads t per frame; video already advances. fc mode
   // ends with settb=AVTB so downstream xfade/concat see the same timebase as
   // static branches. Output is fixed 1920x1080 (crop guarantees it).
   const feed = (frames: number) => video ? "" : `loop=loop=${Math.max(0, frames - 1)}:size=1,`;
-  const chain = (curve: WindowCurve, frames: number, D: number, tb: number, outRef: string): string =>
-    `${feed(frames)}${motionOps(curve, D, tb)},${outTail}` +
-    (fc ? `,settb=AVTB${outRef}` : "");
+  const chain = (curve: WindowCurve, frames: number, D: number, tb: number, outRef: string): string => {
+    // Video clips: default zoom supersample to 2x (5K) instead of 4x (10K) to save 75% pixel cost
+    const effCurve = video && !curve.ss ? { ...curve, ss: 2 } : curve;
+    const ops = motionOps(effCurve, D, tb);
+    const body = video
+      ? `${ops.pre},${ops.anim}`
+      : `${ops.pre},${feed(frames)}${ops.anim}`;
+    return `${body},${outTail}` + (fc ? `,settb=AVTB${outRef}` : "");
+  };
 
   const p = shot.punch;
   if (!p || !fc) {

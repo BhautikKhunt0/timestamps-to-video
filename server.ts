@@ -114,6 +114,104 @@ const HOLD_THREADS = 4;           // Phase 5 measured: auto all-core x264 thread
 const RUN_THREADS = 8;            // Phase 5 measured: run pieces stay CPU-bound after the graph
                                   // fix; 3 concurrent x 8 threads beat auto (107.7s -> 98.6s).
 
+// ---- GPU encode (RTX NVENC) --------------------------------------------------
+// The filter graphs (Ken Burns, xfade, slide overlays) stay on the CPU — they
+// are frame-exact by construction and have no CUDA equivalent in this build.
+// Only the FINAL ENCODE moves to the GPU: h264_nvenc on the RTX card barely
+// uses CPU, which both shortens pieces and frees cores for the filter work
+// running beside them. Detection runs once per process (boot probe encodes a
+// 0.3s color clip); any hard NVENC failure flips the process to CPU for the
+// rest of the run, and every encode site retries once on libx264, so a GPU
+// fault can never wedge a job. RENDER_GPU=0 forces CPU, =1 forces the attempt
+// (still with runtime fallback).
+type VideoEncKind = "hold" | "run" | "slide" | "fb";
+let GPU_ENC: boolean | null = null;         // null = not probed yet
+let GPU_ENC_PROBE: Promise<boolean> | null = null;
+
+// CRF -> NVENC cq mapping (+2: NVENC's per-bit output reads slightly softer
+// than x264 at the same nominal level; sizes land within ~1.2-1.4x at equal
+// perceived quality on 1080p stills and Ken Burns motion).
+const NVENC_CQ: Record<VideoEncKind, string> = { hold: "20", run: "21", slide: "20", fb: "21" };
+
+const cpuEncArgs = (kind: VideoEncKind): string[] => {
+  switch (kind) {
+    case "hold":  return ["-c:v", "libx264", "-preset", HOLD_PRESET, "-crf", HOLD_CRF, "-pix_fmt", "yuv420p", "-threads", String(HOLD_THREADS)];
+    case "run":   return ["-c:v", "libx264", "-preset", RUN_PRESET, "-crf", RUN_CRF, "-pix_fmt", "yuv420p", "-threads", String(RUN_THREADS)];
+    case "slide": return ["-c:v", "libx264", "-preset", SLIDE_PRESET, "-crf", SLIDE_CRF, "-pix_fmt", "yuv420p"];
+    default:      return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"];
+  }
+};
+const gpuEncArgs = (kind: VideoEncKind): string[] => [
+  "-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
+  "-rc", "vbr", "-cq", NVENC_CQ[kind], "-b:v", "0",
+  "-spatial-aq", "1", "-aq-strength", "8", "-pix_fmt", "yuv420p",
+];
+const gpuEncodeOn = (): boolean => GPU_ENC === true;
+// The encode option block for the ACTIVE backend (callers build args fresh on
+// every attempt so a GPU->CPU flip mid-retry is picked up).
+const vEncArgs = (kind: VideoEncKind): string[] => (gpuEncodeOn() ? gpuEncArgs(kind) : cpuEncArgs(kind));
+
+// Session cap: modern GeForce cards allow 5-8 concurrent NVENC sessions (4 safe).
+const gpuConc = (n: number): number => (gpuEncodeOn() ? Math.min(n, 4) : n);
+
+const probeGpuEncode = (): Promise<boolean> => new Promise((resolve) => {
+  try {
+    const p = spawn(ffmpegPath as string, [
+      "-hide_banner", "-f", "lavfi", "-i", "color=c=black:s=256x256:r=30:d=0.3",
+      "-c:v", "h264_nvenc", "-preset", "p4", "-f", "null", "-",
+    ], { windowsHide: true });
+    let err = "";
+    p.stderr?.on("data", (d: any) => { err += d.toString(); });
+    p.on("error", () => resolve(false));
+    p.on("close", (code: number) => resolve(code === 0));
+  } catch { resolve(false); }
+});
+
+const ensureGpuProbe = async (): Promise<boolean> => {
+  if (GPU_ENC !== null) return GPU_ENC;
+  if (process.env.RENDER_GPU === "0") { GPU_ENC = false; return false; }
+  if (!GPU_ENC_PROBE) GPU_ENC_PROBE = probeGpuEncode();
+  GPU_ENC = await GPU_ENC_PROBE;
+  return GPU_ENC;
+};
+
+// Hard failures only: a missing/faulty NVENC stack disables the GPU path for
+// the whole process. Transient failures (session limit) do NOT — the per-encode
+// CPU retry below absorbs those.
+const disableGpuEnc = (jobDir: string, why: string) => {
+  if (!gpuEncodeOn()) return;
+  GPU_ENC = false;
+  appendLog(jobDir, "ffmpeg.log", `[gpu] NVENC disabled for this process, libx264 from here on: ${why.slice(-300)}`);
+};
+
+// Run one VIDEO encode with automatic GPU->CPU fallback: if the GPU encode
+// fails with an NVENC/CUDA-flavored error, retry the SAME logical encode once
+// on libx264 (build() re-evaluates the active backend). Hard backend errors
+// also disable the GPU for the rest of the process.
+const runVideoFfmpeg = async (
+  build: () => string[],
+  opts: { jobDir: string; label: string; timeoutMs?: number },
+): Promise<void> => {
+  const wasGpu = gpuEncodeOn();
+  try {
+    await runFfmpeg(build(), opts);
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (!wasGpu) throw e;
+    if (/Cannot init|no NVENC|library version|CUDA driver|out of memory|3221225794|0xc0000142/i.test(msg)) {
+      disableGpuEnc(opts.jobDir, msg);
+    }
+    appendLog(opts.jobDir, "ffmpeg.log", `[gpu] ${opts.label}: GPU encode failed, retrying on libx264 — ${msg.slice(-200)}`);
+    const prevGpu = GPU_ENC;
+    GPU_ENC = false;
+    try {
+      await runFfmpeg(build(), opts);
+    } finally {
+      if (prevGpu !== false) GPU_ENC = prevGpu;
+    }
+  }
+};
+
 // 1080p canvas filter applied INLINE at encode time from the original upload
 // (Phase 2: the norm_*.png intermediate stage is gone — identical pixels,
 // zero intermediate I/O). Ends with format (callers may append fps etc).
@@ -212,7 +310,7 @@ const runFfmpeg = (args: string[], opts: { jobDir: string; label: string; timeou
     const started = Date.now();
     let proc: any;
     try {
-      proc = spawn(ffmpegPath as string, args);
+      proc = spawn(ffmpegPath as string, args, { windowsHide: true });
     } catch (e: any) {
       return reject(new Error(`${opts.label} failed to spawn: ${e.message}`));
     }
@@ -237,6 +335,9 @@ const runFfmpeg = (args: string[], opts: { jobDir: string; label: string; timeou
       clearTimeout(timer);
       const ms = Date.now() - started;
       if (code === 0) {
+        // Per-ffmpeg timing on the perf log: lets speedup phases see exactly
+        // which pieces (slide/hold/run) dominate, instead of guessing.
+        appendLog(opts.jobDir, "perf.log", `[ffmpeg ${ms}ms] ${opts.label}\n  CMD: ${(ffmpegPath as string)} ${args.join(" ")}`);
         resolve();
       } else {
         appendLog(opts.jobDir, "ffmpeg.log", `[FAIL code=${code} ${ms}ms] ${opts.label}\nCMD: ${(ffmpegPath as string)} ${args.join(" ")}\nSTDERR TAIL:\n${stderr.slice(-4000)}`);
@@ -642,7 +743,8 @@ app.post("/api/generate", async (req, res) => {
     cancelled: false,
   });
   const perfT0 = Date.now();
-  perfMark(jobDir, perfT0, `start mode=${mode} slides=${Array.isArray(durations) ? durations.length : "?"} cpus=${os.cpus().length} settings={runConc:${RUN_CONCURRENCY},batchConc:${HOLD_BATCH_CONCURRENCY},probeConc:${PROBE_CONCURRENCY},muxConc:${MUX_CONCURRENCY},threads:hold=${HOLD_THREADS}/run${RUN_THREADS},hold:${HOLD_PRESET}/crf${HOLD_CRF}${HOLD_TUNE.length ? "+" + HOLD_TUNE.join(" ") : ""},run:${RUN_PRESET}/crf${RUN_CRF}}`);
+  await ensureGpuProbe();
+  perfMark(jobDir, perfT0, `start mode=${mode} slides=${Array.isArray(durations) ? durations.length : "?"} cpus=${os.cpus().length} gpu=${gpuEncodeOn() ? "nvenc" : "cpu"} settings={runConc:${RUN_CONCURRENCY},batchConc:${HOLD_BATCH_CONCURRENCY},probeConc:${PROBE_CONCURRENCY},muxConc:${MUX_CONCURRENCY},threads:hold=${HOLD_THREADS}/run${RUN_THREADS},hold:${HOLD_PRESET}/crf${HOLD_CRF}${HOLD_TUNE.length ? "+" + HOLD_TUNE.join(" ") : ""},run:${RUN_PRESET}/crf${RUN_CRF}}`);
 
   // Render one static hold (single image -> mp4). Fast and never hangs.
   // Input is the RAW upload; canvas scaling happens inline (Phase 2).
@@ -657,37 +759,32 @@ app.post("/api/generate", async (req, res) => {
     const head = isClip
       ? ["-y", "-nostdin", "-i", rawPath]
       : ["-y", "-nostdin", "-framerate", "30", "-i", rawPath];
-    const tail = [
-      "-r", "30", "-c:v", "libx264", "-preset", HOLD_PRESET, "-crf", HOLD_CRF,
-      "-pix_fmt", "yuv420p", "-threads", String(HOLD_THREADS), "-t", d.toString(), outPath,
+    const staticArgs = () => [
+      ...head,
+      "-vf", isClip
+        ? `trim=start_frame=0:end_frame=${frames},setpts=PTS-STARTPTS,settb=1/30,${CLIP_TAIL}`
+        : `trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${SCALE_FILTER},loop=loop=${frames - 1}:size=1`,
+      "-r", "30",
+      // stillimage tune only fits static frames on the CPU encoder.
+      ...(isClip || gpuEncodeOn() ? [] : HOLD_TUNE),
+      ...vEncArgs("hold"),
+      "-t", d.toString(), outPath,
     ];
-    const staticArgs = isClip
-      ? [
-          ...head,
-          "-vf", `trim=start_frame=0:end_frame=${frames},setpts=PTS-STARTPTS,settb=1/30,${CLIP_TAIL}`,
-          ...tail,
-        ]
-      : [
-          ...head,
-          "-vf", `trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${SCALE_FILTER},loop=loop=${frames - 1}:size=1`,
-          ...tail.slice(0, 3), ...HOLD_TUNE, ...tail.slice(3),
-        ];
-    const args = motion
-      ? [
-          ...head,
-          "-filter_complex",
-          buildMotionBranch(motion.shot, {
-            mode: "fc", inputIdx: 0, outLabel: "vout",
-            loopFrames: frames, tOff: motion.tOff ?? 0,
-            inputKind: isClip ? "video" : "still",
-          }),
-          "-map", "[vout]",
-          // stillimage tune only fits static frames — moving content drops it.
-          ...tail,
-        ]
-      : staticArgs;
+    const motionArgs = () => [
+      ...head,
+      "-filter_complex",
+      buildMotionBranch(motion!.shot, {
+        mode: "fc", inputIdx: 0, outLabel: "vout",
+        loopFrames: frames, tOff: motion!.tOff ?? 0,
+        inputKind: isClip ? "video" : "still",
+      }),
+      "-map", "[vout]",
+      // stillimage tune only fits static frames — moving content drops it.
+      "-r", "30", ...vEncArgs("hold"),
+      "-t", d.toString(), outPath,
+    ];
     try {
-      await runFfmpeg(args, { jobDir, label, timeoutMs: 120000 });
+      await runVideoFfmpeg(motion ? motionArgs : staticArgs, { jobDir, label, timeoutMs: 120000 });
     } catch (e) {
       // Motion safety net: the animated zoom re-initialises the scaler every
       // frame and faults on some long shots in this ffmpeg build. One branch
@@ -697,11 +794,11 @@ app.post("/api/generate", async (req, res) => {
       try {
         // The fault is intermittent (per-frame scaler reinit), so one retry
         // usually keeps the camera move instead of dropping to a still.
-        await runFfmpeg(args, { jobDir, label: `${label} (motion retry)`, timeoutMs: 120000 });
+        await runVideoFfmpeg(motionArgs, { jobDir, label: `${label} (motion retry)`, timeoutMs: 120000 });
         return d;
       } catch (e2) {
         appendLog(jobDir, "ffmpeg.log", `[motion fallback to static] ${label}: ${(e2 as Error).message}`);
-        await runFfmpeg(staticArgs, { jobDir, label: `${label} (static)`, timeoutMs: 120000 });
+        await runVideoFfmpeg(staticArgs, { jobDir, label: `${label} (static)`, timeoutMs: 120000 });
       }
     }
     return d;
@@ -754,27 +851,27 @@ app.post("/api/generate", async (req, res) => {
         "-filter_complex", f,
         "-map", "[vout]",
         "-r", "30", "-filter_complex_threads", String(HOLD_THREADS),
-        "-c:v", "libx264", "-preset", HOLD_PRESET,
-        // stillimage tune fits still frames only — motion or clips drop it.
-        "-crf", HOLD_CRF, ...(withMotion || anyClip ? [] : HOLD_TUNE), "-pix_fmt", "yuv420p",
-        "-threads", String(HOLD_THREADS),
+        // stillimage tune fits still frames only — motion, clips or the GPU
+        // encoder drop it.
+        ...(withMotion || anyClip || gpuEncodeOn() ? [] : HOLD_TUNE),
+        ...vEncArgs("hold"),
         "-t", total.toString(),
         outPath,
       ];
     };
     try {
-      await runFfmpeg(buildBatch(anyMotion), { jobDir, label, timeoutMs: 600000 });
+      await runVideoFfmpeg(() => buildBatch(anyMotion), { jobDir, label, timeoutMs: 600000 });
     } catch (e) {
       // Motion safety net (see renderHold): a faulty motion branch must never
       // fail the batch — rerun the identical timeline as clean stills.
       if (!anyMotion) throw e;
       appendLog(jobDir, "ffmpeg.log", `[motion retry] ${label}: ${(e as Error).message}`);
       try {
-        await runFfmpeg(buildBatch(true), { jobDir, label: `${label} (motion retry)`, timeoutMs: 600000 });
+        await runVideoFfmpeg(() => buildBatch(true), { jobDir, label: `${label} (motion retry)`, timeoutMs: 600000 });
         return total;
       } catch (e2) {
         appendLog(jobDir, "ffmpeg.log", `[motion fallback to static] ${label}: ${(e2 as Error).message}`);
-        await runFfmpeg(buildBatch(false), { jobDir, label: `${label} (static)`, timeoutMs: 600000 });
+        await runVideoFfmpeg(() => buildBatch(false), { jobDir, label: `${label} (static)`, timeoutMs: 600000 });
       }
     }
     return total;
@@ -861,27 +958,25 @@ app.post("/api/generate", async (req, res) => {
       a.push(
         "-filter_complex", f, "-map", "[vout]",
         "-r", "30", "-filter_complex_threads", String(RUN_THREADS),
-        "-c:v", "libx264", "-preset", RUN_PRESET,
-        "-crf", RUN_CRF, "-pix_fmt", "yuv420p",
-        "-threads", String(RUN_THREADS),
+        ...vEncArgs("run"),
         "-t", expected.toString(),
         outPath
       );
       return a;
     };
     try {
-      await runFfmpeg(buildRun(anyMotion), { jobDir, label, timeoutMs: 300000 });
+      await runVideoFfmpeg(() => buildRun(anyMotion), { jobDir, label, timeoutMs: 300000 });
     } catch (e) {
       // Motion safety net (see renderHold): rerun the identical run as static
       // xfades rather than losing the job to a faulty motion branch.
       if (!anyMotion) throw e;
       appendLog(jobDir, "ffmpeg.log", `[motion retry] ${label}: ${(e as Error).message}`);
       try {
-        await runFfmpeg(buildRun(true), { jobDir, label: `${label} (motion retry)`, timeoutMs: 300000 });
+        await runVideoFfmpeg(() => buildRun(true), { jobDir, label: `${label} (motion retry)`, timeoutMs: 300000 });
         return expected;
       } catch (e2) {
         appendLog(jobDir, "ffmpeg.log", `[motion fallback to static] ${label}: ${(e2 as Error).message}`);
-        await runFfmpeg(buildRun(false), { jobDir, label: `${label} (static)`, timeoutMs: 300000 });
+        await runVideoFfmpeg(() => buildRun(false), { jobDir, label: `${label} (static)`, timeoutMs: 300000 });
       }
     }
     return expected;
@@ -897,9 +992,8 @@ app.post("/api/generate", async (req, res) => {
         { jobDir, label: label + " (copy)", timeoutMs: 180000 });
     } catch (e) {
       appendLog(jobDir, "ffmpeg.log", `[concat copy failed, retrying with re-encode] ${label}: ${(e as Error).message}`);
-      await runFfmpeg(["-y", "-nostdin", "-f", "concat", "-safe", "0", "-i", listPath,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", outPath],
-        { jobDir, label: label + " (re-encode)", timeoutMs: 600000 });    }
+      const build = () => ["-y", "-nostdin", "-f", "concat", "-safe", "0", "-i", listPath, ...vEncArgs("fb"), outPath];
+      await runVideoFfmpeg(build, { jobDir, label: label + " (re-encode)", timeoutMs: 600000 });    }
   };
 
   // ---- Professional audio pipeline ----
@@ -1209,7 +1303,7 @@ app.post("/api/generate", async (req, res) => {
       const fontOk = fs.existsSync(SLIDE_FONT_PATH);
       if (!fontOk) appendLog(jobDir, "ffmpeg.log", `[slides] headline font missing; rendering titleless`);
       setJobProgress(jobId, 2, "preparing", `Compositing ${unitSpecs.length} slides...`);
-      const built = await mapPool(unitSpecs, SLIDE_PRE_CONCURRENCY, async (u, i) => {
+      const built = await mapPool(unitSpecs, gpuConc(SLIDE_PRE_CONCURRENCY), async (u, i) => {
         checkCancelled(jobId);
         const trivial = u.spec.images.length === 1 && !u.spec.title && u.spec.enter === "none";
         if (trivial) return { path: u.rawPaths[0], clip: false };
@@ -1220,18 +1314,21 @@ app.post("/api/generate", async (req, res) => {
           const effSpec: SlideSpec = fontOk ? u.spec : { ...u.spec, title: "" };
           const geom = layoutSlide(effSpec);
           const { filter } = buildSlideFilter(effSpec, geom, totalLen);
-          const args: string[] = ["-y", "-nostdin"];
-          args.push("-f", "lavfi", "-i", `color=c=${SLIDE_BG}:s=${SLIDE_W}x${SLIDE_H}:r=${SLIDE_FPS}:d=${totalLen}`);
-          for (const rp of u.rawPaths) args.push("-framerate", "30", "-loop", "1", "-i", rp);
-          if (geom.title && effSpec.title) {
-            args.push("-f", "lavfi", "-i", `color=c=black:s=${SLIDE_W}x${geom.title.boxH}:r=${SLIDE_FPS}:d=${totalLen}`);
-          }
-          args.push(
-            "-filter_complex", filter, "-map", "[slide]",
-            "-r", "30", "-c:v", "libx264", "-preset", SLIDE_PRESET, "-crf", SLIDE_CRF,
-            "-pix_fmt", "yuv420p", "-t", String(totalLen), u.clipPath
-          );
-          await runFfmpeg(args, { jobDir, label: `slide_${i}x${u.spec.images.length}`, timeoutMs: 120000 });
+          const build = (): string[] => {
+            const args: string[] = ["-y", "-nostdin"];
+            args.push("-f", "lavfi", "-i", `color=c=${SLIDE_BG}:s=${SLIDE_W}x${SLIDE_H}:r=${SLIDE_FPS}:d=${totalLen}`);
+            for (const rp of u.rawPaths) args.push("-framerate", "30", "-loop", "1", "-i", rp);
+            if (geom.title && effSpec.title) {
+              args.push("-f", "lavfi", "-i", `color=c=black:s=${SLIDE_W}x${geom.title.boxH}:r=${SLIDE_FPS}:d=${totalLen}`);
+            }
+            args.push(
+              "-filter_complex", filter, "-map", "[slide]",
+              "-r", "30", ...vEncArgs("slide"),
+              "-t", String(totalLen), u.clipPath
+            );
+            return args;
+          };
+          await runVideoFfmpeg(build, { jobDir, label: `slide_${i}x${u.spec.images.length}`, timeoutMs: 120000 });
           return { path: u.clipPath, clip: true };
         } catch (e) {
           // One bad slide must never fail the job: fall back to its first
@@ -1469,16 +1566,53 @@ app.post("/api/generate", async (req, res) => {
         // a hard cut so segments stay independent. Documented limitation for scale.
       }
 
+      // Split long MOTION batches into single-item pieces so they parallelize
+      // (Phase 6). A 6-item motion streak encodes serially in ONE ffmpeg pass
+      // (filter graph + encode both single-threaded across the whole span); on
+      // a many-core box that leaves cores idle. Splitting into per-item pieces
+      // lets mapPool run them across HOLD_BATCH_CONCURRENCY at once. Costs one
+      // extra concat (stream-copy, ~ms). We only split MOTION batches — static
+      // batches are already cheap (single-decode graph) and splitting them adds
+      // I/O without a wall-clock win. Clips stay whole (their animation is
+      // per-piece already and cheap), so only `motion` items are split points.
+      const splitMotionBatch = (b: Extract<Piece, { kind: "batch" }>): Extract<Piece, { kind: "batch" }>[] => {
+        const motionCount = b.items.filter(it => it.motion).length;
+        // Only worth splitting when motion dominates AND there are several
+        // units (a 1-2 item batch gains little and pays an extra concat).
+        if (motionCount === 0 || b.items.length < 3 || motionCount < b.items.length - 1) return [b];
+        return b.items.map((it, h) => ({
+          ...b,
+          outPath: path.join(jobDir, `batch_${b.order}_m${h}.mp4`),
+          estDur: Number(it.dur.toFixed(3)),
+          items: [it],
+        }));
+      };
+      const expanded: Piece[] = [];
+      for (const p of pieces) {
+        if (p.kind === "batch") expanded.push(...splitMotionBatch(p));
+        else expanded.push(p);
+      }
+      const renderPieces = expanded;
+      const totalRenderUnits = renderPieces.length;
+
       // Render pieces with bounded concurrency + per-piece fallback (never fail whole job).
       let done = 0;
-      const totalUnits = pieces.length;
       const reportUnit = (piece: Piece) => {
         done++;
-        setJobProgress(jobId, 15 + Math.round((done / totalUnits) * 45),
-          "rendering transitions", `Rendering transitions ${done}/${totalUnits} (segment ${piece.segIdx + 1}/${nSeg})...`);
+        setJobProgress(jobId, 15 + Math.round((done / totalRenderUnits) * 45),
+          "rendering transitions", `Rendering transitions ${done}/${totalRenderUnits} (segment ${piece.segIdx + 1}/${nSeg})...`);
       };
-      // Light hold batches first, wide parallelism.
-      await mapPool(pieces.filter(p => p.kind === "batch"), HOLD_BATCH_CONCURRENCY, async (piece) => {
+      // Light hold batches first, wide parallelism. Split motion children each
+      // render to their own file; ONE stream-copy concat per parent rejoins
+      // them at the parent's outPath after the pool, so downstream assembly is
+      // untouched (children preserve items order).
+      const parentChildren = new Map<string, string[]>();
+      for (const p of pieces) {
+        if (p.kind !== "batch") continue;
+        const kids = renderPieces.filter(c => c.kind === "batch" && c.order === p.order).map(c => c.outPath);
+        if (kids.length > 1) parentChildren.set(p.outPath, kids);
+      }
+      await mapPool(renderPieces.filter(p => p.kind === "batch"), HOLD_BATCH_CONCURRENCY, async (piece) => {
         checkCancelled(jobId);
         const b = piece as Extract<Piece, { kind: "batch" }>;
         const label = `holdbatch_${b.order}x${b.items.length}`;
@@ -1499,8 +1633,14 @@ app.post("/api/generate", async (req, res) => {
         }
         reportUnit(piece);
       });
+      // Reassemble split batches (stream-copy, frame-exact).
+      if (parentChildren.size > 0) {
+        await mapPool([...parentChildren.entries()], 4, async ([parentPath, kids]) => {
+          await concatPieces(kids, parentPath, `reassemble_${path.basename(parentPath)}`);
+        });
+      }
       // Heavy xfade runs, narrow parallelism.
-      const xrunPieces = pieces.filter(p => p.kind === "xrun") as Extract<Piece, { kind: "xrun" }>[];
+      const xrunPieces = renderPieces.filter(p => p.kind === "xrun") as Extract<Piece, { kind: "xrun" }>[];
       for (let i = 0; i < xrunPieces.length; i += RUN_CONCURRENCY) {
         checkCancelled(jobId);
         const batch = xrunPieces.slice(i, i + RUN_CONCURRENCY);
