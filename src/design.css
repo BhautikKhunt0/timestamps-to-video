@@ -515,6 +515,53 @@ textarea { font-family: inherit; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .tile-dur { font-family: var(--font-mono); font-size: 9px; color: var(--acc); flex: none; }
+/* Video asset markers: source length + whether the slot trims or loops it. */
+.tile-vid, .cc-vid {
+  position: absolute; left: 6px; bottom: 6px; z-index: 2;
+  font-family: var(--font-mono); font-size: 8px; font-weight: 700;
+  letter-spacing: 0.08em; line-height: 1;
+  color: #fff; background: rgba(255, 90, 31, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 4px; padding: 3px 5px;
+}
+.tile-vid.loop, .cc-vid.loop { background: rgba(59, 130, 246, 0.92); }
+.cc-vid { left: 5px; bottom: 5px; font-size: 7.5px; padding: 2px 4px; }
+.tile-thumb video.tile-img, .cc-thumb video.tile-img { background: #000; }
+/* Per-clip original-audio level on video tiles (Footage page). */
+.tile-vol {
+  display: flex; align-items: center; gap: 7px;
+  padding: 6px 9px 8px;
+  border-top: 1px solid var(--line);
+  background: rgba(255, 145, 77, 0.045);
+}
+.vol-btn {
+  flex: none;
+  display: grid; place-items: center;
+  width: 20px; height: 20px;
+  border: 1px solid var(--line-3); border-radius: 5px;
+  background: rgba(255, 255, 255, 0.03); color: var(--ink-2);
+  cursor: pointer;
+}
+.vol-btn:hover { border-color: var(--acc-line); color: var(--acc); }
+.vol-btn.on { border-color: var(--acc); background: var(--acc); color: #fff; }
+.vol-btn.mute { border-color: var(--danger-line); background: rgba(244, 63, 94, 0.08); color: var(--danger); }
+.tile-vol input[type="range"] {
+  flex: 1 1 40px; min-width: 36px;
+  accent-color: var(--acc);
+  height: 14px; cursor: pointer;
+}
+.vol-pct {
+  flex: none; min-width: 34px; text-align: right;
+  font-family: var(--font-mono); font-size: 9px; color: var(--ink-2);
+}
+.cc-thumb .cc-idx { z-index: 2; }
+.th-vid {
+  position: absolute; inset: 0; z-index: 1;
+  display: grid; place-items: center;
+  font-size: 10px; color: rgba(255, 255, 255, 0.9);
+  background: rgba(0, 0, 0, 0.24);
+  pointer-events: none;
+}
 .asset-tile.add {
   display: grid; place-items: center;
   min-height: 118px;
@@ -988,6 +1035,7 @@ button.audio-row:hover { transform: translateY(-2px); }
   outline: none;
 }
 .slide-title-input::placeholder { color: var(--ink-3); }
+.slide-title-input:disabled { opacity: 0.42; cursor: not-allowed; }
 .slide-ops { display: flex; gap: 6px; flex: none; align-self: center; }
 
 /* custom select (transition pickers) */
@@ -1003,6 +1051,8 @@ button.audio-row:hover { transform: translateY(-2px); }
   transition: border-color 0.15s;
 }
 .cselect-btn:hover { border-color: var(--line-3); }
+.cselect.dis .cselect-btn { opacity: 0.42; cursor: not-allowed; }
+.cselect.dis .cselect-btn:hover { border-color: var(--line-2); }
 .cselect-btn .trunc { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sel-chev { color: var(--ink-3); transition: transform 0.18s; flex: none; }
 .sel-chev.open { transform: rotate(180deg); }

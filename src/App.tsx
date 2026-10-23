@@ -3,7 +3,7 @@ import {
   Upload, AlertCircle, Loader2, X, CheckCircle2,
   Download, Play, Pause, Music, RefreshCw, Clock,
   Sparkles, Scissors, ArrowLeft, ArrowRight, ChevronDown,
-  MoveLeft, MoveRight, MoveUp, MoveDown
+  MoveLeft, MoveRight, MoveUp, MoveDown, Volume2, VolumeX
 } from "lucide-react";
 import { parseTimestamps } from "./utils/parser";
 import { planMotion, motionBadge, introCutoff, MOTION_INTRO_SECONDS } from "./utils/motion";
@@ -40,6 +40,67 @@ const STEPS = [
 ];
 
 const pad2 = (n: number) => String(Math.max(0, Math.floor(n))).padStart(2, "0");
+
+// A timeline asset is either a still or a live video clip. Browsers
+// occasionally hand us an empty MIME type, so the extension is the fallback.
+const isVideoFile = (file?: File | null): boolean =>
+  !!file && (file.type.startsWith("video/") ||
+    /\.(mp4|m4v|mov|webm|mkv|avi|wmv|flv|mpe?g|3gp|mts?|ts|ogv|f4v|h264|h265|hevc)$/i.test(file.name));
+
+const isImageFile = (file: File): boolean =>
+  file.type.startsWith("image/") ||
+  /\.(png|jpe?g|webp|gif|avif|bmp|tiff?)$/i.test(file.name);
+
+type MediaMeta = { thumb?: string; dur?: number; vol?: number };
+
+// Pull a poster frame + duration out of a local video before it is uploaded.
+// The poster drives every still-only preview surface (cuts, phases, xfade
+// preview); the duration is shown on the asset tile so users can see how much
+// source footage a slot consumes.
+const probeVideoMeta = (file: File): Promise<MediaMeta> => new Promise((resolve) => {
+  const url = URL.createObjectURL(file);
+  const v = document.createElement("video");
+  v.muted = true;
+  v.playsInline = true;
+  v.preload = "auto";
+  let meta: MediaMeta = {};
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
+    try { v.removeAttribute("src"); v.load(); } catch { /* detached */ }
+    URL.revokeObjectURL(url);
+    resolve(meta);
+  };
+  const capture = () => {
+    try {
+      const vw = v.videoWidth || 640;
+      const vh = v.videoHeight || 360;
+      const scale = Math.min(1, 480 / Math.max(1, vw));
+      const c = document.createElement("canvas");
+      c.width = Math.max(2, Math.round(vw * scale));
+      c.height = Math.max(2, Math.round(vh * scale));
+      const g = c.getContext("2d");
+      if (g && vw > 0 && vh > 0) {
+        g.drawImage(v, 0, 0, c.width, c.height);
+        meta = { ...meta, thumb: c.toDataURL("image/jpeg", 0.8) };
+      }
+    } catch { /* poster unavailable — tiles fall back to the video element */ }
+    finish();
+  };
+  const timer = setTimeout(finish, 12000);
+  v.onloadedmetadata = () => {
+    if (Number.isFinite(v.duration) && v.duration > 0) meta = { ...meta, dur: v.duration };
+    try {
+      v.currentTime = Math.min(1, Math.max(0, (v.duration || 0) * 0.05));
+      if (!(v.duration > 0)) capture();
+    } catch { capture(); }
+  };
+  v.onseeked = capture;
+  v.onerror = finish;
+  v.src = url;
+});
 
 const toTimecode = (sec: number) => {
   // Derive from whole frames so the readout always equals the 30fps render
@@ -117,15 +178,18 @@ const safeParseResponse = async (res: Response): Promise<{ ok: boolean; data: an
       return { ok: false, data: null, error: `Server returned HTTP ${res.status}: ${text.substring(0, 100)}` };
     }
     if (text.toLowerCase().includes("<!doctype html>")) {
-      return { ok: false, data: null, error: "Upload failed: Proxy or server returned HTML fallback. Please retry with smaller images." };
+      return { ok: false, data: null, error: "Upload failed: Proxy or server returned HTML fallback. Please retry — large media is uploaded in chunks." };
     }
     return { ok: true, data: text };
   } catch (err: any) {
-    return { ok: false, data: null, error: err.message || "Network or parsing error" };
+    const msg = err?.message === "Failed to fetch"
+      ? "Network error — the server did not respond. Check that the app is running, then retry."
+      : (err.message || "Network or parsing error");
+    return { ok: false, data: null, error: msg };
   }
 };
 
-const CustomSelect = ({ value, onChange, options, className = "", dropdownUp = false }: any) => {
+const CustomSelect = ({ value, onChange, options, className = "", dropdownUp = false, disabled = false }: any) => {
   const [isOpen, setIsOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -142,8 +206,8 @@ const CustomSelect = ({ value, onChange, options, className = "", dropdownUp = f
   const selectedOption = options.find((opt: any) => opt.value === value) || options[0];
 
   return (
-    <div className={`cselect ${className}`} ref={containerRef}>
-      <button type="button" className="cselect-btn" onClick={() => setIsOpen(!isOpen)}>
+    <div className={`cselect ${className} ${disabled ? "dis" : ""}`} ref={containerRef}>
+      <button type="button" className="cselect-btn" disabled={disabled} onClick={() => setIsOpen(!isOpen)}>
         <span className="trunc">{selectedOption?.label}</span>
         <ChevronDown className={`ic ic-14 sel-chev ${isOpen ? "open" : ""}`} />
       </button>
@@ -408,7 +472,10 @@ export default function App() {
       if (idx.length === 0 || idx.length > 3) return null;
       idx.forEach((v) => seen.add(v));
       const enter: SlideEnter = s.enter === "up" || s.enter === "down" || s.enter === "left" || s.enter === "right" || s.enter === "none" ? s.enter : "none";
-      out.push({ imageIndices: idx, enter, title: typeof s.title === "string" ? s.title.slice(0, 60) : "" });
+      const title = typeof s.title === "string" ? s.title.slice(0, 60) : "";
+      // A video always plays as its own live unit — slides composite stills.
+      if (idx.some((v) => isVideoFile(images[v])) && (idx.length > 1 || !!title || enter !== "none")) return null;
+      out.push({ imageIndices: idx, enter, title });
     }
     return seen.size === images.length ? out : null;
   }, [slides, images]);
@@ -430,13 +497,21 @@ export default function App() {
     return out;
   }, [structActive, structSlides, transitions]);
   const unitCount = structActive && structSlides ? structSlides.length : images.length;
+  // Which timeline units are live video clips (no Ken Burns, no card compose).
+  const unitIsVideo = useMemo(
+    () => unitSlides.map((s) => s.imageIndices.length === 1 && isVideoFile(images[s.imageIndices[0]])),
+    [unitSlides, images]
+  );
 
   // Slide editing ops (merge keeps totals: durations are member sums).
+  const slideHasVideo = (indices: number[]) => indices.some((gi) => isVideoFile(images[gi]));
   const mergeSlide = (k: number) => setSlides((prev) => {
     const base = prev ?? autoSlides;
     if (k < 0 || k >= base.length - 1) return prev;
     const a = base[k], b = base[k + 1];
     if (a.imageIndices.length + b.imageIndices.length > 3) return prev;
+    // Live clips never get composited into a still slide — they play as-is.
+    if (slideHasVideo([...a.imageIndices, ...b.imageIndices])) return prev;
     const next = [...base];
     next.splice(k, 2, { imageIndices: [...a.imageIndices, ...b.imageIndices], enter: a.enter, title: a.title });
     return next;
@@ -495,6 +570,12 @@ export default function App() {
       { imageCount: unitCount }),
     [unitDurs, effTransitions, effTransDurs, motionOn, motionStyle, motionSeed, motionIntroSec, motionTail, unitCount]
   );
+  // Live video units never receive a Ken Burns move on the server, so the
+  // badge map must not claim one either.
+  const shownBadgePlan = useMemo(
+    () => badgePlan.map((b, i) => (unitIsVideo[i] ? null : b)),
+    [badgePlan, unitIsVideo]
+  );
 
   // ── Design-only view state (no business logic) ──────────────────
   const [view, setView] = useState(0);              // 0 Footage · 1 Timeline · 2 Motion · 3 Editor
@@ -518,6 +599,113 @@ export default function App() {
     setImageUrls(urls);
     return () => urls.forEach(url => URL.revokeObjectURL(url));
   }, [images]);
+
+  // Video poster frames + source durations, keyed by the File object (indexes
+  // shift when assets are removed; the File identity does not).
+  const [mediaMeta, setMediaMeta] = useState<Map<File, MediaMeta>>(new Map());
+  const mediaMetaRef = useRef(mediaMeta);
+  mediaMetaRef.current = mediaMeta;
+  const probingVideosRef = useRef<Set<File>>(new Set());
+  useEffect(() => {
+    const alive = new Set(images);
+    setMediaMeta((prev) => {
+      let changed = false;
+      const next = new Map<File, MediaMeta>();
+      for (const [f, m] of prev) {
+        if (alive.has(f)) next.set(f, m);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+    const missing = images.filter((f) =>
+      isVideoFile(f) && !mediaMetaRef.current.has(f) && !probingVideosRef.current.has(f));
+    if (missing.length === 0) return;
+    let dead = false;
+    missing.forEach((f) => probingVideosRef.current.add(f));
+    (async () => {
+      const queue = [...missing];
+      await Promise.all(Array.from({ length: Math.min(4, queue.length) }, async () => {
+        while (queue.length > 0) {
+          const file = queue.shift()!;
+          const meta = await probeVideoMeta(file);
+          probingVideosRef.current.delete(file);
+          if (dead) continue;
+          setMediaMeta((prev) => {
+            // Merge, never replace: a volume set before probing finished lands
+            // in the map first and must survive the probe result.
+            const next = new Map(prev);
+            next.set(file, { ...meta, vol: prev.get(file)?.vol });
+            return next;
+          });
+        }
+      }));
+    })();
+    return () => {
+      dead = true;
+      missing.forEach((f) => probingVideosRef.current.delete(f));
+    };
+  }, [images]);
+
+  const posterFor = (index: number): string | undefined => {
+    const file = images[index];
+    if (!file) return undefined;
+    return isVideoFile(file) ? mediaMeta.get(file)?.thumb : imageUrls[index];
+  };
+  const sourceDurFor = (index: number): number | undefined => {
+    const file = images[index];
+    return file && isVideoFile(file) ? mediaMeta.get(file)?.dur : undefined;
+  };
+
+  // Per-clip ORIGINAL-audio level in PERCENT (100 = as recorded, 0 = mute,
+  // up to 200 to lift quiet sources). Keyed by the File object so it survives
+  // reorders and removals exactly like the poster/duration do.
+  const clipVolFor = (index: number): number => {
+    const file = images[index];
+    const v = file ? mediaMeta.get(file)?.vol : undefined;
+    return typeof v === "number" ? v : 100;
+  };
+  const setClipVol = (index: number, pct: number) => {
+    const file = images[index];
+    if (!file) return;
+    const v = Math.min(200, Math.max(0, Math.round(pct)));
+    const cur = mediaMeta.get(file);
+    setMediaMeta((prev) => {
+      const next = new Map(prev);
+      next.set(file, { thumb: cur?.thumb, dur: cur?.dur, vol: v });
+      return next;
+    });
+    const el = document.querySelector(`video[data-vid-idx="${index}"]`) as HTMLVideoElement | null;
+    if (el && !el.muted) el.volume = Math.min(1, v / 100);
+  };
+
+  // Click-to-listen: hover previews must stay muted (browsers refuse audio
+  // without a real gesture), so the speaker button is the gesture that unmutes
+  // ONE clip at its slider level while you dial it in.
+  const [listeningIdx, setListeningIdx] = useState<number | null>(null);
+  const stopListening = () => {
+    setListeningIdx((cur) => {
+      if (cur == null) return cur;
+      const el = document.querySelector(`video[data-vid-idx="${cur}"]`) as HTMLVideoElement | null;
+      if (el) { el.pause(); el.muted = true; }
+      return null;
+    });
+  };
+  const toggleListen = (index: number) => {
+    const el = document.querySelector(`video[data-vid-idx="${index}"]`) as HTMLVideoElement | null;
+    if (!el) { setListeningIdx(null); return; }
+    if (listeningIdx === index) { stopListening(); return; }
+    stopListening();
+    el.muted = false;
+    el.volume = Math.min(1, clipVolFor(index) / 100);
+    el.loop = true;
+    try { el.currentTime = 0; } catch { /* not seekable yet */ }
+    el.play()
+      .then(() => setListeningIdx(index))
+      .catch(() => { el.muted = true; });
+  };
+  // Leaving the footage page or changing the asset list ends any listening
+  // session (indexes shift on removal, so a stale one must not linger).
+  useEffect(() => { stopListening(); }, [images, view]);
 
   // Cap the imported-media grid to a ~15-tile viewport; everything past it scrolls.
   useEffect(() => {
@@ -552,7 +740,8 @@ export default function App() {
 
   const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
-      const filesArray = Array.from(e.target.files ?? []) as File[];
+      const filesArray = (Array.from(e.target.files ?? []) as File[])
+        .filter((file) => isImageFile(file) || isVideoFile(file));
       // Pick order = timeline order. Never re-sort by filename: same-named
       // files from different folders would otherwise swap places.
       setImages(prev => appendInUploadOrder(prev, filesArray));
@@ -573,7 +762,7 @@ export default function App() {
     e.currentTarget.classList.remove('drag-over');
     if (e.dataTransfer.files) {
       const filesArray = (Array.from(e.dataTransfer.files ?? []) as File[])
-        .filter((file: File) => file.type.startsWith('image/'));
+        .filter((file: File) => file.type.startsWith('image/') || isVideoFile(file) || isImageFile(file));
       // Drop order is pick order (see handleImageChange).
       setImages(prev => appendInUploadOrder(prev, filesArray));
     }
@@ -907,13 +1096,15 @@ export default function App() {
     stopSlice();
   };
   const startTransitionPreview = async ( typeId: string ) => {
-    if (imageUrls.length < 2) return;
+    const pA = posterFor(0);
+    const pB = posterFor(1);
+    if (!pA || !pB) return;
     stopSlice();
     pvRunRef.current.id = typeId;
     setPvPlaying(typeId);
     let imgA: HTMLImageElement, imgB: HTMLImageElement;
     try {
-      [imgA, imgB] = await Promise.all([loadImageEl(imageUrls[0]), loadImageEl(imageUrls[1])]);
+      [imgA, imgB] = await Promise.all([loadImageEl(pA), loadImageEl(pB)]);
     } catch {
       stopTransitionPreview();
       return;
@@ -1036,22 +1227,26 @@ export default function App() {
 
   const uploadBatchChunked = async (jobId: string, files: File[]) => {
     const BATCH_SIZE = 5;
-    let uploadedCount = 0;
+    // 3 MiB keeps every multipart request comfortably under common proxy
+    // limits (the cause of "Failed to fetch" on large single-body uploads).
+    const CHUNK_SIZE = 3 * 1024 * 1024;
+    const totalBytes = files.reduce((a, f) => a + (f.size || 0), 0) || 1;
+    const videoCount = files.filter(isVideoFile).length;
+    let videoNo = 0;
+    let doneBytes = 0;
+    const pushProgress = () =>
+      setUploadProgress(Math.max(0, Math.min(100, Math.round((doneBytes / totalBytes) * 100))));
 
-    for (let i = 0; i < files.length; i += BATCH_SIZE) {
-      const chunk = files.slice(i, i + BATCH_SIZE);
-      const chunkIndices = Array.from({ length: chunk.length }, (_, idx) => i + idx);
-
+    const uploadImageBatch = async (batch: File[], indices: number[]) => {
       let attempt = 0;
       const retries = 3;
-
       while (attempt < retries) {
         attempt++;
         try {
           const formData = new FormData();
           formData.append("jobId", jobId);
-          formData.append("indices", JSON.stringify(chunkIndices));
-          chunk.forEach(f => formData.append("images", f));
+          formData.append("indices", JSON.stringify(indices));
+          batch.forEach(f => formData.append("images", f));
 
           const res = await fetch("/api/upload-batch", { method: "POST", body: formData });
           const parsed = await safeParseResponse(res);
@@ -1062,11 +1257,11 @@ export default function App() {
           // server actually stored EVERY file in this chunk (it reports
           // per-file failures instead of failing the whole batch).
           const saved = parsed.data?.count;
-          if (typeof saved === "number" && saved !== chunk.length) {
+          if (typeof saved === "number" && saved !== batch.length) {
             const why = Array.isArray(parsed.data?.failed) && parsed.data.failed.length
               ? parsed.data.failed.join("; ")
               : "server reported no detail";
-            throw new Error(`Only ${saved}/${chunk.length} images were saved — ${why}`);
+            throw new Error(`Only ${saved}/${batch.length} assets were saved — ${why}`);
           }
           break;
         } catch (err: any) {
@@ -1074,14 +1269,85 @@ export default function App() {
           await new Promise(r => setTimeout(r, attempt * 600));
         }
       }
-      uploadedCount += chunk.length;
-      setUploadProgress(Math.round((uploadedCount / files.length) * 100));
+    };
+
+    const uploadVideoChunked = async (file: File, index: number) => {
+      if (file.size <= 0) throw new Error(`"${file.name}" is empty — upload a playable video.`);
+      const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+      const extMatch = /\.([a-z0-9]{1,8})$/i.exec(file.name || "");
+      const ext = extMatch ? `.${extMatch[1].toLowerCase()}` : "";
+      for (let c = 0; c < totalChunks; c++) {
+        const start = c * CHUNK_SIZE;
+        const end = Math.min(file.size, start + CHUNK_SIZE);
+        const blob = file.slice(start, end);
+        let lastErr: any = null;
+        // Transport failures throw TypeError("Failed to fetch") — retry the
+        // SAME chunk with backoff instead of restarting the whole video.
+        for (let attempt = 1; attempt <= 5; attempt++) {
+          try {
+            const formData = new FormData();
+            formData.append("jobId", jobId);
+            formData.append("idx", String(index));
+            formData.append("chunkIndex", String(c));
+            formData.append("totalChunks", String(totalChunks));
+            if (ext) formData.append("ext", ext);
+            formData.append("chunk", blob, `${file.name || "video"}.part`);
+
+            const res = await fetch("/api/upload-chunk", { method: "POST", body: formData });
+            const parsed = await safeParseResponse(res);
+            if (!parsed.ok || parsed.data?.success === false) {
+              throw new Error(parsed.error || `Chunk ${c + 1}/${totalChunks} was rejected`);
+            }
+            lastErr = null;
+            break;
+          } catch (err: any) {
+            lastErr = err;
+            if (attempt < 5) await new Promise(r => setTimeout(r, 700 * 2 ** (attempt - 1)));
+          }
+        }
+        if (lastErr) {
+          throw new Error(
+            `Video "${file.name}" failed to upload (chunk ${c + 1}/${totalChunks}): ${lastErr.message}. ` +
+            `The connection was interrupted — press Render again to retry.`
+          );
+        }
+        doneBytes += end - start;
+        pushProgress();
+      }
+    };
+
+    let i = 0;
+    while (i < files.length) {
+      if (isVideoFile(files[i])) {
+        videoNo++;
+        setUploadStatusText(videoCount > 1
+          ? `Uploading video ${videoNo}/${videoCount} — ${files[i].name}`
+          : `Uploading video — ${files[i].name}`);
+        await uploadVideoChunked(files[i], i);
+        i++;
+        continue;
+      }
+      // Consecutive images still ride one request (small bodies).
+      const batch: File[] = [];
+      const indices: number[] = [];
+      while (i < files.length && batch.length < BATCH_SIZE && !isVideoFile(files[i])) {
+        batch.push(files[i]);
+        indices.push(i);
+        i++;
+      }
+      setUploadStatusText(batch.length === 1
+        ? `Uploading image — ${batch[0].name}`
+        : `Uploading ${batch.length} images…`);
+      await uploadImageBatch(batch, indices);
+      doneBytes += batch.reduce((a, f) => a + (f.size || 0), 0);
+      pushProgress();
     }
+    setUploadProgress(100);
   };
 
   const handleGenerate = async () => {
     if (images.length === 0) {
-      setError("Please upload at least one image.");
+      setError("Please add at least one image or video.");
       return;
     }
 
@@ -1112,8 +1378,14 @@ export default function App() {
       }
 
       const jobId = initParsed.data.jobId;
+      // Guard against a stale backend (e.g. an old `npm start` build): the
+      // chunked video upload route does not exist there, which otherwise
+      // fails only after the video's chunks are attempted.
+      if (Number(initParsed.data?.serverVersion || 0) < 2) {
+        throw new Error("The server is running an older build without video upload support. Stop it and restart `npm run dev` (or rebuild with `npm run build` then `npm start`), then refresh this page.");
+      }
 
-      setUploadStatusText("Uploading images...");
+      setUploadStatusText("Uploading media...");
       await uploadBatchChunked(jobId, images);
 
       if (audioFiles.length > 0) {
@@ -1245,6 +1517,10 @@ export default function App() {
           transitionDurations: effTransDurs,
           transitionDuration: categoryDurations["fade"] || 0.5,
           motion: { enabled: motionOn, style: motionStyle, seed: motionSeed, introSeconds: motionIntroSec, tail: motionTail },
+          // Per-clip original-audio level (percent, unit-indexed). The server
+          // keeps each clip's own sound, scaled and placed on the timeline.
+          clipVolumes: unitSlides.map((s, k) =>
+            unitIsVideo[k] ? clipVolFor(s.imageIndices[0]) : 100),
           // Per-cut SFX: resolved here (inherit type assignment -> cut override)
           // so the server only sees final { join, sound, volume, window } entries.
           sfx: {
@@ -1390,8 +1666,8 @@ export default function App() {
       : `0–${fmtSec(motionTailStart)}s mix · static tail`;
   // Phase ribbon: one marker per join, positioned by cumulative unit time.
   // Director stat chips: how many shots move in each phase.
-  const introMoves = badgePlan.slice(0, Math.min(introEnd, badgePlan.length)).filter(Boolean).length;
-  const tailMoves = badgePlan.slice(Math.min(introEnd, badgePlan.length)).filter(Boolean).length;
+  const introMoves = shownBadgePlan.slice(0, Math.min(introEnd, badgePlan.length)).filter(Boolean).length;
+  const tailMoves = shownBadgePlan.slice(Math.min(introEnd, badgePlan.length)).filter(Boolean).length;
   const liveTransitions = effTransitions.filter(t => t !== "none").length;
   const cutIndices = effTransitions.length > 0 ? effTransitions.map((_, i) => i) : [];
   const visibleCuts = showAllCuts ? cutIndices : cutIndices.slice(0, 6);
@@ -1494,8 +1770,8 @@ export default function App() {
           <span className="eyebrow">Step 01 — Source material</span>
           <h1 className="h-display">Bring in your <em>footage</em></h1>
           <p className="lede">
-            Drop frames and a soundtrack. Everything is sorted A→Z automatically, so your file
-            names become the story order — no dragging required.
+            Drop frames, video clips and a soundtrack. Images hold for their slot; videos are
+            trimmed from the top to the exact timeline length and loop when the slot runs longer.
           </p>
         </div>
 
@@ -1510,9 +1786,9 @@ export default function App() {
               onDragLeave={handleDragLeave}
             >
               <span className="corner tl mono">DROP ZONE</span>
-              <span className="corner br mono">JPG · PNG · WEBP</span>
+              <span className="corner br mono">JPG · PNG · MP4 · MOV · WEBM</span>
               <div className="orb"><Upload className="ic ic-26" /></div>
-              <h3>{images.length > 0 ? "Drop more frames" : "Drop frames here"}</h3>
+              <h3>{images.length > 0 ? "Drop more media" : "Drop images or videos here"}</h3>
               <div className="or">OR</div>
               <div className="drop-actions">
                 <button
@@ -1529,9 +1805,9 @@ export default function App() {
                 )}
               </div>
               <div className="drop-tags">
-                <span className="tag">AUTO-SORT A→Z</span>
-                <span className="tag">RENAME TO REORDER</span>
-                <span className="tag">NO SIZE LIMIT</span>
+                <span className="tag">IMAGES + VIDEO</span>
+                <span className="tag">AUTO-TRIM TO SLOT</span>
+                <span className="tag">SHORT CLIPS LOOP</span>
               </div>
             </div>
 
@@ -1551,11 +1827,46 @@ export default function App() {
                 ref={mediaGridRef}
                 style={mediaGridVh ? { maxHeight: mediaGridVh } : undefined}
               >
-                {images.map((file, index) => (
+                {images.map((file, index) => {
+                  const vid = isVideoFile(file);
+                  const srcDur = sourceDurFor(index);
+                  const slotDur = displayDurations[index] ?? defaultDurationPerImage;
+                  const loops = vid && srcDur != null && slotDur > srcDur + 0.05;
+                  const trims = vid && srcDur != null && slotDur < srcDur - 0.05;
+                  const vol = clipVolFor(index);
+                  return (
                   <div key={`${file.name}-${index}`} className="asset-tile">
                     <div className={`tile-thumb t${(index % 7) + 1}`}>
-                      <img src={imageUrls[index]} alt={file.name} className="tile-img" />
+                      {vid ? (
+                        <video
+                          className="tile-img"
+                          data-vid-idx={index}
+                          src={imageUrls[index]}
+                          poster={posterFor(index)}
+                          muted
+                          loop
+                          playsInline
+                          preload={posterFor(index) ? "none" : "metadata"}
+                          onMouseEnter={(e) => {
+                            if (listeningIdx === index) return;
+                            e.currentTarget.play().catch(() => {});
+                          }}
+                          onMouseLeave={(e) => {
+                            if (listeningIdx === index) return;
+                            const v = e.currentTarget;
+                            v.pause();
+                            try { v.currentTime = 0; } catch { /* not seekable yet */ }
+                          }}
+                        />
+                      ) : (
+                        <img src={imageUrls[index]} alt={file.name} className="tile-img" />
+                      )}
                       <span className="tile-idx">{pad2(index + 1)}</span>
+                      {vid && (
+                        <span className={`tile-vid ${loops ? "loop" : "trim"}`}>
+                          VIDEO{srcDur ? ` · ${srcDur.toFixed(1)}s` : ""}{loops ? " · LOOPS" : trims ? " · TRIM" : ""}
+                        </span>
+                      )}
                       <button
                         type="button"
                         className="tile-x"
@@ -1567,22 +1878,61 @@ export default function App() {
                     </div>
                     <div className="tile-bar">
                       <span className="tile-name">{file.name}</span>
-                      <span className="tile-dur">{(displayDurations[index] ?? defaultDurationPerImage).toFixed(1)}s</span>
+                      <span
+                        className="tile-dur"
+                        title={vid
+                          ? srcDur != null
+                            ? loops
+                              ? `Source ${srcDur.toFixed(2)}s loops to fill this ${slotDur.toFixed(2)}s slot`
+                              : `Uses the first ${slotDur.toFixed(2)}s of this ${srcDur.toFixed(2)}s clip`
+                            : `Trimmed to the ${slotDur.toFixed(2)}s timeline slot`
+                          : `Visible for ${slotDur.toFixed(2)}s`}
+                      >
+                        {slotDur.toFixed(1)}s
+                      </span>
                     </div>
+                    {vid && (
+                      <div className="tile-vol">
+                        <button
+                          type="button"
+                          className={`vol-btn${listeningIdx === index ? " on" : ""}${vol === 0 ? " mute" : ""}`}
+                          onClick={() => toggleListen(index)}
+                          title={vol === 0
+                            ? "Clip audio muted — raise the level to hear it"
+                            : listeningIdx === index
+                              ? "Stop listening"
+                              : "Play this clip's original sound"}
+                          aria-label={`Listen to the original sound of ${file.name}`}
+                        >
+                          {vol === 0 ? <VolumeX className="ic ic-12" /> : <Volume2 className="ic ic-12" />}
+                        </button>
+                        <input
+                          type="range"
+                          min={0}
+                          max={200}
+                          step={5}
+                          value={vol}
+                          onChange={(e) => setClipVol(index, Number(e.target.value))}
+                          aria-label={`Original audio level for ${file.name}`}
+                        />
+                        <span className="vol-pct">{vol === 0 ? "MUTE" : `${vol}%`}</span>
+                      </div>
+                    )}
                   </div>
-                ))}
+                  );
+                })}
                 <button type="button" className="asset-tile add" onClick={() => fileInputRef.current?.click()}>
-                  <span><Upload className="ic ic-20" /> ADD FRAMES</span>
+                  <span><Upload className="ic ic-20" /> ADD MEDIA</span>
                 </button>
               </div>
             ) : (
-              <div className="empty-note">No frames yet — drop files above to start your sequence.</div>
+              <div className="empty-note">No media yet — drop images or videos above to start your sequence.</div>
             )}
 
             <div className="sec-head">
               <span className="sec-title">Soundtrack <b>{audioFiles.length}</b></span>
               <span className="mono muted" style={{ fontSize: "9.5px", letterSpacing: ".14em" }}>
-                OPTIONAL · LOOPED TO FILL · NEVER MUTE
+                OPTIONAL · LOOPED TO FILL · CLIPS KEEP THEIR OWN AUDIO
               </span>
             </div>
 
@@ -1622,7 +1972,7 @@ export default function App() {
                 <span className="count mono">LIVE</span>
               </div>
               <div className="kv-list">
-                <div className="kv"><i>Frames</i><b>{images.length}</b></div>
+                <div className="kv"><i>Assets</i><b>{images.length}</b></div>
                 <div className="kv"><i>Soundtracks</i><b>{audioFiles.length}</b></div>
                 <div className="kv"><i>Est. runtime</i><b className="acc-t">{totalSeconds.toFixed(1)}s</b></div>
                 <div className="kv"><i>Output</i><b>1080p30</b></div>
@@ -1681,16 +2031,46 @@ export default function App() {
               {images.length > 0 ? (
                 <>
                   <div className="seq-strip">
-                    {images.map((file, index) => (
+                    {images.map((file, index) => {
+                      const vid = isVideoFile(file);
+                      const srcDur = sourceDurFor(index);
+                      const slotDur = displayDurations[index] ?? defaultDurationPerImage;
+                      const fit = srcDur == null ? ""
+                        : slotDur > srcDur + 0.05 ? " · LOOPS"
+                        : slotDur < srcDur - 0.05 ? " · TRIM" : "";
+                      return (
                       <React.Fragment key={`${file.name}-${index}`}>
                         <div className={`clip-card ${index === 0 ? "on" : ""}`}>
                           <div className={`cc-thumb t${(index % 7) + 1}`}>
-                            <img src={imageUrls[index]} alt={file.name} className="tile-img" />
+                            {vid ? (
+                              <video
+                                className="tile-img"
+                                src={imageUrls[index]}
+                                poster={posterFor(index)}
+                                muted
+                                loop
+                                playsInline
+                                preload={posterFor(index) ? "none" : "metadata"}
+                                onMouseEnter={(e) => { e.currentTarget.play().catch(() => {}); }}
+                                onMouseLeave={(e) => {
+                                  const v = e.currentTarget;
+                                  v.pause();
+                                  try { v.currentTime = 0; } catch { /* not seekable yet */ }
+                                }}
+                              />
+                            ) : (
+                              <img src={imageUrls[index]} alt={file.name} className="tile-img" />
+                            )}
                             <span className="cc-idx">{pad2(index + 1)}</span>
+                            {vid && (
+                              <span className={`cc-vid ${fit.includes("LOOPS") ? "loop" : fit.includes("TRIM") ? "trim" : ""}`}>
+                                VIDEO{srcDur ? ` · ${srcDur.toFixed(1)}s` : ""}{fit}
+                              </span>
+                            )}
                           </div>
                           <div className="cc-meta">
                             <span className="cc-name">{file.name}</span>
-                            <span className="cc-dur">SLIDE <b>{(displayDurations[index] ?? defaultDurationPerImage).toFixed(1)}s</b></span>
+                            <span className="cc-dur">{vid ? "CLIP" : "SLIDE"} <b>{(displayDurations[index] ?? defaultDurationPerImage).toFixed(1)}s</b></span>
                           </div>
                         </div>
                         {index < images.length - 1 && (() => {
@@ -1711,7 +2091,8 @@ export default function App() {
                           );
                         })()}
                       </React.Fragment>
-                    ))}
+                      );
+                    })}
                     <button type="button" className="clip-add" onClick={() => fileInputRef.current?.click()}>
                       <span><Upload className="ic ic-20" /> ADD CLIP</span>
                     </button>
@@ -1723,7 +2104,7 @@ export default function App() {
                 </>
               ) : (
                 <div className="empty-note" style={{ marginTop: 12 }}>
-                  No frames yet — add them on step 01 to build the sequence.
+                  No media yet — add images or videos on step 01 to build the sequence.
                 </div>
               )}
             </section>
@@ -2027,7 +2408,7 @@ export default function App() {
                     className="ph-stage ph-anim-zoom"
                     style={{ "--ph-z1": motionStyle === "subtle" ? 1.07 : motionStyle === "dynamic" ? 1.2 : 1.14 } as React.CSSProperties}
                   >
-                    {imageUrls[0] && <img src={imageUrls[0]} alt="" />}
+                    {posterFor(0) && <img src={posterFor(0)} alt="" />}
                     {motionOn && <span className="ph-live"><span className="pulse" />LIVE</span>}
                     <span className="ph-stage-cap mono">
                       {motionStyle === "subtle" ? "6–9% BREATH" : motionStyle === "dynamic" ? "11–18% BREATH" : "8–15% BREATH"}
@@ -2055,7 +2436,7 @@ export default function App() {
                   </div>
 
                   <div className={`ph-stage ${motionTail === "pan" ? "ph-anim-pan" : "ph-anim-none"}`}>
-                    {imageUrls[0] && <img src={imageUrls[0]} alt="" />}
+                    {posterFor(0) && <img src={posterFor(0)} alt="" />}
                     {motionOn && <span className="ph-live"><span className="pulse" />LIVE</span>}
                     <span className="ph-stage-cap mono">
                       {motionTail === "pan" ? "ALT PANS · ~0.55PX/FRAME" : "STATIC FRAMES"}
@@ -2250,18 +2631,20 @@ export default function App() {
                     // Visual family: blend / wipe / push / cut — colors the whole card.
                     const fam = item.id === "none" ? "cut" : item.id === "fade" ? "fade" : item.id.startsWith("smooth") ? "wipe" : "push";
                     const famLabel = fam === "cut" ? "HARD CUT" : fam === "fade" ? "BLEND" : fam === "wipe" ? "WIPE" : "PUSH";
+                    const pvPosterA = posterFor(0);
+                    const pvPosterB = posterFor(1);
                     return (
                       <div className={`insp-card fam-${fam} ${isTop ? "on" : ""}`}>
                     <div className={`tr-preview ${pvClassFor(item.id)} ${pvPlaying === item.id ? "live" : ""}`}>
                       {pvPlaying === item.id ? (
                         <canvas className="pv-live" ref={pvCanvasRef} />
-                      ) : imageUrls.length >= 2 ? (
+                      ) : pvPosterA && pvPosterB ? (
                         <div
                           className="pv-stage"
                           style={{ "--pv-dur": `${item.id === "none" ? 1.8 : Math.max(0.3, dur) / 0.35}s` } as React.CSSProperties}
                         >
-                          <img className="pv-a" src={imageUrls[0]} alt="" />
-                          <img className="pv-b" src={imageUrls[1]} alt="" />
+                          <img className="pv-a" src={pvPosterA} alt="" />
+                          <img className="pv-b" src={pvPosterB} alt="" />
                         </div>
                       ) : (
                         <>
@@ -2277,14 +2660,14 @@ export default function App() {
                       <button
                         type="button"
                         className={`pv-run ${pvPlaying === item.id ? "stop" : ""}`}
-                        disabled={pvPlaying !== null && pvPlaying !== item.id}
+                        disabled={pvPlaying !== null ? pvPlaying !== item.id : !(pvPosterA && pvPosterB)}
                         onClick={() => toggleTransitionPreview(item.id)}
                         title={
                           pvPlaying === item.id
                             ? "Stop preview"
-                            : imageUrls.length >= 2
-                              ? `Real preview: your first two images, the ${item.name} transition + your SFX`
-                              : "Upload at least 2 images to preview with your footage"
+                            : pvPosterA && pvPosterB
+                              ? `Real preview: your first two assets, the ${item.name} transition + your SFX`
+                              : "Upload at least 2 media assets to preview with your footage"
                         }
                       >
                         {pvPlaying === item.id ? "■ STOP" : "▶ PREVIEW"}
@@ -2449,30 +2832,38 @@ export default function App() {
                 <>
                   <div className="cut-map">
                     {unitSlides.map((sl, k) => {
-                      const slideBadge = motionBadge(badgePlan[k]);
-                      const canMerge = k < unitSlides.length - 1 &&
+                      const unitVid = unitIsVideo[k];
+                      const slideBadge = motionBadge(shownBadgePlan[k]);
+                      const canMerge = k < unitSlides.length - 1 && !unitVid && !unitIsVideo[k + 1] &&
                         sl.imageIndices.length + unitSlides[k + 1].imageIndices.length <= 3;
-                      const layoutName = sl.imageIndices.length === 1 ? "1-UP HERO"
+                      const layoutName = unitVid ? "LIVE CLIP" : sl.imageIndices.length === 1 ? "1-UP HERO"
                         : sl.imageIndices.length === 2 ? "2-UP SPLIT" : "3-UP GRID";
                       return (
                         <div key={k} className="cut-row">
-                          <span className="cut-num">SLIDE #{k + 1}</span>
+                          <span className="cut-num">{unitVid ? `CLIP #${k + 1}` : `SLIDE #${k + 1}`}</span>
                           <span className="cut-thumbs">
                             {sl.imageIndices.map((gi) => (
                               <span key={gi} className={`th t${(gi % 7) + 1}`}>
-                                {imageUrls[gi] && <img src={imageUrls[gi]} alt="" />}
+                                {posterFor(gi) && <img src={posterFor(gi)} alt="" />}
+                                {isVideoFile(images[gi]) && <span className="th-vid">▶</span>}
                               </span>
                             ))}
                           </span>
                           <span className="cut-label">
                             <b>{layoutName} · Σ {unitDurs[k].toFixed(1)}s</b>
-                            <i>{slideBadge ? `${slideBadge} · cards enter one-by-one` : "STATIC HOLD"}</i>
+                            <i>
+                              {unitVid
+                                ? "VIDEO TRIMMED TO SLOT · PLAYS AS-IS"
+                                : slideBadge ? `${slideBadge} · cards enter one-by-one` : "STATIC HOLD"}
+                            </i>
                           </span>
                           <input
                             className="slide-title-input"
                             value={sl.title}
                             maxLength={60}
-                            placeholder="Headline…"
+                            placeholder={unitVid ? "Video plays as-is" : "Headline…"}
+                            disabled={unitVid}
+                            title={unitVid ? "Live video units do not composite headlines" : undefined}
                             onChange={(e) => {
                               const v = e.target.value;
                               setSlides((prev) => {
@@ -2486,6 +2877,7 @@ export default function App() {
                           />
                           <CustomSelect
                             value={sl.enter}
+                            disabled={unitVid}
                             onChange={(val: any) => {
                               const enter = String(val) as SlideEnter;
                               setSlides((prev) => {
@@ -2527,7 +2919,7 @@ export default function App() {
                 </>
               ) : (
                 <div className="empty-note" style={{ marginTop: 12 }}>
-                  Upload frames to compose slides.
+                  Add images to compose slides.
                 </div>
               )}
             </section>
@@ -2556,7 +2948,7 @@ export default function App() {
                       const trans = effTransitions[idx] || "none";
                       const isActive = trans !== "none";
                       const thisDur = categoryDurations[trans] || 0.5;
-                      const moveBadge = motionBadge(badgePlan[idx]);
+                      const moveBadge = motionBadge(shownBadgePlan[idx]);
                       const tailCut = motionOn && idx >= introEnd;
                       const tailChip = motionTail === "pan" ? "PAN TAIL · CUTS" : "CUT-ONLY TAIL";
                       // Slide joins read the boundary images; legacy reads raw names.
@@ -2580,11 +2972,13 @@ export default function App() {
                           <span className="cut-num">CUT #{idx + 1}</span>
                           <span className="cut-thumbs">
                             <span className={`th t${(thumbA % 7) + 1}`}>
-                              {imageUrls[thumbA] && <img src={imageUrls[thumbA]} alt="" />}
+                              {posterFor(thumbA) && <img src={posterFor(thumbA)} alt="" />}
+                              {isVideoFile(images[thumbA]) && <span className="th-vid">▶</span>}
                             </span>
                             <span className={`cut-dia ${markerModFor(trans)}`}><span className="dia" /></span>
                             <span className={`th t${((thumbB) % 7) + 1}`}>
-                              {imageUrls[thumbB] && <img src={imageUrls[thumbB]} alt="" />}
+                              {posterFor(thumbB) && <img src={posterFor(thumbB)} alt="" />}
+                              {isVideoFile(images[thumbB]) && <span className="th-vid">▶</span>}
                             </span>
                           </span>
                           <span className="cut-label">
@@ -2686,7 +3080,7 @@ export default function App() {
                 </>
               ) : (
                 <div className="empty-note" style={{ marginTop: 12 }}>
-                  Upload at least 2 frames to customize transitions.
+                  Add at least 2 assets to customize transitions.
                 </div>
               )}
             </section>
@@ -2757,10 +3151,25 @@ export default function App() {
                   onEnded={() => setIsPlaying(false)}
                 />
               ) : images.length > 0 ? (
-                <>
-                  <img src={imageUrls[0]} alt="" className="video-el" />
-                  <div className="scene" style={{ opacity: 0.18 }} />
-                </>
+                isVideoFile(images[0]) ? (
+                  <>
+                    <video
+                      className="video-el"
+                      src={imageUrls[0]}
+                      poster={posterFor(0)}
+                      muted
+                      loop
+                      playsInline
+                      controls
+                    />
+                    <div className="scene" style={{ opacity: 0.18 }} />
+                  </>
+                ) : (
+                  <>
+                    <img src={posterFor(0) ?? imageUrls[0]} alt="" className="video-el" />
+                    <div className="scene" style={{ opacity: 0.18 }} />
+                  </>
+                )
               ) : (
                 <>
                   <div className="scene">
@@ -2792,7 +3201,7 @@ export default function App() {
                     <span>
                       {images.length > 0
                         ? <><b>{images[0].name}</b> · SOURCE FRAME 01</>
-                        : <>NO MEDIA · ADD FRAMES ON STEP 01</>}
+                        : <>NO MEDIA · ADD MEDIA ON STEP 01</>}
                     </span>
                     <span className="acc-t">
                       {images.length > 0 ? "PRESS RENDER TO FILL THE PROGRAM" : "AWAITING FOOTAGE"}
@@ -2861,7 +3270,7 @@ export default function App() {
               </span>
             </div>
             <p className="exp-sub mono">
-              SEQ 01 · {images.length} FRAMES · {totalSeconds.toFixed(1)}S · 30FPS
+              SEQ 01 · {images.length} ASSETS · {totalSeconds.toFixed(1)}S · 30FPS
             </p>
           </div>
 
@@ -2917,7 +3326,7 @@ export default function App() {
                   </div>
                   <div className="ep-top">
                     <span className="ep-eta">
-                      {uploading ? `UPLOAD ${uploadProgress}%` : `${Math.round(progress)}%`} · {images.length} FRAMES
+                      {uploading ? `UPLOAD ${uploadProgress}%` : `${Math.round(progress)}%`} · {images.length} ASSETS
                     </span>
                     <span className="ep-eta">
                       {!uploading && progress > 0 ? formatEta(eta) : ""}
@@ -2926,12 +3335,12 @@ export default function App() {
                 </div>
                 {!uploading && images.length > 50 && (
                   <p className="panel-note">
-                    Large job ({images.length} frames) renders in segments — progress lands per segment,
+                    Large job ({images.length} assets) renders in segments — progress lands per segment,
                     chapters appear as they finish.
                   </p>
                 )}
-                <button type="button" className="mini-btn danger wide" style={{ marginTop: 10 }} onClick={handleCancel}>
-                  Cancel render
+                <button type="button" className="mini-btn danger wide" style={{ marginTop: 10 }} onClick={handleCancel} disabled={uploading}>
+                  {uploading ? "Uploading media…" : "Cancel render"}
                 </button>
               </section>
             )}
@@ -2987,10 +3396,10 @@ export default function App() {
                 {images.length > 0 ? (
                   <div className="note">
                     <Clock className="ic ic-14" />
-                    <span>~{totalSeconds.toFixed(0)}s · {images.length} frames · 1080p30 · {transitions.length} cuts</span>
+                    <span>~{totalSeconds.toFixed(0)}s · {images.length} assets · 1080p30 · {transitions.length} cuts</span>
                   </div>
                 ) : (
-                  <div className="empty-note">Add frames on step 01 to enable rendering.</div>
+                  <div className="empty-note">Add media on step 01 to enable rendering.</div>
                 )}
               </section>
             )}
@@ -3028,7 +3437,7 @@ export default function App() {
             </button>
             <div className="foot-meta mono">
               <span>1080P30 · H.264 + AAC</span>
-              <span>{images.length} FRAMES</span>
+              <span>{images.length} ASSETS</span>
             </div>
           </div>
         </aside>
@@ -3061,7 +3470,7 @@ export default function App() {
         type="file"
         ref={fileInputRef}
         multiple
-        accept="image/*"
+        accept="image/*,video/*"
         onChange={handleImageChange}
         className="hidden"
       />

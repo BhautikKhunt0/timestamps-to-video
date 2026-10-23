@@ -225,6 +225,11 @@ const CLIP_TAIL = "setsar=1,format=yuv420p";
 const SLIDE_PRESET = "ultrafast";
 const SLIDE_CRF = "18";
 const SLIDE_PRE_CONCURRENCY = 4;
+// Source video -> normalized timeline clip. Each upload is decoded once,
+// trimmed/looped to its exact slot budget and encoded CFR-30 1080p; every
+// later path (holds, batches, xfades) then treats it like any pre-rendered
+// slide clip (frame-exact trims, no rescaling).
+const VIDEO_PRE_CONCURRENCY = 4;
 // Headline font, filesystem path (the filter graph uses the escaped
 // SLIDE_FONT_FILE from slides.ts). Missing file => slides render titleless,
 // never fail: the check runs per job in the slide pre-render step.
@@ -397,6 +402,11 @@ if (!fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
+// Bumped whenever the client/server upload contract changes. The UI refuses
+// to start a render against an older backend instead of failing mid-upload
+// with a network error (the classic "video never appeared in the job dir").
+const SERVER_API_VERSION = 2;
+
 /**
  * Extension for an uploaded file: prefer a sane on-disk extension from the
  * original name, else derive it from the browser's MIME type. Files with no
@@ -421,12 +431,33 @@ const EXT_BY_MIME: Record<string, string> = {
   "audio/webm": ".webm",
   "audio/ogg": ".ogg",
   "video/mp4": ".mp4",
+  "video/quicktime": ".mov",
+  "video/x-m4v": ".m4v",
+  "video/webm": ".webm",
+  "video/x-matroska": ".mkv",
+  "video/x-msvideo": ".avi",
+  "video/x-ms-wmv": ".wmv",
+  "video/x-flv": ".flv",
+  "video/ogg": ".ogv",
+  "video/mpeg": ".mpg",
+  "video/3gpp": ".3gp",
 };
 const fileExt = (file: Express.Multer.File): string => {
   const raw = path.extname(file.originalname || "").toLowerCase();
   if (/^\.[a-z0-9]{1,8}$/.test(raw)) return raw === ".jpeg" ? ".jpg" : raw;
   return EXT_BY_MIME[String(file.mimetype || "").toLowerCase().split(";")[0]] || "";
 };
+
+// Timeline assets can be stills OR video clips. Detection is by extension
+// (the upload keeps the source container) — video units are pre-rendered to a
+// normalized CFR-30 1080p clip before the timeline graph touches them.
+const VIDEO_EXTS = new Set([
+  ".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi",
+  ".wmv", ".flv", ".mpg", ".mpeg", ".3gp", ".ts", ".mts", ".ogv", ".f4v",
+  ".h264", ".h265", ".hevc",
+]);
+const isVideoPath = (filePath: string): boolean =>
+  VIDEO_EXTS.has(path.extname(filePath).toLowerCase());
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -448,6 +479,15 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
+// Video uploads are streamed in small chunks. One huge multipart body is what
+// made browser uploads die with a network-level "Failed to fetch" behind
+// proxies/slow links; bounded chunks keep every request small, and a failed
+// chunk can be retried without restarting the whole file.
+const CHUNK_UPLOAD_LIMIT = 32 * 1024 * 1024; // far above the ~3MB client chunk
+const chunkUpload = multer({ storage, limits: { fileSize: CHUNK_UPLOAD_LIMIT, files: 1 } });
+const CHUNK_JOB_ID = /^[A-Za-z0-9_-]{1,120}$/;
+const CHUNK_EXT = /^\.[a-z0-9]{1,8}$/;
+
 // Multer/storage errors must be JSON like every other API response — an HTML
 // error page here reads as "proxy returned HTML" in the client. Wrapping the
 // multer middleware catches its errors too (they fire before the route handler).
@@ -467,7 +507,7 @@ app.get("/api/init-job", (req, res) => {
   const jobId = "job_" + Date.now() + "_" + Math.random().toString(36).substring(2, 9);
   const jobDir = path.join(UPLOAD_DIR, jobId);
   fs.mkdirSync(jobDir, { recursive: true });
-  res.json({ jobId });
+  res.json({ jobId, serverVersion: SERVER_API_VERSION });
 });
 
 // Upload images in batch
@@ -501,6 +541,139 @@ app.post("/api/upload-batch", uploadRoute(upload.array("images"), (req, res) => 
     res.json({ success: failed.length === 0 && saved.length > 0, count: saved.length, indices: parsedIndices, failed });
   } catch (error: any) {
     res.status(500).json({ error: error.message || "Failed to process batch upload" });
+  }
+}));
+
+// Upload one chunk of a video. Chunks land as chunk_<idx>_<n>.part and are
+// assembled into raw_<idx><ext> when the LAST chunk arrives. The completion
+// marker makes a retried final chunk idempotent (lost response == still done),
+// so a flaky connection can never strand a fully-uploaded asset.
+app.post("/api/upload-chunk", uploadRoute(chunkUpload.single("chunk"), async (req, res) => {
+  const file = req.file as Express.Multer.File | undefined;
+  const dropTemp = () => { if (file?.path) { try { fs.unlinkSync(file.path); } catch { /* already moved */ } } };
+
+  const rawJobId = String(req.body.jobId || "");
+  const jobId = rawJobId && CHUNK_JOB_ID.test(rawJobId) ? rawJobId : "";
+  const idx = Number(req.body.idx);
+  const chunkIndex = Number(req.body.chunkIndex);
+  const totalChunks = Number(req.body.totalChunks);
+  const extIn = String(req.body.ext || "").toLowerCase();
+
+  if (!file || !jobId) {
+    dropTemp();
+    return res.status(400).json({ error: "Invalid chunk upload (missing file or jobId)" });
+  }
+  if (!Number.isInteger(idx) || idx < 0 || idx > 100000 ||
+      !Number.isInteger(totalChunks) || totalChunks < 1 || totalChunks > 20000 ||
+      !Number.isInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= totalChunks) {
+    dropTemp();
+    return res.status(400).json({ error: "Invalid chunk coordinates" });
+  }
+  if (file.size <= 0) {
+    dropTemp();
+    return res.status(400).json({ error: "Empty upload chunk" });
+  }
+  // Keep a known video extension when possible. Unknown exporters can still
+  // upload: ffmpeg sniffs the real container from the bytes, and the chunk
+  // completion marker below records the slot as a video regardless of the
+  // on-disk extension (so raw_<idx>.mp4 with a .dat source still renders).
+  let ext = CHUNK_EXT.test(extIn) && VIDEO_EXTS.has(extIn) ? extIn : "";
+  if (!ext) {
+    const byMime = EXT_BY_MIME[String(file.mimetype || "").toLowerCase().split(";")[0]] || "";
+    ext = VIDEO_EXTS.has(byMime) ? byMime : ".mp4";
+  }
+  const jobDir = path.join(UPLOAD_DIR, jobId);
+  if (!fs.existsSync(jobDir)) {
+    dropTemp();
+    return res.status(400).json({ error: "Job directory not found" });
+  }
+
+  const metaPath = path.join(jobDir, `chunk_${idx}.json`);
+  const targetPath = path.join(jobDir, `raw_${idx}${ext}`);
+  const partPath = (n: number) => path.join(jobDir, `chunk_${idx}_${n}.part`);
+  let meta: { totalChunks: number; ext: string; done?: boolean } | null = null;
+  try { meta = JSON.parse(fs.readFileSync(metaPath, "utf8")); } catch { meta = null; }
+
+  // Already assembled (the client never saw the final response): acknowledge.
+  if (meta?.done && meta.totalChunks === totalChunks && meta.ext === ext && fs.existsSync(targetPath)) {
+    dropTemp();
+    return res.json({ success: true, done: true, count: 1, retriedAfterComplete: true });
+  }
+
+  // A fresh attempt (no meta, or the client restarted with a different chunk
+  // count/format) clears stale parts and any previous raw for this slot so
+  // rawImages can never pick up two versions of the same asset.
+  if (!meta || meta.totalChunks !== totalChunks || meta.ext !== ext) {
+    for (const f of fs.readdirSync(jobDir)) {
+      if (new RegExp(`^chunk_${idx}_\\d+\\.part$`).test(f)) {
+        try { fs.unlinkSync(path.join(jobDir, f)); } catch { /* best effort */ }
+      }
+    }
+    for (const f of fs.readdirSync(jobDir)) {
+      if (new RegExp(`^raw_${idx}\\.[a-z0-9]{1,8}$`, "i").test(f)) {
+        try { fs.unlinkSync(path.join(jobDir, f)); } catch { /* best effort */ }
+      }
+    }
+    meta = { totalChunks, ext };
+    fs.writeFileSync(metaPath, JSON.stringify(meta));
+  }
+
+  const chunkPath = partPath(chunkIndex);
+  try {
+    fs.rmSync(chunkPath, { force: true });
+    fs.renameSync(file.path, chunkPath);
+  } catch (e: any) {
+    dropTemp();
+    return res.status(500).json({ error: `Could not store chunk: ${e.message}` });
+  }
+
+  if (chunkIndex < totalChunks - 1) {
+    return res.json({ success: true, done: false, count: 0, received: chunkIndex + 1, totalChunks });
+  }
+
+  const missing: number[] = [];
+  for (let n = 0; n < totalChunks; n++) {
+    if (!fs.existsSync(partPath(n))) missing.push(n);
+  }
+  if (missing.length > 0) {
+    return res.status(409).json({
+      error: `Missing video chunk(s) ${missing.slice(0, 8).join(", ")}${missing.length > 8 ? "…" : ""}`,
+      missing,
+    });
+  }
+
+  // Assemble by streaming the parts in order into the final raw asset.
+  const tmpPath = targetPath + ".assembling";
+  const assemble = () => new Promise<void>((resolve, reject) => {
+    try { fs.rmSync(tmpPath, { force: true }); } catch { /* best effort */ }
+    const out = fs.createWriteStream(tmpPath);
+    let n = 0;
+    let settled = false;
+    const fail = (e: any) => { if (settled) return; settled = true; try { out.destroy(); } catch {} reject(e); };
+    out.on("error", fail);
+    out.on("finish", () => { if (!settled) { settled = true; resolve(); } });
+    const pump = () => {
+      if (n >= totalChunks) { out.end(); return; }
+      const rs = fs.createReadStream(partPath(n++));
+      rs.on("error", fail);
+      rs.on("end", pump);
+      rs.pipe(out, { end: false });
+    };
+    pump();
+  });
+
+  try {
+    await assemble();
+    fs.rmSync(targetPath, { force: true });
+    fs.renameSync(tmpPath, targetPath);
+    for (let n = 0; n < totalChunks; n++) {
+      try { fs.unlinkSync(partPath(n)); } catch { /* best effort */ }
+    }
+    fs.writeFileSync(metaPath, JSON.stringify({ totalChunks, ext, done: true }));
+    res.json({ success: true, done: true, count: 1, bytes: fs.statSync(targetPath).size });
+  } catch (e: any) {
+    try { fs.rmSync(tmpPath, { force: true }); } catch { /* best effort */ }
+    res.status(500).json({ error: `Could not assemble video: ${e.message}` });
   }
 }));
 
@@ -716,7 +889,7 @@ app.post("/api/cancel/:jobId", (req, res) => {
 });
 
 app.post("/api/generate", async (req, res) => {
-  const { jobId, durations, transitions, transitionDurations, transitionDuration, outputMode, motion, slides, sfx } = req.body;
+  const { jobId, durations, transitions, transitionDurations, transitionDuration, outputMode, motion, slides, sfx, clipVolumes } = req.body;
   if (!jobId || !durations || !Array.isArray(durations)) {
     return res.status(400).json({ error: "Invalid payload" });
   }
@@ -751,18 +924,22 @@ app.post("/api/generate", async (req, res) => {
   // Pre-rendered slide clips (isClip) carry baked animation: consume their
   // real frames via a range trim instead of freezing frame 0 + loop.
   const renderHold = async (rawPath: string, dur: number, outPath: string, label: string,
-    motion?: { shot: ShotMotion; tOff?: number } | null, isClip: boolean = false) => {
+    motion?: { shot: ShotMotion; tOff?: number } | null, isClip: boolean = false,
+    clipStartFrames: number = 0) => {
     // Whole frames only (no toFixed(3), which could push an exact frame count
     // off the grid and add a stray frame); 0.1s floor kept for encode safety.
     const frames = Math.max(toFrames(0.1), toFrames(dur));
     const d = toSeconds(frames);
+    // Clip inputs can be consumed from a later window (a timeline unit split
+    // across chapters continues at its offset instead of restarting at 0).
+    const clipFrom = Math.max(0, Math.round(clipStartFrames));
     const head = isClip
       ? ["-y", "-nostdin", "-i", rawPath]
       : ["-y", "-nostdin", "-framerate", "30", "-i", rawPath];
     const staticArgs = () => [
       ...head,
       "-vf", isClip
-        ? `trim=start_frame=0:end_frame=${frames},setpts=PTS-STARTPTS,settb=1/30,${CLIP_TAIL}`
+        ? `trim=start_frame=${clipFrom}:end_frame=${clipFrom + frames},setpts=PTS-STARTPTS,settb=1/30,${CLIP_TAIL}`
         : `trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${SCALE_FILTER},loop=loop=${frames - 1}:size=1`,
       "-r", "30",
       // stillimage tune only fits static frames on the CPU encoder.
@@ -839,8 +1016,10 @@ app.post("/api/generate", async (req, res) => {
             inputKind: items[i].clip ? "video" : "still",
           });
         } else if (items[i].clip) {
-          // Baked slide animation: consume real frames, never rescale.
-          f += `[${i}:v]trim=start_frame=0:end_frame=${frames},setpts=PTS-STARTPTS,settb=1/30,${CLIP_TAIL},settb=AVTB[v${i}];`;
+          // Baked slide/video clip: consume real frames from this piece's
+          // timeline offset, never rescale.
+          const startF = Math.max(0, Math.round((items[i].tOff ?? 0) * 30));
+          f += `[${i}:v]trim=start_frame=${startF}:end_frame=${startF + frames},setpts=PTS-STARTPTS,settb=1/30,${CLIP_TAIL},settb=AVTB[v${i}];`;
         } else {
           f += `[${i}:v]trim=end_frame=1,setpts=PTS-STARTPTS,settb=1/30,${SCALE_FILTER},loop=loop=${frames - 1}:size=1,settb=AVTB[v${i}];`;
         }
@@ -1058,19 +1237,19 @@ app.post("/api/generate", async (req, res) => {
     }
   };
 
-  // ---- Transition SFX mixing: ONE pass over the FULL-LENGTH track ----
-  // Each cut sound is TRIMMED to its user-selected slice (atrim within the
-  // sound file), delayed to be CENTERED on its cut (cut - sliceDur/2) and
-  // summed into the music bed with amix(normalize=0) + a limiter guard
-  // (summed peaks stay under 1.0; music level is never re-scaled).
-  // Mixing the full-length track (not per chunk) means a sound centered near
-  // a chunk boundary spills naturally across the slice boundary — no clicks,
-  // no per-chunk bookkeeping. Without music, a silent bed carries the SFX.
-  // Per-cut volume + window offset are baked before the delay.
-  const mixSfxLayer = async (
+  // ---- Layered audio mix: ONE pass over the FULL-LENGTH track ----
+  // Each layer is TRIMMED to its slice (atrim within the file), scaled, then
+  // delayed onto the timeline and summed into the bed with amix(normalize=0)
+  // + a limiter guard (summed peaks stay under 1.0; the bed level is never
+  // re-scaled). SFX layers are CENTERED on their cut (at - sliceDur/2); clip
+  // audio layers start exactly at `at` (centered=false). Mixing the full-length
+  // track (not per chunk) means a layer spanning a chunk boundary spills
+  // naturally across the slice boundary — no clicks, no per-chunk bookkeeping.
+  // Without a bed, a silent track carries the layers.
+  const mixAudioLayers = async (
     basePath: string | null,
     totalDur: number,
-    cuts: { at: number; file: string; vol: number; sliceStart: number; sliceDur: number }[],
+    layers: { at: number; file: string; vol: number; sliceStart: number; sliceDur: number; centered?: boolean }[],
     outPath: string
   ): Promise<void> => {
     let base = basePath;
@@ -1082,12 +1261,13 @@ app.post("/api/generate", async (req, res) => {
         { jobDir, label: "sfx_bed", timeoutMs: 60000 });
     }
     const args: string[] = ["-y", "-nostdin", "-i", base];
-    for (const c of cuts) args.push("-i", c.file);
+    for (const c of layers) args.push("-i", c.file);
     const vars: string[] = [
       `[0:a]aformat=sample_rates=48000:channel_layouts=stereo[bed]`,
     ];
-    cuts.forEach((c, k) => {
-      const dMs = Math.max(0, Math.round((c.at - c.sliceDur / 2) * 1000));
+    layers.forEach((c, k) => {
+      const startAt = c.centered === false ? c.at : c.at - c.sliceDur / 2;
+      const dMs = Math.max(0, Math.round(startAt * 1000));
       // Trim first (carve the drag-selected window), then volume, then delay.
       const trim = c.sliceDur > 0 || c.sliceStart > 0
         ? `atrim=start=${c.sliceStart.toFixed(3)}:end=${(c.sliceStart + c.sliceDur).toFixed(3)},asetpts=PTS-STARTPTS,`
@@ -1097,14 +1277,14 @@ app.post("/api/generate", async (req, res) => {
         trim +
         `volume=${c.vol.toFixed(3)},adelay=${dMs}|${dMs}[s${k}]`);
     });
-    const mixInputs = `[bed]` + cuts.map((_c, k) => `[s${k}]`).join("");
+    const mixInputs = `[bed]` + layers.map((_c, k) => `[s${k}]`).join("");
     const filter =
       vars.join(";") + ";" +
-      `${mixInputs}amix=inputs=${cuts.length + 1}:normalize=0,alimiter=limit=0.96[aout]`;
+      `${mixInputs}amix=inputs=${layers.length + 1}:normalize=0,alimiter=limit=0.96[aout]`;
     await runFfmpeg([
       ...args, "-filter_complex", filter, "-map", "[aout]",
       "-c:a", "aac", "-b:a", "192k", outPath,
-    ], { jobDir, label: "mix_sfx", timeoutMs: 300000 });
+    ], { jobDir, label: "mix_audio_layers", timeoutMs: 300000 });
   };
 
   try {
@@ -1120,8 +1300,27 @@ app.post("/api/generate", async (req, res) => {
       });
 
     if (rawImages.length === 0) {
-      throw new Error("No images found for job");
+      throw new Error("No media found for job");
     }
+    // Every raw asset is either a still or a video clip. Videos follow the
+    // same timeline slots as stills — but are trimmed from their first frame
+    // to the slot's exact frame budget (and looped when the slot is longer).
+    // Chunk-uploaded assets also carry a completion marker, so a video with a
+    // non-standard extension is still treated as video (never as a still).
+    const chunkVideoIdx = new Set<number>();
+    for (const f of files) {
+      const m = /^chunk_(\d+)\.json$/.exec(f);
+      if (!m) continue;
+      try {
+        const meta = JSON.parse(fs.readFileSync(path.join(jobDir, f), "utf8"));
+        if (meta?.done) chunkVideoIdx.add(Number(m[1]));
+      } catch { /* incomplete marker */ }
+    }
+    const rawIsVideo = rawImages.map((f) => {
+      if (isVideoPath(f)) return true;
+      const m = /^raw_(\d+)/.exec(f);
+      return !!m && chunkVideoIdx.has(Number(m[1]));
+    });
 
     // ---- Slide structure (multi-card slides, optional) ----
     // Payload `slides` aligns with `durations`: one entry per timeline unit.
@@ -1129,6 +1328,9 @@ app.post("/api/generate", async (req, res) => {
     // Strict validation — every raw image covered EXACTLY once, indices in
     // range. Anything off => legacy per-image timeline (byte-identical).
     // Trivial slides (1 image, no title, enter none) keep the still path.
+    // A video plays as its own unit: multi-card slides + headlines composite
+    // stills only, so a structured slide that contains a video falls back to
+    // the legacy timeline (the video is never silently frozen into a card).
     let slideMode = false;
     let unitSpecs: { spec: SlideSpec; rawPaths: string[]; clipPath: string }[] = [];
     {
@@ -1137,10 +1339,17 @@ app.post("/api/generate", async (req, res) => {
       if (sArr.length > 0 && sArr.length === dArr.length) {
         const seen = new Set<number>();
         let ok = true;
+        let videoSlideConflict = false;
         const tmp: typeof unitSpecs = [];
         for (let i = 0; i < sArr.length && ok; i++) {
           const spec = normalizeSlideSpec({ ...(sArr[i] as any), duration: Number(dArr[i]) || 5 });
           if (!spec) { ok = false; break; }
+          const nontrivial = spec.images.length > 1 || !!spec.title || spec.enter !== "none";
+          if (nontrivial && spec.images.some((ri) => rawIsVideo[ri])) {
+            ok = false;
+            videoSlideConflict = true;
+            break;
+          }
           for (const ri of spec.images) {
             if (ri >= rawImages.length || seen.has(ri)) { ok = false; break; }
             seen.add(ri);
@@ -1156,7 +1365,7 @@ app.post("/api/generate", async (req, res) => {
           slideMode = true;
           unitSpecs = tmp;
         } else {
-          appendLog(jobDir, "ffmpeg.log", `[slides] invalid structure; using legacy per-image timeline`);
+          appendLog(jobDir, "ffmpeg.log", `[slides] ${videoSlideConflict ? "video inside a composed slide" : "invalid structure"}; using legacy per-unit timeline`);
         }
       }
     }
@@ -1164,6 +1373,10 @@ app.post("/api/generate", async (req, res) => {
     // Every array below (durations, transitions, motion plan, files) is
     // unit-indexed from here on.
     const unitCount = slideMode ? unitSpecs.length : rawImages.length;
+    // Video units always play live (no Ken Burns / card compositing).
+    const unitIsVideo: boolean[] = slideMode
+      ? unitSpecs.map((u) => u.spec.images.length === 1 && rawIsVideo[u.spec.images[0]])
+      : rawIsVideo.slice(0, unitCount);
 
     let finalDurations: number[] = [...durations].map((d: any) => Number(d) || 5);
     while (finalDurations.length < unitCount) {
@@ -1173,6 +1386,18 @@ app.post("/api/generate", async (req, res) => {
     // Honor every script timestamp to the nearest frame WITHOUT accumulating
     // rounding error along the timeline (see quantizeTimelineToFrames).
     finalDurations = quantizeTimelineToFrames(finalDurations);
+
+    // Per-clip ORIGINAL-audio level as PERCENT of the recorded level (100 = as
+    // shot, 0 = mute, up to 200 to lift quiet sources). Unit-indexed like every
+    // other timeline array; missing entries default to full level.
+    const unitClipVolPct: number[] = (Array.isArray(clipVolumes) ? clipVolumes : [])
+      .map((v: any) => { const n = Number(v); return Number.isFinite(n) ? Math.min(200, Math.max(0, n)) : 100; });
+    while (unitClipVolPct.length < unitCount) unitClipVolPct.push(100);
+    unitClipVolPct.length = unitCount;
+    // Nominal visible start of each unit on the frame-quantized timeline — the
+    // same anchor the SFX cuts use (centered transitions never shift it).
+    const unitStartAt: number[] = [];
+    { let a = 0; for (const d of finalDurations) { unitStartAt.push(a); a += d; } }
 
     // ---- Parse + sanitize transitions ----
     const allowedIn = new Set(["none", "fade", "smoothleft", "smoothright", "slideleft", "slideright", "slideup", "slidedown"]);
@@ -1267,6 +1492,10 @@ app.post("/api/generate", async (req, res) => {
     const motionPlan: (ShotMotion | null)[] = motionCfg.enabled
       ? planMotion(finalDurations, parsedTransitions, safeTransDurations, motionCfg)
       : [];
+    // A live video already moves — Ken Burns would crop/scale it on top of its
+    // own camera work. Video units keep their frames untouched (the plan stays
+    // for stills only; UI badges mirror this exact rule).
+    unitIsVideo.forEach((isVid, i) => { if (isVid && motionPlan[i]) motionPlan[i] = null; });
     if (motionPlan.length) {
       const moving = motionPlan.filter(Boolean).length;
       const punches = motionPlan.filter((s) => s?.punch).length;
@@ -1275,7 +1504,19 @@ app.post("/api/generate", async (req, res) => {
     }
 
     const hasActiveTransitions = unitCount > 1 && parsedTransitions.some(t => t !== "none");
-    console.log(`[job ${jobId}] units=${unitCount} slideMode=${slideMode} activeTrans=${parsedTransitions.filter(t => t !== "none").length} hasActive=${hasActiveTransitions} mode=${mode}`);
+    // Visible span of unit i inside the transition graph (transition halves
+    // included). Video clips must be long enough to feed that whole span plus
+    // the xfade anti-EOF pad — same mirror math renderXfadeRun uses.
+    const videoSpanSec = (i: number): number => {
+      if (!hasActiveTransitions) return finalDurations[i];
+      const qD = quantizeTimelineToFrames(finalDurations);
+      const qT = safeTransDurations.map((t) => (t > 0 ? toSeconds(Math.max(1, toFrames(t))) : 0));
+      const halfDn = (fr: number) => Math.floor(fr / 2);
+      return qD[i]
+        + (i > 0 ? toSeconds(toFrames(qT[i - 1]) - halfDn(toFrames(qT[i - 1]))) : 0)
+        + (i < qD.length - 1 ? toSeconds(halfDn(toFrames(qT[i]))) : 0);
+    };
+    console.log(`[job ${jobId}] units=${unitCount} videos=${unitIsVideo.filter(Boolean).length} slideMode=${slideMode} activeTrans=${parsedTransitions.filter(t => t !== "none").length} hasActive=${hasActiveTransitions} mode=${mode}`);
 
     // ---- Timeline unit inputs ----
     // Legacy: raw uploads feed encodes directly (Phase 2) — canvas scaling
@@ -1342,7 +1583,72 @@ app.post("/api/generate", async (req, res) => {
       const nClip = unitIsClip.filter(Boolean).length;
       perfMark(jobDir, perfT0, `slides composited (${nClip}/${unitSpecs.length} clips, rest stills)`);
     }
-    setJobProgress(jobId, 2, "preparing", `Preparing ${unitCount} unit${unitCount === 1 ? "" : "s"}...`);
+
+    // ---- Video assets -> normalized timeline clips ----
+    // A video slot is filled with the source's FIRST N frames (N = the slot's
+    // frame budget on the 30fps grid), exactly like the script timestamps
+    // demand. If the file is shorter than its slot it loops from the start —
+    // never a frozen last frame. The normalized clip then flows through the
+    // untouched hold/batch/xfade machinery as a regular clip input.
+    const videoUnitIdxs = unitIsVideo.flatMap((v, i) => (v ? [i] : []));
+    // Each clip's ORIGINAL audio, cut/looped over the exact same window as its
+    // picture and scaled to the clip's own volume; placed on the timeline later.
+    const clipAudioPaths: (string | null)[] = new Array(unitCount).fill(null);
+    if (videoUnitIdxs.length > 0) {
+      setJobProgress(jobId, 2, "preparing", `Preparing ${videoUnitIdxs.length} video clip${videoUnitIdxs.length === 1 ? "" : "s"}...`);
+      let vDone = 0;
+      await mapPool(videoUnitIdxs, gpuConc(VIDEO_PRE_CONCURRENCY), async (i) => {
+        checkCancelled(jobId);
+        const src = slideFiles[i];
+        // Mode B consumes the slot plus both transition halves and the 0.5s
+        // anti-EOF pad; Mode A consumes just the slot (chunk splits continue
+        // at a frame offset, never beyond the slot). +2 frames headroom absorbs
+        // encoder rounding at the tail.
+        const span = hasActiveTransitions ? videoSpanSec(i) + 0.5 : finalDurations[i];
+        const clipFrames = Math.max(2, Math.ceil(span * RENDER_FPS + 1e-6) + 2);
+        const clipLen = toSeconds(clipFrames);
+        const outPath = path.join(jobDir, `video_${i}.mp4`);
+        const gain = unitClipVolPct[i] / 100;
+        const audioPath = path.join(jobDir, `vaudio_${i}.m4a`);
+        const wantAudio = gain > 0 && (await probeHasAudio(src));
+        const build = (): string[] => {
+          const a = [
+            "-y", "-nostdin",
+            // Demuxer-level loop: slots longer than the source keep moving.
+            // -t bounds the output, so a long source still only decodes/encodes
+            // the frames this timeline slot actually needs.
+            "-stream_loop", "-1", "-i", src,
+            "-map", "0:v:0", "-an",
+            "-vf", `fps=${RENDER_FPS},${SCALE_FILTER}`,
+            "-r", String(RENDER_FPS),
+            ...vEncArgs("run"),
+            "-t", clipLen.toString(),
+            outPath,
+          ];
+          if (wantAudio) {
+            // Same -stream_loop/-t window as the picture, so the audio stays
+            // frame-locked to its clip (looped sources loop their sound too).
+            a.push(
+              "-map", "0:a:0", "-vn",
+              "-af", `volume=${gain.toFixed(3)},aformat=sample_rates=48000:channel_layouts=stereo`,
+              "-c:a", "aac", "-b:a", "192k",
+              "-t", clipLen.toString(),
+              audioPath,
+            );
+          }
+          return a;
+        };
+        await runVideoFfmpeg(build, { jobDir, label: `video_clip_${i + 1}`, timeoutMs: 900000 });
+        slideFiles[i] = outPath;
+        unitIsClip[i] = true;
+        if (wantAudio) clipAudioPaths[i] = audioPath;
+        vDone++;
+        setJobProgress(jobId, 2 + Math.round((vDone / videoUnitIdxs.length) * 6), "preparing",
+          `Preparing video clips ${vDone}/${videoUnitIdxs.length}...`);
+      });
+      perfMark(jobDir, perfT0, `videos normalized (${videoUnitIdxs.length} clips, ${clipAudioPaths.filter(Boolean).length} with audio)`);
+    }
+    setJobProgress(jobId, 8, "preparing", `Preparing ${unitCount} unit${unitCount === 1 ? "" : "s"}...`);
     perfMark(jobDir, perfT0, `prepare done (${unitCount} units, slideMode=${slideMode})`);
 
     // ---- Audio discovery ----
@@ -1360,6 +1666,44 @@ app.post("/api/generate", async (req, res) => {
       audioDurations.push(await getMediaDuration(path.join(jobDir, f)));
     }
     perfMark(jobDir, perfT0, `audio probe done (${audioFiles.length} tracks)`);
+
+    // Clip audio rides the timeline as placed layers: each starts at its unit's
+    // visible start. Gain was already baked at extraction, so vol=1 here.
+    const clipLayers = clipAudioPaths
+      .map((p, i) => (p ? { at: unitStartAt[i], file: p, vol: 1, sliceStart: 0, sliceDur: 0, centered: false } : null))
+      .filter((x): x is { at: number; file: string; vol: number; sliceStart: number; sliceDur: number; centered: boolean } => !!x);
+
+    // One continuous full-length track: soundtrack bed -> clip audio -> SFX.
+    // Both render modes slice this per chunk, so clip audio lands identically
+    // whether the timeline went through the concat path or xfade runs.
+    const prepareFullAudio = async (totalVideoDur: number): Promise<string | null> => {
+      let fullAudio: string | null = null;
+      if (audioFiles.length > 0) {
+        setJobProgress(jobId, 62, "preparing audio", "Combining audio tracks...");
+        const combinedPath = path.join(jobDir, "combined_audio.m4a");
+        const combinedDur = await concatAudios(audioFiles.map(f => path.join(jobDir, f)), combinedPath);
+        const fullPath = path.join(jobDir, "full_audio.m4a");
+        setJobProgress(jobId, 64, "preparing audio", combinedDur < totalVideoDur ? "Looping audio to cover full video..." : "Trimming audio to video length...");
+        await buildFullAudio(combinedPath, combinedDur, totalVideoDur, fullPath);
+        fullAudio = fullPath;
+      }
+      if (clipLayers.length > 0) {
+        setJobProgress(jobId, 66, "mixing audio", `Mixing original audio from ${clipLayers.length} clip${clipLayers.length === 1 ? "" : "s"}...`);
+        const clipPath = path.join(jobDir, "full_audio_clips.m4a");
+        await mixAudioLayers(fullAudio, totalVideoDur, clipLayers, clipPath);
+        fullAudio = clipPath;
+        perfMark(jobDir, perfT0, `clip audio mixed (${clipLayers.length} layers)`);
+      }
+      if (sfxSchedule.length > 0) {
+        setJobProgress(jobId, 68, "mixing audio", "Mixing transition sound effects...");
+        const sfxPath = path.join(jobDir, "full_audio_sfx.m4a");
+        await mixAudioLayers(fullAudio, totalVideoDur, sfxSchedule, sfxPath);
+        fullAudio = sfxPath;
+        perfMark(jobDir, perfT0, `sfx mixed`);
+      }
+      perfMark(jobDir, perfT0, `audio prep done`);
+      return fullAudio;
+    };
 
     const job: any = jobs.get(jobId);
     if (job) job.chunks = [];
@@ -1434,7 +1778,7 @@ app.post("/api/generate", async (req, res) => {
           if (bj.items.length === 1) {
             await renderHold(bj.items[0].path, bj.items[0].dur, bj.outPath, `ahold_${bj.chunkIdx}`,
               bj.items[0].motion ? { shot: bj.items[0].motion, tOff: bj.items[0].tOff } : null,
-              bj.items[0].clip ?? false);
+              bj.items[0].clip ?? false, (bj.items[0].tOff ?? 0) * 30);
           } else {
             await renderHoldBatch(bj.items, bj.outPath, `abatch_${bj.chunkIdx}x${bj.items.length}`);
           }
@@ -1455,26 +1799,7 @@ app.post("/api/generate", async (req, res) => {
       perfMark(jobDir, perfT0, `modeA video encode done (${chunks.length} chunks, ${batchJobs.length} batches)`);
       // Build one continuous audio track covering the whole timeline (loop if short).
       const totalVideoDur = chunks.reduce((a: number, x: any) => a + x.dur, 0);
-      let fullAudio: string | null = null;
-      if (audioFiles.length > 0) {
-        setJobProgress(jobId, 72, "preparing audio", "Combining audio tracks...");
-        const combinedPath = path.join(jobDir, "combined_audio.m4a");
-        const combinedDur = await concatAudios(audioFiles.map(f => path.join(jobDir, f)), combinedPath);
-        const fullPath = path.join(jobDir, "full_audio.m4a");
-        setJobProgress(jobId, 76, "preparing audio", combinedDur < totalVideoDur ? "Looping audio to cover full video..." : "Trimming audio to video length...");
-        await buildFullAudio(combinedPath, combinedDur, totalVideoDur, fullPath);
-        fullAudio = fullPath;
-      }
-      if (sfxSchedule.length > 0) {
-        // SFX rides on the full-length bed (music already looped/trimmed) —
-        // one mix pass, chunk slicing and muxing below stay untouched.
-        setJobProgress(jobId, 78, "mixing audio", "Mixing transition sound effects...");
-        const sfxPath = path.join(jobDir, "full_audio_sfx.m4a");
-        await mixSfxLayer(fullAudio, totalVideoDur, sfxSchedule, sfxPath);
-        fullAudio = sfxPath;
-        perfMark(jobDir, perfT0, `sfx mixed (mode A)`);
-      }
-      perfMark(jobDir, perfT0, `modeA audio prep done`);
+      const fullAudio = await prepareFullAudio(totalVideoDur);
       // Mux each chunk with its exact audio slice (independent files -> parallel).
       {
         const urls: string[] = new Array(chunks.length);
@@ -1626,7 +1951,7 @@ app.post("/api/generate", async (req, res) => {
             const hp = path.join(jobDir, `batch_${b.order}_fb_${h}.mp4`);
             await renderHold(b.items[h].path, b.items[h].dur, hp, `${label}_fb${h}`,
               b.items[h].motion ? { shot: b.items[h].motion, tOff: b.items[h].tOff } : null,
-              b.items[h].clip ?? false);
+              b.items[h].clip ?? false, (b.items[h].tOff ?? 0) * 30);
             holdPaths.push(hp);
           }
           await concatPieces(holdPaths, b.outPath, `${label}_fbConcat`);
@@ -1695,24 +2020,7 @@ app.post("/api/generate", async (req, res) => {
       perfMark(jobDir, perfT0, `modeB probe done (${pieces.length} pieces)`);
 
       // One continuous audio track for the whole timeline (loop if short).
-      let fullAudio: string | null = null;
-      if (audioFiles.length > 0) {
-        setJobProgress(jobId, 62, "preparing audio", "Combining audio tracks...");
-        const combinedPath = path.join(jobDir, "combined_audio.m4a");
-        const combinedDur = await concatAudios(audioFiles.map(f => path.join(jobDir, f)), combinedPath);
-        const fullPath = path.join(jobDir, "full_audio.m4a");
-        setJobProgress(jobId, 64, "preparing audio", combinedDur < totalVideoDur ? "Looping audio to cover full video..." : "Trimming audio to video length...");
-        await buildFullAudio(combinedPath, combinedDur, totalVideoDur, fullPath);
-        fullAudio = fullPath;
-      }
-      if (sfxSchedule.length > 0) {
-        setJobProgress(jobId, 65, "mixing audio", "Mixing transition sound effects...");
-        const sfxPath = path.join(jobDir, "full_audio_sfx.m4a");
-        await mixSfxLayer(fullAudio, totalVideoDur, sfxSchedule, sfxPath);
-        fullAudio = sfxPath;
-        perfMark(jobDir, perfT0, `sfx mixed (mode B)`);
-      }
-      perfMark(jobDir, perfT0, `modeB audio prep done`);
+      const fullAudio = await prepareFullAudio(totalVideoDur);
 
       // Greedy chunk assignment: whole pieces only, never cut inside a transition.
       // Single mode = everything in one video; chunks mode = per-audio targets.
