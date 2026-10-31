@@ -1,0 +1,31 @@
+Added Features:
+
+1. Transitions More
+2. Redesigned Again
+3. Motion page split into 2 focused pages with a strict numbered story:
+   Camera Plan (01 Director + A–D deck, 02 Live phases, 03 Phase ribbon,
+   04 Shot structure, aside) and Cuts & Sound (Beat console, 01 Sound
+   rack, 02 Split transition library, 03 Cut map)
+4. Motion page total visual redesign: ruled sections, ladder chips,
+   family-colored rail rows + inspector, stateful cut rows, docked page
+   switcher — all scoped to the motion page only
+5. 🎲 Randomize all cuts button: every join gets a fresh weighted-random
+   transition in one click (re-click rerolls; refine any cut after)
+6. Transition SFX: project-stored sound library (import once, reuse forever)
+   with per-transition assignment, per-cut volume/mute, preview, starter
+   pack, and real mixing into rendered audio (centered on every cut)
+7. SFX segment editor: drag a window on the sound's real waveform to pick
+   exactly WHICH part plays inside each transition's seconds (0.3–2.0s),
+   sliced from the file at render time (atrim)
+8. Real transition preview: your first two uploaded images animate through
+   the actual transition (fade/wipe/push/cut) with the chosen sound slice
+   at its chosen volume, looping
+9. Transition library restructured as a SPLIT LIBRARY: a compact left rail
+   of all transition types (seconds, cut count, ♪ = sound assigned) drives
+   ONE big inspector — large real preview, seconds, Apply-to-all, SFX
+   picker + volume + waveform segment editor — replacing eight overloaded
+   cards with ten controls each
+
+Fixed Issues:
+1. No Audio Cuts
+2. Speed Increased More

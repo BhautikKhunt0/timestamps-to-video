@@ -8,4 +8,5 @@ output/
 *.log
 .env*
 !.env.example
-
+scripts/
+.selftest/

@@ -1,0 +1,50 @@
+[
+  {
+    "id": "sfx_st_swoosh-soft",
+    "name": "Swoosh Soft",
+    "file": "sfx_st_swoosh-soft.m4a",
+    "dur": 1.1
+  },
+  {
+    "id": "sfx_st_swoosh-deep",
+    "name": "Swoosh Deep",
+    "file": "sfx_st_swoosh-deep.m4a",
+    "dur": 1.5
+  },
+  {
+    "id": "sfx_st_riser",
+    "name": "Riser",
+    "file": "sfx_st_riser.m4a",
+    "dur": 1.7
+  },
+  {
+    "id": "sfx_st_pop",
+    "name": "Pop",
+    "file": "sfx_st_pop.m4a",
+    "dur": 0.16
+  },
+  {
+    "id": "sfx_st_punch",
+    "name": "Punch",
+    "file": "sfx_st_punch.m4a",
+    "dur": 0.5
+  },
+  {
+    "id": "sfx_st_sparkle",
+    "name": "Sparkle",
+    "file": "sfx_st_sparkle.m4a",
+    "dur": 0.9
+  },
+  {
+    "id": "sfx_st_tick",
+    "name": "Tick",
+    "file": "sfx_st_tick.m4a",
+    "dur": 0.07
+  },
+  {
+    "id": "sfx_mvermj1ltfrq3",
+    "name": "Short whoose 2",
+    "file": "sfx_mvermj1ltfrq3.mp3",
+    "dur": 1.01
+  }
+]

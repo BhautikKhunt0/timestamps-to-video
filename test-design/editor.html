@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Fluxcut Studio — 04 Editor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<div class="app app-editor">
+
+  <!-- ═══════════ TOP BAR — minimal ═══════════ -->
+  <header class="topbar">
+    <div class="tb-left">
+      <a class="brand" href="./index.html">
+        <span class="brand-mark"><span></span></span>
+        <span class="brand-name">Fluxcut</span>
+        <span class="brand-tag">STUDIO</span>
+      </a>
+    </div>
+
+    <nav class="stepper">
+      <div class="step-track"><div class="step-fill" style="width:100%"></div></div>
+      <a class="step done" href="./index.html"><span class="step-dot"><svg class="ic ic-12" viewBox="0 0 24 24"><path d="M4 12.5l5 5L20 6.5"/></svg></span><span class="step-lbl">Footage</span></a>
+      <a class="step done" href="./timeline.html"><span class="step-dot"><svg class="ic ic-12" viewBox="0 0 24 24"><path d="M4 12.5l5 5L20 6.5"/></svg></span><span class="step-lbl">Timeline</span></a>
+      <a class="step done" href="./motion.html"><span class="step-dot"><svg class="ic ic-12" viewBox="0 0 24 24"><path d="M4 12.5l5 5L20 6.5"/></svg></span><span class="step-lbl">Motion</span></a>
+      <a class="step active" href="./editor.html"><span class="step-dot"><i>4</i></span><span class="step-lbl">Editor</span></a>
+    </nav>
+
+    <div class="tb-right">
+      <a class="btn btn-ghost" href="./motion.html">
+        <svg class="ic ic-14" viewBox="0 0 24 24"><path d="M19 12H5M11 6l-6 6 6 6"/></svg>
+        Motion
+      </a>
+    </div>
+  </header>
+
+  <!-- ═══════════ WORKSPACE ═══════════ -->
+  <div class="editor-body">
+
+    <!-- monitor + transport only -->
+    <section class="stage">
+      <div class="viewer-wrap">
+        <div class="viewer">
+          <div class="scene">
+            <div class="sky-glow"></div>
+            <div class="skyline"></div>
+            <div class="street"></div>
+            <div class="v-copy">
+              <span class="v-kicker">CHAPTER 03 — NEON STREETS</span>
+              <span class="v-title">Midnight Run</span>
+              <span class="v-rule"></span>
+            </div>
+          </div>
+
+          <div class="safe-area"></div>
+
+          <div class="v-top">
+            <span class="v-badge"><i class="dot acc"></i>PROGRAM · SEQ 01</span>
+            <span class="v-badge ghost">FIT · 100%</span>
+          </div>
+
+          <div class="v-bottom">
+            <div class="v-scrub">
+              <div class="v-scrub-fill"></div>
+              <span class="v-knob"></span>
+              <span class="v-mark" style="left:26%"></span>
+              <span class="v-mark" style="left:54%"></span>
+              <span class="v-mark" style="left:79%"></span>
+            </div>
+            <div class="v-meta mono">
+              <span class="v-tc">00:00:12:04</span>
+              <span class="v-dur">/ 00:00:48:00</span>
+              <span class="v-fps">7 CLIPS · 6 CUTS</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="transport">
+        <div class="t-group">
+          <span class="tc-now">00:00:12:04</span>
+          <span class="tc-sub">TC</span>
+        </div>
+
+        <div class="t-buttons">
+          <button class="tbtn" aria-label="Previous cut">
+            <svg class="ic ic-fill" viewBox="0 0 24 24"><path d="M18 6v12L9 12zM6 6h2.2v12H6z"/></svg>
+          </button>
+          <button class="tbtn" aria-label="Step back">
+            <svg class="ic ic-fill" viewBox="0 0 24 24"><path d="M15 6v12L6 12z"/></svg>
+          </button>
+          <button class="tbtn play" aria-label="Play">
+            <svg class="ic ic-fill" viewBox="0 0 24 24"><path d="M8 5.2v13.6L19 12z"/></svg>
+          </button>
+          <button class="tbtn" aria-label="Step forward">
+            <svg class="ic ic-fill" viewBox="0 0 24 24"><path d="M9 6v12l9-6z"/></svg>
+          </button>
+          <button class="tbtn" aria-label="Next cut">
+            <svg class="ic ic-fill" viewBox="0 0 24 24"><path d="M6 6v12l9-6zM15.8 6H18v12h-2.2z"/></svg>
+          </button>
+        </div>
+
+        <div class="t-right">
+          <span class="chip">1.0×</span>
+          <button class="tbtn sm" aria-label="Volume">
+            <svg class="ic" viewBox="0 0 24 24"><path d="M11 5L6.5 9H3v6h3.5L11 19z"/><path d="M15 9.5a3.5 3.5 0 010 5M17.6 7a7 7 0 010 10"/></svg>
+          </button>
+          <button class="tbtn sm" aria-label="Fullscreen">
+            <svg class="ic" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════ EXPORT-ONLY SETTINGS ═══════════ -->
+    <aside class="export-panel">
+      <div class="exp-head">
+        <div class="panel-head">
+          <span class="panel-title">Export</span>
+          <span class="badge"><i class="dot acc"></i>RENDERING</span>
+        </div>
+        <p class="exp-sub mono">SEQ 01 · 00:48.0 · 1 440 FRAMES · 7 CLIPS</p>
+      </div>
+
+      <div class="exp-scroll">
+
+        <section class="exp-sec">
+          <div class="exp-label">Deliver as</div>
+          <div class="mode-grid">
+            <button class="mode on">
+              <b>One film</b>
+              <i>Single continuous file</i>
+            </button>
+            <button class="mode">
+              <b>Chapters</b>
+              <i>Split per soundtrack</i>
+            </button>
+          </div>
+        </section>
+
+        <section class="exp-sec">
+          <div class="exp-label">Format</div>
+          <div class="select">
+            <span>Container</span>
+            <span class="sel-val">MP4 <svg class="ic ic-12" viewBox="0 0 24 24"><path d="M6 9.5l6 6 6-6"/></svg></span>
+          </div>
+          <div class="select">
+            <span>Codec</span>
+            <span class="sel-val">H.264 + AAC <svg class="ic ic-12" viewBox="0 0 24 24"><path d="M6 9.5l6 6 6-6"/></svg></span>
+          </div>
+          <div class="select">
+            <span>Resolution</span>
+            <span class="sel-val">1920 × 1080 <svg class="ic ic-12" viewBox="0 0 24 24"><path d="M6 9.5l6 6 6-6"/></svg></span>
+          </div>
+          <div class="select">
+            <span>Frame rate</span>
+            <span class="sel-val">30 fps <svg class="ic ic-12" viewBox="0 0 24 24"><path d="M6 9.5l6 6 6-6"/></svg></span>
+          </div>
+        </section>
+
+        <section class="exp-sec">
+          <div class="exp-label">Quality</div>
+          <div class="field">
+            <div class="field-row">
+              <label>Bitrate</label>
+              <span class="val-chip">16 Mbps</span>
+            </div>
+            <div class="slider">
+              <span class="slider-fill" style="width:64%"></span>
+              <span class="slider-knob" style="left:64%"></span>
+            </div>
+            <div class="slider-ends"><span>FAST</span><span>VISUALLY LOSSLESS</span></div>
+          </div>
+          <div class="stat-grid" style="margin-top:12px">
+            <div class="stat"><i>Est. size</i><b>42 MB</b></div>
+            <div class="stat"><i>Color</i><b>Rec.709</b></div>
+          </div>
+          <div class="toggle-row" style="margin-top:10px">
+            <span>Hardware encode</span>
+            <span class="switch on"><i></i></span>
+          </div>
+          <div class="toggle-row">
+            <span>Normalize audio</span>
+            <span class="switch on"><i></i></span>
+          </div>
+          <div class="toggle-row">
+            <span>Burn-in timecode</span>
+            <span class="switch"><i></i></span>
+          </div>
+        </section>
+
+        <section class="exp-sec">
+          <div class="exp-label">Destination</div>
+          <div class="dest">
+            <svg class="ic ic-14" viewBox="0 0 24 24"><path d="M3 7.5A1.5 1.5 0 014.5 6h4l2 2.5h7A1.5 1.5 0 0119 10v7a1.5 1.5 0 01-1.5 1.5h-13A1.5 1.5 0 013 17z"/></svg>
+            <span class="dest-path">~/Movies/fluxcut/midnight_run.mp4</span>
+            <button class="mini-btn">Change</button>
+          </div>
+        </section>
+
+        <section class="exp-sec">
+          <div class="exp-label">Progress</div>
+          <div class="exp-progress">
+            <div class="ep-top">
+              <span class="ep-state">ENCODING · SEGMENT 3 / 5</span>
+              <span class="ep-eta">ETA 01:42</span>
+            </div>
+            <div class="bar"><i style="width:68%"></i></div>
+            <div class="ep-top">
+              <span class="ep-eta">972 / 1 440 FRAMES</span>
+              <span class="ep-eta">68%</span>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="exp-foot">
+        <button class="btn-export">
+          <span class="fill"></span>
+          <span class="lbl">
+            <svg class="ic" viewBox="0 0 24 24"><path d="M12 4v11M7.5 10.5L12 15l4.5-4.5"/><path d="M4 17v1.5A1.5 1.5 0 005.5 20h13a1.5 1.5 0 001.5-1.5V17"/></svg>
+            Exporting… 68%
+          </span>
+        </button>
+        <div class="foot-meta mono">
+          <span>H.264 · 1080P30</span>
+          <span>EST. 42 MB</span>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- ═══════════ TIMELINE — display only ═══════════ -->
+  <section class="timeline">
+    <div class="tl-toolbar">
+      <div class="tl-tools">
+        <button class="tool active" aria-label="Selection">
+          <svg class="ic" viewBox="0 0 24 24"><path d="M5 3l6.5 16.5 2.4-6.4 6.4-2.4z"/></svg>
+        </button>
+        <button class="tool" aria-label="Razor">
+          <svg class="ic" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.4"/><circle cx="6" cy="18" r="2.4"/><path d="M20 4L7.5 16.5M14.2 14.6L20 20M7.5 7.5L11.5 11.5"/></svg>
+        </button>
+        <span class="tool-div"></span>
+        <button class="tool on-toggle" aria-label="Snapping">
+          <svg class="ic" viewBox="0 0 24 24"><path d="M6 4v9a6 6 0 0012 0V4"/><path d="M6 9h4M14 9h4"/></svg>
+        </button>
+      </div>
+
+      <div class="tl-time">
+        <span class="tl-tc">00:00:12:04</span>
+        <span class="tl-tc-sub">DUR 00:00:48:00</span>
+      </div>
+
+      <div class="tl-zoom">
+        <span class="zoom-lab">ZOOM</span>
+        <span class="zoom-track"><i></i></span>
+        <button class="tool" aria-label="Fit timeline">
+          <svg class="ic" viewBox="0 0 24 24"><path d="M4 8V4h4M20 8V4h-4M4 16v4h4M20 16v4h-4M8 12h8"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="tl-body">
+      <div class="tl-heads">
+        <div class="tl-spacer rh-ruler"></div>
+        <div class="tl-head rh-l sel">
+          <span class="th-name">V1</span>
+          <span class="th-tools">
+            <svg class="ic ic-12" viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.6"/></svg>
+            <svg class="ic ic-12 muted" viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="9.5" rx="2"/><path d="M8.5 10.5V7.5a3.5 3.5 0 017 0v3"/></svg>
+          </span>
+        </div>
+        <div class="tl-head rh-a">
+          <span class="th-name acc-t">A1</span>
+          <span class="th-tools">
+            <svg class="ic ic-12" viewBox="0 0 24 24"><path d="M11 5L6.5 9H3v6h3.5L11 19z"/><path d="M15 9.5a3.5 3.5 0 010 5"/></svg>
+            <svg class="ic ic-12 muted" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9z"/><path d="M17 9.5l4 5M21 9.5l-4 5"/></svg>
+          </span>
+        </div>
+      </div>
+
+      <div class="tl-lanes">
+        <div class="tl-ruler rh-ruler">
+          <span>00:00</span><span>00:06</span><span>00:12</span><span>00:18</span>
+          <span>00:24</span><span>00:30</span><span>00:36</span><span>00:42</span><span>00:48</span>
+        </div>
+
+        <div class="tl-lane rh-l">
+          <div class="lane-clips">
+            <div class="clip c1" style="flex:1.15"><span class="clip-name">city_alley_01</span><span class="clip-dur">5.0s</span></div>
+            <div class="clip c2 sel tf-fade" style="flex:1.3"><span class="clip-name">neon_sign_02</span><span class="clip-dur">5.0s</span></div>
+            <div class="clip c3 tf-left" style="flex:1"><span class="clip-name">street_crowd</span><span class="clip-dur">4.5s</span></div>
+            <div class="clip c4 tf-right" style="flex:1.35"><span class="clip-name">rooftop_dusk</span><span class="clip-dur">6.0s</span></div>
+            <div class="clip c5 tf-none" style="flex:1.1"><span class="clip-name">subway_tunnel</span><span class="clip-dur">5.0s</span></div>
+            <div class="clip c6 tf-fade" style="flex:1.2"><span class="clip-name">bridge_night</span><span class="clip-dur">5.0s</span></div>
+            <div class="clip c7 tf-fade" style="flex:1.25"><span class="clip-name">dawn_skyline</span><span class="clip-dur">5.5s</span></div>
+          </div>
+        </div>
+
+        <div class="tl-lane rh-a">
+          <div class="lane-clips">
+            <div class="clip clip-audio a1" style="flex:3.2">
+              <span class="wave"></span>
+              <span class="clip-name">soundtrack_main.mp3</span>
+              <span class="clip-dur">looped</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="playhead" style="left:38%">
+          <span class="ph-head">00:12:04</span>
+          <span class="ph-line"></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</div>
+</body>
+</html>

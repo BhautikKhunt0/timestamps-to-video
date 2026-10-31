@@ -1,0 +1,307 @@
+================================================================================
+SCRIPT-TO-VIDEO CONVERTER — DETAILED FEATURES
+================================================================================
+Convert a timestamped script + images (+ optional audio) into a finished
+1080p30 MP4 video, fully offline. Frontend: React + Vite. Backend: Express
+(server.ts) driving a local ffmpeg-static binary. No cloud rendering.
+
+Tech stack: React 19, Vite 6, Tailwind 4, Express 4, Multer uploads,
+WebSocket (ws) live progress, ffmpeg-static 6.1.1 (libx264), TypeScript.
+
+Run:  npm install  ->  set GEMINI_API_KEY in .env.local  ->  npm run dev
+Build: npm run build  ->  node dist/server.cjs   (also: npm start, npm run preview)
+Lint/typecheck: npx tsc --noEmit
+Self-tests: npx tsx ./.selftest/verify.ts  (motion) | slides.ts | slides_pipe.ts | slides_e2e.ts
+
+
+================================================================================
+1. USER JOURNEY — STEP BY STEP (4 guided steps)
+================================================================================
+
+STEP 0 — FOOTAGE (upload everything)
+  1. Upload images (batch). Files are stored per-job as raw_<index>.<ext>
+     so ordering is stable (A-Z sort, numeric raw_N ordering on server).
+  2. Paste/type the script with timestamps. The timestamp parser
+     (src/utils/parser.ts) accepts ranges (00:12 -> 00:18, --> / ->),
+     single timestamps, HH:MM:SS / MM:SS / seconds, comma or dot decimals,
+     en/em dashes. Each timestamp span becomes one image's duration.
+  3. Optional: upload up to 50 audio tracks (music/voice). They are combined
+     into one continuous track later — audio never gets cut short.
+
+STEP 1 — TIMELINE (durations, transitions, slide structure)
+  4. Durations resolve per image: script timestamps win; missing/short lists
+     repeat the last value; empty falls back to Default Duration Per Image
+     (picker: 2/3/4/5/8/10s). Total runtime (Σ) is shown live.
+  5. Pick transitions per cut (or apply one globally): Hard Cut, Cross Fade,
+     Wipe Left/Right, Slide Left/Right/Up/Down. Each transition type has its
+     own duration (0.3–2.0s cards). Every transition lands EXACTLY centered
+     on its cut (half from the outgoing frame, half from the incoming).
+  6. Compose SLIDES (optional): group up to 3 images into one slide —
+     1-UP HERO (single card + headline below), 2-UP SPLIT (two landscape
+     cards + headline above), 3-UP GRID (three portrait cards + headline
+     above). Per slide: headline text (max 60 chars), entrance direction
+     (Still / From bottom / top / left / right), Merge/Split/Reset controls.
+     Cards enter ONE BY ONE (0.20s stagger, slide+fade), title enters first.
+     Never grouping anything = legacy 1-image timeline, pixel-identical
+     output to before the feature existed.
+  7. The CUT MAP previews every join: transition, centered-timing label,
+     camera-move badge, and (past the motion opening) tail locks that mark
+     hard-cut joins.
+     Sequence strip shows per-image tiles with durations; markers show CUT,
+     GROUPED (inside a slide), or transition length. Preview ALWAYS equals
+     output — badges and server render share one planner (same seed ⇒ same
+     plan).
+
+STEP 2 — MOTION (Pro Camera / Ken Burns, two phases)
+  8. Toggle camera motion ON/OFF (default ON), style Subtle/Mixed/Dynamic,
+     and Remix the seed for a brand-new randomized move set.
+  9. Motion reads: push (zoom in), pull (zoom out), pan left/right, drift —
+     randomized across the OPENING phase (default first 60s, configurable
+     15s/30s/60s/90s/2min/3min/whole video), never repeating a move back to
+     back, dissolving joins mirrored 50% of the time so blends stay
+     invisible. THE REST of the timeline then glides on subtle alternating
+     pan-left / pan-right (Subtle pans mode, default) or stays static
+     (Static cuts) — chosen in the phase-2 section of the Camera card.
+
+STEP 3 — EDITOR / EXPORT
+  10. Output mode: Single (one film) or Chapters (one video per audio track).
+  11. Generate → live progress bar with stage + detail + ETA (WebSocket push,
+      polling fallback), per-chunk ready events, Cancel anytime.
+  12. Built-in player, per-chunk download (film_N.mp4 / chapter_N.mp4),
+      Download-all.
+
+
+================================================================================
+2. SLIDE COMPOSITOR (multi-card slides)
+================================================================================
+  - Paper-gray canvas #F2F1EF, 1920x1080, 30fps, yuv420p.
+  - Bold black headlines (Arial Bold via drawtext; user text is escaped so
+    characters like : , % [ ] ; can't break the filter graph; >60 chars
+    trimmed; missing font file ⇒ titleless render, never a failed job).
+  - Deterministic card boxes: 1-up 860x700 (900x760 untitled), 2-up 2x816x459,
+    3-up 3x534x700; source images cover-crop center-framed into boxes.
+  - Choreography: title fades+rises 0.45s first; cards staggered 0.20s apart,
+    each travelling 56px along its entrance direction + fade + 0.96→1 scale
+    over 0.55s; drop-shadow grows as the card "lands". Short slides
+    time-scale the whole dance to fit (min 1.2s-ish behavior preserved).
+  - Each slide pre-renders once (libx264 ultrafast CRF18, ~0.5s per 4s slide,
+    4-wide parallel) to an exact-frame CFR clip, then flows through the
+    normal timeline (holds, crossfades, intro Ken Burns) like any other unit.
+  - One bad slide never fails a job: it falls back to its first image still.
+
+
+================================================================================
+3. CAMERA MOTION ENGINE (Ken Burns)
+================================================================================
+  Planner (src/utils/motion.ts — single source of truth for preview + render):
+  - Moves: push / pull / pan-l / pan-r / drift. Static under 1.2s (cut rhythm
+    carries it). Zoom breathes 8–15% by shot length (Mixed; ~6–9% Subtle,
+    ~11–18% Dynamic) so mid-curve motion stays above the subpixel shimmer
+    floor. Push/pull carry a tiny lateral drift so the frame center never
+    sits at exact-zero velocity.
+  - Lifted-cosine ease (35% linear pedestal): ends keep ~35% of average
+    velocity, killing the frozen-then-jump that pure cosine + 1px
+    quantization caused at every cut.
+  - Seeded (mulberry32) randomized mix, no repeats, family-change
+    preference; 50% dissolve mirroring (push↔pull, pan-r↔pan-l) for invisible
+    blend handoffs without collapsing into push,pull,push,pull… forever.
+  Two-phase timeline (planner is the single source of truth — badges ==
+  server output):
+  - PHASE 1 — OPENING (first `introSeconds`, default 60s): every 1.2s+ shot
+    draws from the full pool (push/pull/pan-l/pan-r/drift). Configurable in
+    the UI (15s/30s/60s/90s/2min/3min/whole video).
+  - PHASE 2 — THE REST (`tail`): "pan" = subtle strictly-alternating
+    pan-l/pan-r glide on every 1.2s+ shot (constant ~8% zoom window,
+    ~0.55px/frame travel, 2x supersample — half the pixels of 4x at ~0.14px
+    rms, below the visible floor, so long timelines stay cheap); "none" =
+    static cuts. RNG-FREE by design: the head plan is bit-identical with or
+    without the tail, so previews always match the server and alternation is
+    seed-independent.
+  - Tail JOINS always render as hard cuts (no xfade re-encodes across the
+    tail); stored transitions there are restored when motion is off.
+  Renderer:
+  Zoom via 4x-supersampled zoompan (crash-free; animated-scale shrink
+    segfaults this ffmpeg build, so zoompan is mandatory) — position jitter
+    ~0.11px rms. Pan via supersampled fixed crop + downscale (zero scaler
+    reinit; 4x in the intro, 2x in the tail). All sizes constant per shot;
+    yuv444p through the animated stage.
+  - Video-aware branches let Ken Burns run ON TOP of pre-rendered slide
+    clips (frame-window trim, no loop); chunk splits continue curve + baked
+    animation seamlessly (measured continuity 0.073px).
+  - Frame-exact everywhere; silent static fallbacks if a motion branch faults.
+
+
+================================================================================
+4. SERVER RENDER PIPELINE — WHAT HAPPENS ON GENERATE (in order)
+================================================================================
+  1. init-job → jobId + job folder. upload-batch → raw_N files. upload-audio
+     → audio_N files. (All under output/<jobId>/.)
+  2. generate: durations → per-UNIT timeline (slides or images), quantized to
+     whole frames on the CUMULATIVE timeline (cuts never drift: ±½ frame max
+     even on 300-image jobs). Transitions sanitized + clamped to fit
+     (0.8× neighbor rule, whole frames, 0.2–2.0s band; too-short ⇒ cut).
+  3. Motion plan built (two phases; tail transitions forced to cuts first so
+     curve extensions match the rendered graph).
+  4. Slide pre-render (only non-trivial slides; trivial = still path).
+  5. MODE A (no transitions): single-decode hold batches (loop filter, concat
+     filter — exact by construction) + stream-copy assembly per chunk.
+     MODE B (transitions): 20-image segments split at hard cuts into hold
+     batches + real overlapping xfade runs (offsets on the exact frame grid),
+     actual durations probed for A/V sync, greedy whole-piece chunking that
+     never cuts inside a transition.
+  6. Audio: combine tracks → loop/trim to total video length → per-chunk
+     slice (+0.5s head) → mux with video as timeline master (stream-copy +
+     -shortest; apad fallback). No chunk is ever mute; video is never
+     truncated to fit audio.
+  7. Progress broadcast (progress/stage/detail/ETA, chunk_ready, complete),
+     cancel checks between every unit, per-piece retry (forced fade) then
+     hard-cut fallback — a faulty piece can never fail the whole job.
+
+
+================================================================================
+5. TRANSITIONS, AUDIO, OUTPUTS, API
+================================================================================
+  Transitions: Hard Cut (none), Cross Fade, Wipe Left/Right (smooth*),
+  Slide Left/Right/Up/Down, plus engine support for fadeblack/fadewhite,
+  wipes, circlecrop, rectcrop, distance, radial, hblur, dissolve, pixelize
+  (unknown names safely fall back to fade — a typo can never hang a job).
+  Transition at every segment boundary is intentionally a hard cut (scale
+  design, documented).
+  Audio: multi-track combine, loop-or-trim to video length, per-chunk exact
+  slices, muxed AFTER video (video is master). Segment tunes: holds use
+  ultrafast CRF18 + stillimage tune; xfade runs veryfast CRF20.
+  Performance: single-decode filter graphs (no per-frame re-decode),
+  bounded concurrency (holds×2, xfades×3, mux×4, probes×20, slide
+  pre-renders×4), 20-image segments scale to 300+ images without hangs.
+  Outputs: chunk_000.mp4… (single = whole film; chunks = per-audio-target
+  ~120s chapters), downloadable per chunk or all-at-once.
+  API: GET /api/init-job · POST /api/upload-batch · POST /api/upload-audio ·
+  POST /api/generate · POST /api/cancel/:jobId · GET /api/progress/:jobId ·
+  GET /api/video/job/:jobId/:filename · WS /api/ws (progress/chunk_ready/
+  complete/error). Dev serves Vite middleware; production serves dist/.
+  Verification: .selftest/verify.ts (motion: crash hunt, frame-exactness, no
+  mid-shot cuts, smoothness) · slides.ts (compositor) · slides_pipe.ts
+  (clip branches) · slides_e2e.ts (live server end-to-end).
+
+--------------------------------------------------------------------------------
+TRANSITION SFX · PROJECT-STORED SOUND LIBRARY
+--------------------------------------------------------------------------------
+  Every transition (including hard cuts) can carry its own sound effect, and
+  the sounds live INSIDE the project (<root>/sfx/ + index.json manifest):
+  import once → available for every future job, no re-uploads.
+
+  Library API: GET /api/sfx/list · POST /api/sfx/upload (multipart "sfx",
+  0.03–20s audio only, friendly name from the filename, duration probed,
+  unique on-disk id) · POST /api/sfx/seed (synthesizes a 7-sound starter
+  pack: Swoosh Soft/Deep, Riser, Pop, Punch, Sparkle, Tick; idempotent,
+  stable ids sfx_st_*) · DELETE /api/sfx/:id (file + manifest entry;
+  ghost references in assignments/cut overrides are cleaned client-side)
+  · GET /api/sfx/:id/file (preview streaming, immutable cache header).
+
+  Motion page (Editor) — pages: the whole Motion experience is split into
+  TWO focused pages via a segmented dock switcher under the hero; each
+  page is a strict numbered vertical story:
+    · CAMERA PLAN —
+        01 Director (sliding power switch + CONTROL DECK: Style /
+          Opening length / Seed+remix / Tail mode as A–D cells, each
+          with a live hint + plan stat chips),
+        02 Live phases (01 Opening / 02 The rest — live CSS preview of
+          the actual move on your first image, time range, move-pool
+          chips; controls live in the deck, the cards only show),
+        03 Phase ribbon (the whole timeline's rhythm map),
+        04 Shot structure (slide grouping — moved here because it
+          defines the SHOTS the phases and ribbon operate on),
+        then the render plan/rules aside.
+    · CUTS & SOUND — full-width workspace, also a numbered ladder:
+      BEAT CONSOLE banner (counts + the 🎲 RANDOMIZE ALL CUTS button),
+      01 Sound rack · 02 Transition library as a SPLIT LIBRARY: a left
+      rail listing every transition type (icon, name, seconds, cut
+      count, ♪ when a sound is assigned, family color, selected state)
+      feeding ONE INSPECTOR on the right — big real preview (canvas
+      play on your first two images), name + family chip, description,
+      seconds select, cut count + Apply-to-all, SFX picker + volume +
+      segment editor (waveform window drag) — · 03 Cut map.
+    Switching pages stops any running transition preview; the counts on
+    the tabs update live (FULL MIX / OPEN Xs on the left, LIVE cuts +
+    SFX count on the right).
+
+  Motion page — visual identity (scoped to .motion-shell, nothing else
+  in the app changes): ruled panel heads with orange numbered ladder
+  chips (01…04 restarting per page), a sliding power switch with
+  CAMERA ON/OFF label, sunken segmented page dock with icon tiles,
+  gradient hero word, family tokens (BLEND blue / WIPE violet / PUSH
+  amber / HARD CUT grey) painting rail rows and the inspector (colored
+  top rail, icon tile, family chip, selected ring), a click-to-select
+  type rail (hover nudge, active count chip, ♪ marker) beside the
+  inspector, stateful cut rows (orange left rail + orange cut number
+  for live transitions, dimmed tail rows), green command banner for
+  the console, tinted sound rack with glowing playing chip, pill stat
+  chips. The inspector stage is a large 16:9-ish preview that hover-
+  plays the exact family animation and hosts the real canvas preview.
+
+  🎲 RANDOMIZE ALL CUTS (beat console, cuts page): one click gives EVERY
+  join a fresh transition from a weighted pool — fades lead (cinematic
+  default), slides add motion variety, occasional hard cuts keep pace
+  (3×fade, smoothleft/right, 4×slides, none). Re-click rerolls again;
+  per-cut SFX tweaks stay intact; structured-slide mode keeps group
+  interiors intact (boundary joins re-read after regrouping).
+
+  Sound rack: horizontally
+  scrolling chips with play/stop, a deterministic pseudo-
+  waveform fingerprint per sound, duration, delete; + Import sounds and
+  ⚡ Starter pack buttons; import progress/summary inline. Every
+  transition card gained an SFX strip: sound picker (None + all library
+  sounds with durations), preview button, 0–200% volume slider, then a
+  SEGMENT EDITOR: the sound's real waveform (decoded in-browser) with a
+  draggable window whose WIDTH is the transition's seconds (0.3–2.0s;
+  hard cuts use the whole sound) — drag to pick exactly which part of
+  the sound plays at every cut of that transition type, with live
+  [start → end] readout; changing the transition duration re-clamps the
+  window. Card strip preview plays EXACTLY the sliced window at the
+  chosen volume (WebAudio BufferSource + GainNode — no <audio> element,
+  so 200% and trims are heard as rendered). The cut-map rows show a
+  per-cut SFX line (inheriting the transition's sound: same window +
+  volume): preview, per-cut volume 0–200%, and a ✕ silence toggle
+  (reversible "♪ muted" badge); "Reset sfx tweaks" clears all per-cut
+  overrides. Assignment (type → sound + volume + window offset)
+  persists in localStorage (sfxAssignV2, v1 auto-migrated); deleted
+  sounds self-heal on reload; per-cut volumes are session state,
+  resettable in one click.
+
+  ▶ REAL PREVIEW (per transition card, "▶ PREVIEW" button): plays the
+  user's first TWO uploaded images in a canvas loop — hold → actual
+  transition (fade blends by alpha; wipes sweep with a feathered edge;
+  slides are true pushes; hard cut swaps at midpoint) → hold — with the
+  selected sound slice firing exactly when the render would fire it
+  (transition start, right volume/window) and a status chip
+  "REAL PREVIEW · <TYPE> · SFX <vol>%". Stop button + disabled-preview
+  guard so only one preview runs at a time. Laser-focused approximation
+  of the ffmpeg xfade families — visual judgement, not reference pixels.
+
+  Render: the client resolves each join to a final { i, sfx, vol, start }
+  entry so the server only sees decided sounds. The server schedules each
+  sound CENTERED on its join cut (cut − sliceDur/2) on the frame-quantized
+  timeline — the same anchor transitions use. The slice is the TRANSITION'S
+  effective duration (safeTransDurations after all clamps + motion gating),
+  carved from the sound at the dragged window offset via atrim — "none"
+  joins (hard cuts / motion tail) play the whole sound. Then ALL slices mix
+  into the single full-length audio bed in ONE amix pass (volume baked per
+  sound, bed never re-scaled, alimiter guards against summed-peak
+  clipping). Without music, a silent bed is synthesized so SFX-only videos
+  still have audio. Mixing the FULL track (not per chunk) means a sound
+  straddling a chunk boundary is sliced naturally across both neighbors —
+  no clicks, no gaps. Volume: payload multiplier = UI% / 100, clamped
+  0.01–3.0.
+
+  Verification: .selftest/sfx_e2e.ts — S1 pop+punch audible above a music
+  bed at their cuts (control window quiet), bed level intact; S2 chunks
+  mode with two 6s chapter targets: swoosh centered exactly ON the chunk
+  boundary is audible from BOTH sides (full-track slice proof, no clicks/
+  gaps); S3 volume 2.0 louder than 1.0 (+6 dB) with an apples-to-apples
+  bed level; S4 without ANY music the silent-bed path still yields an
+  audio track where the punch is the only content; S5 segment trim: the
+  SAME sound (riser) sliced [0..0.5] vs [1.2..1.7] renders measurably
+  different — the loud-top slice dominates the quiet-rise slice — proving
+  the drag-selected window is honored in the output. Library API verified
+  live: idempotent seed, invalid-file rejection, upload friendly-name+
+  duration probe, delete + mono-sound render probe (.selftest/sfx_mono.ts).

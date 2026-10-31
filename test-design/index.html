@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Fluxcut Studio — 01 Footage</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<div class="app">
+
+  <!-- ═══════════ TOP BAR ═══════════ -->
+  <header class="topbar">
+    <div class="tb-left">
+      <a class="brand" href="./index.html">
+        <span class="brand-mark"><span></span></span>
+        <span class="brand-name">Fluxcut</span>
+        <span class="brand-tag">STUDIO</span>
+      </a>
+    </div>
+
+    <nav class="stepper">
+      <div class="step-track"><div class="step-fill" style="width:0%"></div></div>
+      <a class="step active" href="./index.html"><span class="step-dot"><i>1</i></span><span class="step-lbl">Footage</span></a>
+      <a class="step" href="./timeline.html"><span class="step-dot"><i>2</i></span><span class="step-lbl">Timeline</span></a>
+      <a class="step" href="./motion.html"><span class="step-dot"><i>3</i></span><span class="step-lbl">Motion</span></a>
+      <a class="step" href="./editor.html"><span class="step-dot"><i>4</i></span><span class="step-lbl">Editor</span></a>
+    </nav>
+
+    <div class="tb-right">
+      <a class="btn btn-accent" href="./timeline.html">
+        Continue to Timeline
+        <svg class="ic ic-14" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </a>
+    </div>
+  </header>
+
+  <!-- ═══════════ PAGE ═══════════ -->
+  <main class="page-body">
+    <div class="page-shell">
+
+      <div class="page-hero">
+        <span class="eyebrow">Step 01 — Source material</span>
+        <h1 class="h-display">Bring in your <em>footage</em></h1>
+        <p class="lede">Drop frames and a soundtrack. Everything is sorted A→Z automatically, so your file names become the story order — no dragging required.</p>
+      </div>
+
+      <div class="media-grid">
+        <!-- main column -->
+        <div class="media-main">
+
+          <div class="drop-hero">
+            <span class="corner tl mono">DROP ZONE</span>
+            <span class="corner br mono">JPG · PNG · WEBP · MP3</span>
+            <div class="orb">
+              <svg class="ic ic-26" viewBox="0 0 24 24"><path d="M12 16.5V4M7.5 8.5L12 4l4.5 4.5"/><path d="M4 15v3.5A1.5 1.5 0 005.5 20h13a1.5 1.5 0 001.5-1.5V15"/></svg>
+            </div>
+            <h3>Drop frames here</h3>
+            <p>Unlimited images · duplicates handled · safe to re-import</p>
+            <div class="or">OR</div>
+            <div class="drop-actions">
+              <button class="mini-btn accent">Browse files</button>
+              <button class="mini-btn">Import from URL</button>
+            </div>
+            <div class="drop-tags">
+              <span class="tag">AUTO-SORT A→Z</span>
+              <span class="tag">RENAME TO REORDER</span>
+              <span class="tag">NO SIZE LIMIT</span>
+            </div>
+          </div>
+
+          <div class="sec-head">
+            <span class="sec-title">Imported <b>7</b></span>
+            <span class="sec-tools">
+              <span class="seg">
+                <span class="on">All <i>7</i></span>
+                <span>Video <i>7</i></span>
+                <span>Audio <i>2</i></span>
+              </span>
+              <button class="mini-btn danger">Clear all</button>
+            </span>
+          </div>
+
+          <div class="asset-grid">
+            <div class="asset-tile t1 on">
+              <div class="tile-thumb">
+                <span class="tile-idx">01</span>
+                <button class="tile-x"><svg class="ic ic-12" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+              </div>
+              <div class="tile-bar"><span class="tile-name">city_alley_01.jpg</span><span class="tile-dur">5.0s</span></div>
+            </div>
+            <div class="asset-tile t2">
+              <div class="tile-thumb">
+                <span class="tile-idx">02</span>
+                <button class="tile-x"><svg class="ic ic-12" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+              </div>
+              <div class="tile-bar"><span class="tile-name">neon_sign_02.jpg</span><span class="tile-dur">5.0s</span></div>
+            </div>
+            <div class="asset-tile t3">
+              <div class="tile-thumb">
+                <span class="tile-idx">03</span>
+                <button class="tile-x"><svg class="ic ic-12" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+              </div>
+              <div class="tile-bar"><span class="tile-name">street_crowd.jpg</span><span class="tile-dur">4.5s</span></div>
+            </div>
+            <div class="asset-tile t4">
+              <div class="tile-thumb">
+                <span class="tile-idx">04</span>
+                <button class="tile-x"><svg class="ic ic-12" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+              </div>
+              <div class="tile-bar"><span class="tile-name">rooftop_dusk.jpg</span><span class="tile-dur">6.0s</span></div>
+            </div>
+            <div class="asset-tile t5">
+              <div class="tile-thumb">
+                <span class="tile-idx">05</span>
+                <button class="tile-x"><svg class="ic ic-12" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+              </div>
+              <div class="tile-bar"><span class="tile-name">subway_tunnel.jpg</span><span class="tile-dur">5.0s</span></div>
+            </div>
+            <div class="asset-tile t6">
+              <div class="tile-thumb">
+                <span class="tile-idx">06</span>
+                <button class="tile-x"><svg class="ic ic-12" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+              </div>
+              <div class="tile-bar"><span class="tile-name">bridge_night.jpg</span><span class="tile-dur">5.0s</span></div>
+            </div>
+            <div class="asset-tile add">
+              <span>
+                <svg class="ic ic-20" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+                ADD FRAMES
+              </span>
+            </div>
+          </div>
+
+          <div class="sec-head">
+            <span class="sec-title">Soundtrack</span>
+            <span class="mono muted" style="font-size:9.5px; letter-spacing:.14em">OPTIONAL · LOOPED TO FILL · NEVER MUTE</span>
+          </div>
+
+          <div class="audio-row">
+            <span class="au-ic"><svg class="ic" viewBox="0 0 24 24"><path d="M9 18V5.5l11-2V16"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg></span>
+            <span class="au-meta"><b>soundtrack_main.mp3</b><i>320 KBPS · 2:48 · LOOPED</i></span>
+            <span class="wave-mini"></span>
+            <span class="chip">PRIMARY</span>
+            <button class="icon-btn"><svg class="ic ic-12" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+          </div>
+
+          <div class="audio-row">
+            <span class="au-ic alt"><svg class="ic" viewBox="0 0 24 24"><path d="M9 18V5.5l11-2V16"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg></span>
+            <span class="au-meta"><b>city_ambience.wav</b><i>48 KHZ · 1:12 · STEREO</i></span>
+            <span class="wave-mini blue"></span>
+            <span class="chip">LAYER</span>
+            <button class="icon-btn"><svg class="ic ic-12" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+          </div>
+        </div>
+
+        <!-- side column -->
+        <aside class="media-aside">
+          <div class="panel">
+            <div class="panel-head">
+              <span class="panel-title">Session</span>
+              <span class="count mono">LIVE</span>
+            </div>
+            <div class="kv-list">
+              <div class="kv"><i>Frames</i><b>7</b></div>
+              <div class="kv"><i>Soundtracks</i><b>2</b></div>
+              <div class="kv"><i>Est. runtime</i><b class="acc-t">35.0s</b></div>
+              <div class="kv"><i>Est. size</i><b>42 MB</b></div>
+              <div class="kv"><i>Output</i><b>1080p30</b></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><span class="panel-title">Ready check</span></div>
+            <div class="checklist">
+              <div class="check ok">
+                <span class="bullet"><svg class="ic ic-12" viewBox="0 0 24 24"><path d="M4 12.5l5 5L20 6.5"/></svg></span>
+                Files sorted A → Z
+              </div>
+              <div class="check ok">
+                <span class="bullet"><svg class="ic ic-12" viewBox="0 0 24 24"><path d="M4 12.5l5 5L20 6.5"/></svg></span>
+                Soundtrack attached
+              </div>
+              <div class="check">
+                <span class="bullet"><i></i></span>
+                Add timestamps on the next step
+              </div>
+            </div>
+          </div>
+
+          <div class="panel tip-panel">
+            <span class="eyebrow">Pro tip</span>
+            <p>Name files like <b>01_intro.jpg</b> · <b>02_hook.jpg</b> and the order takes care of itself — forever.</p>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </main>
+
+</div>
+</body>
+</html>

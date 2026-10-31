@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Fluxcut Studio — 02 Timeline</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<div class="app">
+
+  <!-- ═══════════ TOP BAR ═══════════ -->
+  <header class="topbar">
+    <div class="tb-left">
+      <a class="brand" href="./index.html">
+        <span class="brand-mark"><span></span></span>
+        <span class="brand-name">Fluxcut</span>
+        <span class="brand-tag">STUDIO</span>
+      </a>
+    </div>
+
+    <nav class="stepper">
+      <div class="step-track"><div class="step-fill" style="width:33.3%"></div></div>
+      <a class="step done" href="./index.html"><span class="step-dot"><svg class="ic ic-12" viewBox="0 0 24 24"><path d="M4 12.5l5 5L20 6.5"/></svg></span><span class="step-lbl">Footage</span></a>
+      <a class="step active" href="./timeline.html"><span class="step-dot"><i>2</i></span><span class="step-lbl">Timeline</span></a>
+      <a class="step" href="./motion.html"><span class="step-dot"><i>3</i></span><span class="step-lbl">Motion</span></a>
+      <a class="step" href="./editor.html"><span class="step-dot"><i>4</i></span><span class="step-lbl">Editor</span></a>
+    </nav>
+
+    <div class="tb-right">
+      <a class="btn btn-ghost" href="./index.html">
+        <svg class="ic ic-14" viewBox="0 0 24 24"><path d="M19 12H5M11 6l-6 6 6 6"/></svg>
+        Footage
+      </a>
+      <a class="btn btn-accent" href="./motion.html">
+        Continue to Motion
+        <svg class="ic ic-14" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+      </a>
+    </div>
+  </header>
+
+  <!-- ═══════════ PAGE ═══════════ -->
+  <main class="page-body">
+    <div class="page-shell">
+
+      <div class="page-hero">
+        <span class="eyebrow">Step 02 — Sequence</span>
+        <h1 class="h-display">Lay out the <em>timeline</em></h1>
+        <p class="lede">Every frame gets a place and a duration. Write millisecond timestamps and they map 1:1 onto your clips — or fall back to a uniform slide length.</p>
+      </div>
+
+      <div class="tl-grid">
+        <!-- main column -->
+        <div class="tl-main">
+
+          <section class="panel">
+            <div class="panel-head">
+              <span class="panel-title">Clip sequence</span>
+              <span class="count mono">7 CLIPS · A→Z</span>
+              <button class="icon-btn" aria-label="Sort">
+                <svg class="ic ic-14" viewBox="0 0 24 24"><path d="M4 7h11M4 12h8M4 17h5"/><path d="M17 8v9M14.5 14.5L17 17l2.5-2.5"/></svg>
+              </button>
+            </div>
+
+            <div class="seq-strip">
+              <div class="clip-card on">
+                <div class="cc-thumb t1"><span class="cc-idx">01</span><span class="cc-grip">⋮⋮</span></div>
+                <div class="cc-meta">
+                  <span class="cc-name">city_alley_01.jpg</span>
+                  <span class="cc-dur">SLIDE <b>5.0s</b></span>
+                </div>
+              </div>
+
+              <div class="seq-marker"><span class="dia"></span><span class="m-lab">0.8s</span></div>
+
+              <div class="clip-card">
+                <div class="cc-thumb t2"><span class="cc-idx">02</span><span class="cc-grip">⋮⋮</span></div>
+                <div class="cc-meta">
+                  <span class="cc-name">neon_sign_02.jpg</span>
+                  <span class="cc-dur">SLIDE <b>5.0s</b></span>
+                </div>
+              </div>
+
+              <div class="seq-marker left"><span class="dia"></span><span class="m-lab">0.5s</span></div>
+
+              <div class="clip-card">
+                <div class="cc-thumb t3"><span class="cc-idx">03</span><span class="cc-grip">⋮⋮</span></div>
+                <div class="cc-meta">
+                  <span class="cc-name">street_crowd.jpg</span>
+                  <span class="cc-dur">SLIDE <b>4.5s</b></span>
+                </div>
+              </div>
+
+              <div class="seq-marker right"><span class="dia"></span><span class="m-lab">0.5s</span></div>
+
+              <div class="clip-card">
+                <div class="cc-thumb t4"><span class="cc-idx">04</span><span class="cc-grip">⋮⋮</span></div>
+                <div class="cc-meta">
+                  <span class="cc-name">rooftop_dusk.jpg</span>
+                  <span class="cc-dur">SLIDE <b>6.0s</b></span>
+                </div>
+              </div>
+
+              <div class="seq-marker none"><span class="dia"></span><span class="m-lab">CUT</span></div>
+
+              <div class="clip-card">
+                <div class="cc-thumb t5"><span class="cc-idx">05</span><span class="cc-grip">⋮⋮</span></div>
+                <div class="cc-meta">
+                  <span class="cc-name">subway_tunnel.jpg</span>
+                  <span class="cc-dur">SLIDE <b>5.0s</b></span>
+                </div>
+              </div>
+
+              <div class="seq-marker"><span class="dia"></span><span class="m-lab">0.8s</span></div>
+
+              <div class="clip-card">
+                <div class="cc-thumb t6"><span class="cc-idx">06</span><span class="cc-grip">⋮⋮</span></div>
+                <div class="cc-meta">
+                  <span class="cc-name">bridge_night.jpg</span>
+                  <span class="cc-dur">SLIDE <b>5.0s</b></span>
+                </div>
+              </div>
+
+              <div class="seq-marker"><span class="dia"></span><span class="m-lab">0.8s</span></div>
+
+              <div class="clip-card">
+                <div class="cc-thumb t7"><span class="cc-idx">07</span><span class="cc-grip">⋮⋮</span></div>
+                <div class="cc-meta">
+                  <span class="cc-name">dawn_skyline.jpg</span>
+                  <span class="cc-dur">SLIDE <b>5.5s</b></span>
+                </div>
+              </div>
+
+              <div class="clip-add">
+                <span>
+                  <svg class="ic ic-20" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+                  ADD CLIP
+                </span>
+              </div>
+            </div>
+
+            <div class="strip-foot">
+              <span>DRAG TO REORDER · DOUBLE-CLICK A DURATION TO EDIT</span>
+              <span>Σ 36.0S SLIDES + 6 TRANSITIONS</span>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <span class="panel-title">Script — timestamps</span>
+              <span class="count mono">7 RANGES · Σ 48.0S</span>
+              <button class="mini-btn" style="margin-left:auto">Parse script</button>
+            </div>
+
+            <div class="script-box">
+              <div class="script-line"><span class="ln">1</span><span class="ts">0:00.000 <b>–</b> 0:05.000</span><span class="lab">intro / alley</span></div>
+              <div class="script-line"><span class="ln">2</span><span class="ts">0:05.000 <b>–</b> 0:10.000</span><span class="lab">hook / neon sign</span></div>
+              <div class="script-line"><span class="ln">3</span><span class="ts">0:10.000 <b>–</b> 0:14.500</span><span class="lab">crowd ambience</span></div>
+              <div class="script-line"><span class="ln">4</span><span class="ts">0:14.500 <b>–</b> 0:20.500</span><span class="lab">rooftop reveal</span></div>
+              <div class="script-line"><span class="ln">5</span><span class="ts">0:20.500 <b>–</b> 0:25.500</span><span class="lab">tunnel run</span></div>
+              <div class="script-line"><span class="ln">6</span><span class="ts">0:25.500 <b>–</b> 0:30.500</span><span class="lab">bridge crossing</span></div>
+              <div class="script-line new"><span class="ln">7</span><span class="ts">0:30.500 <b>–</b> 0:36.000</span><span class="lab">dawn / outro</span></div>
+            </div>
+
+            <div class="strip-foot">
+              <span>MILLISECOND PRECISE · ONE RANGE PER CLIP</span>
+              <span class="ok-t">✓ PARSED</span>
+            </div>
+          </section>
+        </div>
+
+        <!-- side column -->
+        <aside class="tl-aside">
+          <div class="panel">
+            <div class="panel-head"><span class="panel-title">Timing</span></div>
+            <div class="field" style="margin-top:10px">
+              <div class="field-row">
+                <label>Default per slide</label>
+                <span class="val-chip">5.0s</span>
+              </div>
+            </div>
+            <div class="dur-opts">
+              <span class="dur-opt">2s</span>
+              <span class="dur-opt">3s</span>
+              <span class="dur-opt">4s</span>
+              <span class="dur-opt on">5s</span>
+              <span class="dur-opt">8s</span>
+              <span class="dur-opt">10s</span>
+            </div>
+            <p class="panel-note">Used only when no script ranges are present.</p>
+            <div class="toggle-row" style="margin-top:10px">
+              <span>Fit script to clips</span>
+              <span class="switch on"><i></i></span>
+            </div>
+            <div class="toggle-row">
+              <span>Pad last clip to match</span>
+              <span class="switch on"><i></i></span>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><span class="panel-title">Runtime</span><span class="count mono">TARGET</span></div>
+            <div class="big-total">
+              <b>00:48.0</b>
+              <i>MINUTES : SECONDS</i>
+            </div>
+            <div class="stat-grid" style="margin-top:10px">
+              <div class="stat"><i>Clips</i><b>7</b></div>
+              <div class="stat"><i>Ranges</i><b class="ok-t">7</b></div>
+              <div class="stat"><i>Avg slide</i><b>5.1s</b></div>
+              <div class="stat"><i>Frames</i><b>1 440</b></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><span class="panel-title">Ordering</span></div>
+            <div class="order-list">
+              <div class="order-opt on">
+                <span class="radio"></span>
+                Alphabetical A → Z
+                <small>AUTO</small>
+              </div>
+              <div class="order-opt">
+                <span class="radio"></span>
+                Manual order
+                <small>DRAG</small>
+              </div>
+              <div class="order-opt">
+                <span class="radio"></span>
+                By timestamp
+                <small>SCRIPT</small>
+              </div>
+            </div>
+            <div class="note" style="margin-top:12px">
+              <svg class="ic ic-14" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5M12 16.2v.3"/></svg>
+              All 7 ranges map 1:1 onto your clips — nothing to fix.
+            </div>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </main>
+
+</div>
+</body>
+</html>
