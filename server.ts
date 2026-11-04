@@ -1587,12 +1587,15 @@ app.post("/api/generate", async (req, res) => {
     // ---- Video assets -> normalized timeline clips ----
     // A video slot is filled with the source's FIRST N frames (N = the slot's
     // frame budget on the 30fps grid), exactly like the script timestamps
-    // demand. If the file is shorter than its slot it loops from the start —
-    // never a frozen last frame. The normalized clip then flows through the
-    // untouched hold/batch/xfade machinery as a regular clip input.
+    // demand. If the file is shorter than its slot its LAST frame is held
+    // (extended) till the slot ends — never looped from the start. The
+    // normalized clip then flows through the untouched hold/batch/xfade
+    // machinery as a regular clip input.
     const videoUnitIdxs = unitIsVideo.flatMap((v, i) => (v ? [i] : []));
-    // Each clip's ORIGINAL audio, cut/looped over the exact same window as its
-    // picture and scaled to the clip's own volume; placed on the timeline later.
+    // Each clip's ORIGINAL audio, cut over the exact same window as its
+    // picture and scaled to the clip's own volume; placed on the timeline
+    // later. When the video ends early its sound ends with it — the held
+    // last frame is silent (no audio loop).
     const clipAudioPaths: (string | null)[] = new Array(unitCount).fill(null);
     if (videoUnitIdxs.length > 0) {
       setJobProgress(jobId, 2, "preparing", `Preparing ${videoUnitIdxs.length} video clip${videoUnitIdxs.length === 1 ? "" : "s"}...`);
@@ -1614,20 +1617,22 @@ app.post("/api/generate", async (req, res) => {
         const build = (): string[] => {
           const a = [
             "-y", "-nostdin",
-            // Demuxer-level loop: slots longer than the source keep moving.
-            // -t bounds the output, so a long source still only decodes/encodes
-            // the frames this timeline slot actually needs.
-            "-stream_loop", "-1", "-i", src,
+            // No loop: the source plays once. tpad freezes its last frame for
+            // any remaining slot time (cloned PTS keep CFR-30), and -t bounds
+            // the output, so a long source still only decodes/encodes the
+            // frames this timeline slot actually needs.
+            "-i", src,
             "-map", "0:v:0", "-an",
-            "-vf", `fps=${RENDER_FPS},${SCALE_FILTER}`,
+            "-vf", `fps=${RENDER_FPS},tpad=stop_mode=clone:stop_duration=${clipLen.toString()},${SCALE_FILTER}`,
             "-r", String(RENDER_FPS),
             ...vEncArgs("run"),
             "-t", clipLen.toString(),
             outPath,
           ];
           if (wantAudio) {
-            // Same -stream_loop/-t window as the picture, so the audio stays
-            // frame-locked to its clip (looped sources loop their sound too).
+            // Same -t window as the picture, so the audio stays frame-locked
+            // to its clip. A short source's sound simply ends with the video;
+            // the held last frame plays silently.
             a.push(
               "-map", "0:a:0", "-vn",
               "-af", `volume=${gain.toFixed(3)},aformat=sample_rates=48000:channel_layouts=stereo`,
